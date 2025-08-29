@@ -660,6 +660,20 @@ func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session s
 	return nil
 }
 
+// mapHooksErrorToJSONRPCError maps specific hooks errors to appropriate JSON-RPC error responses
+func mapHooksErrorToJSONRPCError(requestID *jsonrpc.RequestID, err error) *jsonrpc.Response {
+	switch e := err.(type) {
+	case *hooks.NotFoundError:
+		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeMethodNotFound, e.Error(), nil)
+	case *hooks.AlreadySubscribedError, *hooks.NotSubscribedError, *hooks.InvalidParamsError:
+		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInvalidParams, e.Error(), nil)
+	case *hooks.UnsupportedOperationError:
+		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeMethodNotFound, e.Error(), nil)
+	default:
+		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
+	}
+}
+
 func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	switch req.Method {
 	case string(mcp.PingMethod):
@@ -673,12 +687,186 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		tools, err := toolsCap.ListTools(ctx, session)
 		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "failed to list tools", nil), nil
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListToolsResult{
 			Tools: tools,
 		})
+	case string(mcp.ToolsCallMethod):
+		toolsCap := h.hooks.GetToolsCapability()
+
+		if toolsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
+		}
+
+		var callToolReq mcp.CallToolRequestReceived
+		if err := json.Unmarshal(req.Params, &callToolReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		result, err := toolsCap.CallTool(ctx, session, &callToolReq)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, result)
+	case string(mcp.ResourcesListMethod):
+		resourcesCap := h.hooks.GetResourcesCapability()
+
+		if resourcesCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+
+		var listResourcesReq mcp.ListResourcesRequest
+		if err := json.Unmarshal(req.Params, &listResourcesReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		resources, nextCursor, err := resourcesCap.ListResources(ctx, session, listResourcesReq.Cursor)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourcesResult{
+			Resources: resources,
+			PaginatedResult: mcp.PaginatedResult{
+				NextCursor: nextCursor,
+			},
+		})
+	case string(mcp.ResourcesReadMethod):
+		resourcesCap := h.hooks.GetResourcesCapability()
+
+		if resourcesCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+
+		var readResourceReq mcp.ReadResourceRequest
+		if err := json.Unmarshal(req.Params, &readResourceReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		contents, err := resourcesCap.ReadResource(ctx, session, readResourceReq.URI)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ReadResourceResult{
+			Contents: contents,
+		})
+	case string(mcp.ResourcesSubscribeMethod):
+		resourcesCap := h.hooks.GetResourcesCapability()
+
+		if resourcesCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+
+		var subscribeReq mcp.SubscribeRequest
+		if err := json.Unmarshal(req.Params, &subscribeReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		err := resourcesCap.SubscribeToResource(ctx, session, subscribeReq.URI)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, struct{}{})
+	case string(mcp.ResourcesUnsubscribeMethod):
+		resourcesCap := h.hooks.GetResourcesCapability()
+
+		if resourcesCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+
+		var unsubscribeReq mcp.UnsubscribeRequest
+		if err := json.Unmarshal(req.Params, &unsubscribeReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		err := resourcesCap.UnsubscribeFromResource(ctx, session, unsubscribeReq.URI)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, struct{}{})
+	case string(mcp.PromptsListMethod):
+		promptsCap := h.hooks.GetPromptsCapability()
+
+		if promptsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+		}
+
+		var listPromptsReq mcp.ListPromptsRequest
+		if err := json.Unmarshal(req.Params, &listPromptsReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		prompts, nextCursor, err := promptsCap.ListPrompts(ctx, session, listPromptsReq.Cursor)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
+			Prompts: prompts,
+			PaginatedResult: mcp.PaginatedResult{
+				NextCursor: nextCursor,
+			},
+		})
+	case string(mcp.PromptsGetMethod):
+		promptsCap := h.hooks.GetPromptsCapability()
+
+		if promptsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+		}
+
+		var getPromptReq mcp.GetPromptRequestReceived
+		if err := json.Unmarshal(req.Params, &getPromptReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, result)
+	case string(mcp.LoggingSetLevelMethod):
+		loggingCap := h.hooks.GetLoggingCapability()
+
+		if loggingCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
+		}
+
+		var setLevelReq mcp.SetLevelRequest
+		if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		err := loggingCap.SetLevel(ctx, session, setLevelReq.Level)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, struct{}{})
+	case string(mcp.CompletionCompleteMethod):
+		completionsCap := h.hooks.GetCompletionsCapability()
+
+		if completionsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
+		}
+
+		var completeReq mcp.CompleteRequest
+		if err := json.Unmarshal(req.Params, &completeReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		result, err := completionsCap.Complete(ctx, session, &completeReq)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, result)
 	}
 	// TODO: Actually handle the request
 	return &jsonrpc.Response{

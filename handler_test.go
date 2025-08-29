@@ -69,6 +69,19 @@ func TestSingleInstance(t *testing.T) {
 		if want, got := 0, len(res.Tools); want != got {
 			t.Errorf("Unexpected number of tools: want %d, got %d", want, got)
 		}
+
+		// Attempt to call a tool that doesn't exist and make sure
+		// the resulting error is a NotFoundError
+		_, err = cs.CallTool(ctx, &sdk.CallToolParams{
+			Name: "non-existent-tool",
+		})
+		if err == nil {
+			t.Fatalf("Expected error calling non-existent tool, got nil")
+		}
+
+		if want, got := `calling "tools/call": tool not found: non-existent-tool`, err.Error(); want != got {
+			t.Errorf("Unexpected error message: want %q, got %q", want, got)
+		}
 	})
 }
 
