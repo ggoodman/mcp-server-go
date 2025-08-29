@@ -1,0 +1,12 @@
+{
+	"servers": {
+		"Go please": {
+			"type": "stdio",
+			"command": "gopls",
+			"args": [
+				"mcp"
+			]
+		}
+	},
+	"inputs": []
+}
