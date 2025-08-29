@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -77,6 +77,55 @@ type StreamingHTTPConfig struct {
 
 	// AuthorizationServerURL is the URL of the OIDC authorization server.
 	AuthorizationServerURL string
+
+	// Auth is an optional custom authenticator. If nil, authentication checks will be skipped.
+	Auth auth.Authenticator
+
+	// Hooks provides the MCP server logic implementation.
+	Hooks hooks.Hooks
+
+	// Sessions manages session state for the MCP server.
+	Sessions sessions.SessionStore
+
+	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
+	LogHandler slog.Handler
+}
+
+// ManualOIDCConfig allows configuring the StreamingHTTPHandler with pre-configured
+// OAuth/OIDC details, bypassing the need for OIDC discovery. This is particularly
+// useful for testing or environments where OIDC discovery is not available.
+type ManualOIDCConfig struct {
+	// ServerURL is the fully qualified URL of the streaming HTTP MCP server endpoint.
+	ServerURL string
+
+	// ServerName is the human-readable name of the server.
+	ServerName string
+
+	// Issuer is the OAuth2 authorization server issuer URL.
+	Issuer string
+
+	// JwksURI is the URL of the JSON Web Key Set document.
+	JwksURI string
+
+	// Optional fields that would normally be discovered from authorization server metadata
+	ScopesSupported                            []string
+	TokenEndpointAuthMethodsSupported          []string
+	TokenEndpointAuthSigningAlgValuesSupported []string
+	ServiceDocumentation                       string
+	OpPolicyUri                                string
+	OpTosUri                                   string
+
+	// Auth is an optional custom authenticator. If nil, authentication checks will be skipped.
+	Auth auth.Authenticator
+
+	// Hooks provides the MCP server logic implementation.
+	Hooks hooks.Hooks
+
+	// Sessions manages session state for the MCP server.
+	Sessions sessions.SessionStore
+
+	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
+	LogHandler slog.Handler
 }
 
 // StreamingHTTPHandler implements the stream HTTP transport protocol of
@@ -84,6 +133,7 @@ type StreamingHTTPConfig struct {
 type StreamingHTTPHandler struct {
 	mux            *http.ServeMux
 	oidcProvider   *oidc.Provider
+	log            *slog.Logger
 	prmDocument    wellknown.ProtectedResourceMetadata
 	prmDocumentURL *url.URL
 	serverURL      *url.URL
@@ -99,15 +149,15 @@ type writeFlusher interface {
 }
 
 func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*StreamingHTTPHandler, error) {
-	mcpURL, err := url.Parse(config.ServerURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid server URL %q: %w", config.ServerURL, err)
+	if config.Hooks == nil {
+		return nil, fmt.Errorf("hooks is required")
 	}
 
-	if mcpURL.Scheme != "https" && mcpURL.Scheme != "http" {
-		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
+	if config.Sessions == nil {
+		return nil, fmt.Errorf("sessions is required")
 	}
 
+	// Perform OIDC discovery
 	provider, err := oidc.NewProvider(ctx, config.AuthorizationServerURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OIDC provider: %w", err)
@@ -123,20 +173,90 @@ func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*
 		return nil, fmt.Errorf("the supplied authorization server does not declare support for a JWKS URI in its metadata")
 	}
 
+	// Create manual config from discovered metadata and delegate to manual constructor
+	manualConfig := ManualOIDCConfig{
+		ServerURL:                         config.ServerURL,
+		ServerName:                        config.ServerName,
+		Issuer:                            asm.Issuer,
+		JwksURI:                           asm.JwksUri,
+		ScopesSupported:                   asm.ScopesSupported,
+		TokenEndpointAuthMethodsSupported: asm.TokenEndpointAuthMethodsSupported,
+		TokenEndpointAuthSigningAlgValuesSupported: asm.TokenEndpointAuthSigningAlgValuesSupported,
+		ServiceDocumentation:                       asm.ServiceDocumentation,
+		OpPolicyUri:                                asm.OpPolicyUri,
+		OpTosUri:                                   asm.OpTosUri,
+		Auth:                                       config.Auth,
+		Hooks:                                      config.Hooks,
+		Sessions:                                   config.Sessions,
+		LogHandler:                                 config.LogHandler,
+	}
+
+	handler, err := NewStreamingHTTPHandlerWithManualOIDC(ctx, manualConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the OIDC provider for the discovery-based path
+	handler.oidcProvider = provider
+
+	return handler, nil
+}
+
+// NewStreamingHTTPHandlerWithManualOIDC creates a new StreamingHTTPHandler with
+// manually provided OAuth/OIDC configuration, bypassing OIDC discovery.
+// This is useful for testing or environments where OIDC discovery is not available.
+func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOIDCConfig) (*StreamingHTTPHandler, error) {
+	mcpURL, err := url.Parse(config.ServerURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server URL %q: %w", config.ServerURL, err)
+	}
+
+	if mcpURL.Scheme != "https" && mcpURL.Scheme != "http" {
+		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
+	}
+
+	if config.Issuer == "" {
+		return nil, fmt.Errorf("issuer is required")
+	}
+
+	if config.JwksURI == "" {
+		return nil, fmt.Errorf("JwksURI is required")
+	}
+
+	if config.Hooks == nil {
+		return nil, fmt.Errorf("hooks is required")
+	}
+
+	if config.Sessions == nil {
+		return nil, fmt.Errorf("sessions is required")
+	}
+
+	logHandler := slog.DiscardHandler
+
+	if config.LogHandler != nil {
+		logHandler = config.LogHandler
+	}
+
+	log := slog.New(logHandler)
+
 	h := &StreamingHTTPHandler{
+		log:          log,
 		serverURL:    mcpURL,
-		oidcProvider: provider,
+		oidcProvider: nil, // Not needed for manual configuration
+		auth:         config.Auth,
+		hooks:        config.Hooks,
+		sessions:     config.Sessions,
 		prmDocument: wellknown.ProtectedResourceMetadata{
 			Resource:                              mcpURL.String(),
-			AuthorizationServers:                  []string{asm.Issuer},
-			JwksURI:                               asm.JwksUri,
-			ScopesSupported:                       asm.ScopesSupported,
-			BearerMethodsSupported:                asm.TokenEndpointAuthMethodsSupported,
-			ResourceSigningAlgValuesSupported:     asm.TokenEndpointAuthSigningAlgValuesSupported,
+			AuthorizationServers:                  []string{config.Issuer},
+			JwksURI:                               config.JwksURI,
+			ScopesSupported:                       config.ScopesSupported,
+			BearerMethodsSupported:                config.TokenEndpointAuthMethodsSupported,
+			ResourceSigningAlgValuesSupported:     config.TokenEndpointAuthSigningAlgValuesSupported,
 			ResourceName:                          config.ServerName,
-			ResourceDocumentation:                 asm.ServiceDocumentation,
-			ResourcePolicyURI:                     asm.OpPolicyUri,
-			ResourceTosURI:                        asm.OpTosUri,
+			ResourceDocumentation:                 config.ServiceDocumentation,
+			ResourcePolicyURI:                     config.OpPolicyUri,
+			ResourceTosURI:                        config.OpTosUri,
 			TlsClientCertificateBoundAccessTokens: false,
 			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
 		},
@@ -152,22 +272,71 @@ func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(fmt.Sprintf("POST %s", strings.TrimPrefix(mcpURL.String(), "https://")), h.handlePostMCP)
-	mux.HandleFunc(fmt.Sprintf("GET %s", strings.TrimPrefix(mcpURL.String(), "https://")), h.handleGetMCP)
-	mux.HandleFunc(fmt.Sprintf("GET %s", strings.TrimPrefix(h.prmDocumentURL.String(), "https://")), h.handleGetProtectedResourceMetadata)
+	mux.HandleFunc(fmt.Sprintf("POST %s", hostPath(mcpURL)), h.handlePostMCP)
+	mux.HandleFunc(fmt.Sprintf("GET %s", hostPath(mcpURL)), h.handleGetMCP)
+	mux.HandleFunc(fmt.Sprintf("GET %s", hostPath(h.prmDocumentURL)), h.handleGetProtectedResourceMetadata)
 
 	h.mux = mux
 
 	return h, nil
 }
 
+// hostPath takes a url.URL and returns the host and path components concatenated.
+// For example, for URL "https://example.com:8080/foo/bar", it returns "example.com/foo/bar".
+// If the path is empty, it returns
+func hostPath(u *url.URL) string {
+	path := u.Path
+	if path == "" || path == "/" {
+		path = "/{$}"
+	}
+	return u.Hostname() + path
+}
+
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+// checkAuthentication safely checks authentication, handling the case where no authenticator is configured.
+// If no authenticator is set, it returns a result indicating the request is authenticated (for testing/development).
+func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) (auth.AuthenticationResult, error) {
+	if h.auth == nil {
+		// No authenticator configured, allow request for testing/development
+		return &noAuthResult{}, nil
+	}
+	return h.auth.CheckAuthentication(r)
+}
+
+// noAuthResult is a simple implementation that always returns authenticated
+// Used when no authenticator is configured
+type noAuthResult struct{}
+
+func (n *noAuthResult) IsAuthenticated() bool {
+	return true
+}
+
+func (n *noAuthResult) UserInfo() (auth.UserInfo, error) {
+	return &noAuthUserInfo{}, nil
+}
+
+func (n *noAuthResult) GetAuthenticationChallenge() *auth.AuthenticationChallenge {
+	return nil
+}
+
+// noAuthUserInfo provides default user info when no authenticator is configured
+type noAuthUserInfo struct{}
+
+func (n *noAuthUserInfo) UserID() string {
+	return "test-user"
+}
+
+func (n *noAuthUserInfo) Claims(ref any) error {
+	return nil // No claims to unmarshal
 }
 
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
+	h.log.Debug("handlePostMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
 	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
 	if err != nil {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -186,7 +355,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	authResult, err := h.auth.CheckAuthentication(r)
+	authResult, err := h.checkAuthentication(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -284,7 +453,13 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
-		res, err := h.hooks.Initialize(ctx, session, &initializeReq)
+		initializeRes, err := h.hooks.Initialize(ctx, session, &initializeReq)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -369,6 +544,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 // handleGetMCP handles the GET /mcp endpoint, which is used to consume messages
 // from an established session.
 func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handleGetMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
 	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
 	if err != nil {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -381,7 +557,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	authResult, err := h.auth.CheckAuthentication(r)
+	authResult, err := h.checkAuthentication(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -495,6 +671,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 // handleGetProtectedResourceMetadata serves the OAuth2 Protected Resource Metadata
 // document crafted when the StreamingHTTPHandler initialized.
 func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handleGetProtectedResourceMetadata", slog.String("method", r.Method), slog.String("url", r.URL.String()))
 	w.Header().Set("Content-Type", "application/json")
 
 	if err := json.NewEncoder(w).Encode(h.prmDocument); err != nil {

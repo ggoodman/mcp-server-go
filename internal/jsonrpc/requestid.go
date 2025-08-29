@@ -22,7 +22,7 @@ func NewRequestID(value interface{}) *RequestID {
 
 // String returns the prefixed string representation of the ID
 // Format: "s:<string_value>" for strings, "n:<numeric_value>" for numbers, "nil:" for nil values
-func (id RequestID) String() string {
+func (id *RequestID) String() string {
 	if id.value == nil {
 		return ""
 	}
@@ -38,30 +38,29 @@ func (id RequestID) String() string {
 }
 
 // Value returns the underlying value
-func (id RequestID) Value() interface{} {
+func (id *RequestID) Value() interface{} {
 	return id.value
 }
 
 // IsNil returns true if the ID is nil/empty
-func (id RequestID) IsNil() bool {
+func (id *RequestID) IsNil() bool {
+	if id == nil {
+		return true
+	}
+
 	return id.value == nil
 }
 
 // MarshalJSON implements json.Marshaler
-func (id RequestID) MarshalJSON() ([]byte, error) {
-	if id.value == nil {
-		return []byte("null"), nil
+func (id *RequestID) MarshalJSON() ([]byte, error) {
+	if id == nil || id.value == nil {
+		return []byte{}, nil
 	}
 	return json.Marshal(id.value)
 }
 
 // UnmarshalJSON implements json.Unmarshaler
 func (id *RequestID) UnmarshalJSON(data []byte) error {
-	if string(data) == "null" {
-		id.value = nil
-		return nil
-	}
-
 	// Try to unmarshal as a number first
 	var num float64
 	if err := json.Unmarshal(data, &num); err == nil {

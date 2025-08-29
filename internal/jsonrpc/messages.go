@@ -32,6 +32,19 @@ type Response struct {
 	ID             *RequestID      `json:"id,omitempty"`
 }
 
+func NewResultResponse(id *RequestID, result any) (*Response, error) {
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal result: %w", err)
+	}
+
+	return &Response{
+		JSONRPCVersion: ProtocolVersion,
+		Result:         resultBytes,
+		ID:             id,
+	}, nil
+}
+
 type Error struct {
 	Code    ErrorCode `json:"code"`
 	Message string    `json:"message"`
