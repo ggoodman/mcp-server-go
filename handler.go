@@ -78,8 +78,8 @@ type StreamingHTTPConfig struct {
 	// AuthorizationServerURL is the URL of the OIDC authorization server.
 	AuthorizationServerURL string
 
-	// Auth is an optional custom authenticator. If nil, authentication checks will be skipped.
-	Auth auth.Authenticator
+	// Authenticator provides authentication logic for the MCP server.
+	Authenticator auth.Authenticator
 
 	// Hooks provides the MCP server logic implementation.
 	Hooks hooks.Hooks
@@ -115,8 +115,8 @@ type ManualOIDCConfig struct {
 	OpPolicyUri                                string
 	OpTosUri                                   string
 
-	// Auth is an optional custom authenticator. If nil, authentication checks will be skipped.
-	Auth auth.Authenticator
+	// Authenticator provides authentication logic for the MCP server.
+	Authenticator auth.Authenticator
 
 	// Hooks provides the MCP server logic implementation.
 	Hooks hooks.Hooks
@@ -149,6 +149,10 @@ type writeFlusher interface {
 }
 
 func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*StreamingHTTPHandler, error) {
+	if config.Authenticator == nil {
+		return nil, fmt.Errorf("authenticator is required")
+	}
+
 	if config.Hooks == nil {
 		return nil, fmt.Errorf("hooks is required")
 	}
@@ -185,7 +189,7 @@ func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*
 		ServiceDocumentation:                       asm.ServiceDocumentation,
 		OpPolicyUri:                                asm.OpPolicyUri,
 		OpTosUri:                                   asm.OpTosUri,
-		Auth:                                       config.Auth,
+		Authenticator:                              config.Authenticator,
 		Hooks:                                      config.Hooks,
 		Sessions:                                   config.Sessions,
 		LogHandler:                                 config.LogHandler,
@@ -223,6 +227,10 @@ func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOID
 		return nil, fmt.Errorf("JwksURI is required")
 	}
 
+	if config.Authenticator == nil {
+		return nil, fmt.Errorf("authenticator is required")
+	}
+
 	if config.Hooks == nil {
 		return nil, fmt.Errorf("hooks is required")
 	}
@@ -243,7 +251,7 @@ func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOID
 		log:          log,
 		serverURL:    mcpURL,
 		oidcProvider: nil, // Not needed for manual configuration
-		auth:         config.Auth,
+		auth:         config.Authenticator,
 		hooks:        config.Hooks,
 		sessions:     config.Sessions,
 		prmDocument: wellknown.ProtectedResourceMetadata{
@@ -296,43 +304,6 @@ func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	h.mux.ServeHTTP(w, r)
 }
 
-// checkAuthentication safely checks authentication, handling the case where no authenticator is configured.
-// If no authenticator is set, it returns a result indicating the request is authenticated (for testing/development).
-func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) (auth.AuthenticationResult, error) {
-	if h.auth == nil {
-		// No authenticator configured, allow request for testing/development
-		return &noAuthResult{}, nil
-	}
-	return h.auth.CheckAuthentication(r)
-}
-
-// noAuthResult is a simple implementation that always returns authenticated
-// Used when no authenticator is configured
-type noAuthResult struct{}
-
-func (n *noAuthResult) IsAuthenticated() bool {
-	return true
-}
-
-func (n *noAuthResult) UserInfo() (auth.UserInfo, error) {
-	return &noAuthUserInfo{}, nil
-}
-
-func (n *noAuthResult) GetAuthenticationChallenge() *auth.AuthenticationChallenge {
-	return nil
-}
-
-// noAuthUserInfo provides default user info when no authenticator is configured
-type noAuthUserInfo struct{}
-
-func (n *noAuthUserInfo) UserID() string {
-	return "test-user"
-}
-
-func (n *noAuthUserInfo) Claims(ref any) error {
-	return nil // No claims to unmarshal
-}
-
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
@@ -355,7 +326,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	authResult, err := h.checkAuthentication(r)
+	authResult, err := h.auth.CheckAuthentication(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -508,6 +479,10 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
+		// Set the content type for the SSE response
+		w.Header().Set("Content-Type", eventStreamMediaType.String())
+		w.WriteHeader(http.StatusOK)
+
 		// This is a request with an ID, so we need to handle it appropriately.
 		res, err := h.handleRequest(ctx, session, userInfo, req)
 		if err != nil {
@@ -557,7 +532,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	authResult, err := h.checkAuthentication(r)
+	authResult, err := h.auth.CheckAuthentication(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -686,6 +661,25 @@ func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session s
 }
 
 func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	switch req.Method {
+	case string(mcp.PingMethod):
+		return jsonrpc.NewResultResponse(req.ID, struct{}{})
+	case string(mcp.ToolsListMethod):
+		toolsCap := h.hooks.GetToolsCapability()
+
+		if toolsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
+		}
+
+		tools, err := toolsCap.ListTools(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "failed to list tools", nil), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListToolsResult{
+			Tools: tools,
+		})
+	}
 	// TODO: Actually handle the request
 	return &jsonrpc.Response{
 		JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -704,66 +698,6 @@ func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessi
 	// TODO: Actually handle the response
 	return nil
 }
-
-// type authenticationResult struct {
-// 	isAuthenticated       bool
-// 	userInfo              auth.UserInfo
-// 	status                int
-// 	wwwAuthenticateHeader string
-// 	err                   error
-// }
-
-// func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) authenticationResult {
-// 	_, cancel := context.WithCancel(r.Context())
-// 	defer cancel()
-
-// 	prmDocumentURL := h.prmDocumentURL.String()
-
-// 	if strings.ContainsAny(prmDocumentURL, "\\\"") {
-// 		return authenticationResult{
-// 			isAuthenticated: false,
-// 			status:          http.StatusInternalServerError,
-// 			err:             fmt.Errorf("protected resource metadata URL contains invalid characters"),
-// 		}
-// 	}
-
-// 	authzHeader := r.Header.Get(authorizationHeader)
-// 	if authzHeader == "" {
-// 		return authenticationResult{
-// 			isAuthenticated:       false,
-// 			status:                http.StatusUnauthorized,
-// 			wwwAuthenticateHeader: fmt.Sprintf("resource_metadata=\"%s\"", prmDocumentURL),
-// 		}
-// 	}
-
-// 	prefix, value, ok := strings.Cut(authzHeader, " ")
-// 	if !ok || prefix != "Bearer" || value == "" {
-// 		return authenticationResult{
-// 			isAuthenticated: false,
-// 			status:          http.StatusBadRequest,
-// 		}
-// 	}
-
-// 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-// 	defer cancel()
-
-// 	userInfo, err := h.oidcProvider.UserInfo(ctx, oauth2.StaticTokenSource(&oauth2.Token{
-// 		AccessToken: value,
-// 	}))
-// 	if err != nil {
-// 		return authenticationResult{
-// 			isAuthenticated: false,
-// 			status:          http.StatusInternalServerError,
-// 			err:             err,
-// 		}
-// 	}
-
-// 	// Fallback
-// 	return authenticationResult{
-// 		isAuthenticated: true,
-// 		userInfo:        userInfo,
-// 	}
-// }
 
 // writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.
 // The message will be JSON encoded and written as the data field of the SSE event.

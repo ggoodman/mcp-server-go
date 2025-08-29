@@ -45,6 +45,18 @@ func NewResultResponse(id *RequestID, result any) (*Response, error) {
 	}, nil
 }
 
+func NewErrorResponse(id *RequestID, code ErrorCode, message string, data any) *Response {
+	return &Response{
+		JSONRPCVersion: ProtocolVersion,
+		Error: &Error{
+			Code:    code,
+			Message: message,
+			Data:    data,
+		},
+		ID: id,
+	}
+}
+
 type Error struct {
 	Code    ErrorCode `json:"code"`
 	Message string    `json:"message"`

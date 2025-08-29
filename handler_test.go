@@ -10,14 +10,14 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ggoodman/mcp-streaming-http-go/hooks"
-	"github.com/ggoodman/mcp-streaming-http-go/mcp"
+	"github.com/ggoodman/mcp-streaming-http-go/auth/authtest"
+	"github.com/ggoodman/mcp-streaming-http-go/hooks/hookstest"
 	"github.com/ggoodman/mcp-streaming-http-go/sessions/memory"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestSingleInstance(t *testing.T) {
-	t.Run("Simple tool call", func(t *testing.T) {
+	t.Run("Basic list tools", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
@@ -29,13 +29,14 @@ func TestSingleInstance(t *testing.T) {
 		defer srv.Close()
 
 		handler, err := NewStreamingHTTPHandlerWithManualOIDC(ctx, ManualOIDCConfig{
-			ServerURL:  srv.URL,
-			ServerName: "TestServer",
-			Issuer:     "http://127.0.0.1:0",
-			JwksURI:    "http://127.0.0.1/.well-known/jwks.json",
-			Hooks:      &mockHooks{},
-			Sessions:   memory.NewStore(),
-			LogHandler: testLogHandler(t),
+			ServerURL:     srv.URL,
+			ServerName:    "TestServer",
+			Issuer:        "http://127.0.0.1:0",
+			JwksURI:       "http://127.0.0.1/.well-known/jwks.json",
+			Authenticator: authtest.NewNoAuth(""),
+			Hooks:         hookstest.NewMockHooks(hookstest.WithEmptyToolsCapability()),
+			Sessions:      memory.NewStore(),
+			LogHandler:    testLogHandler(t),
 		})
 		if err != nil {
 			t.Fatalf("Failed to create handler: %v", err)
@@ -55,53 +56,21 @@ func TestSingleInstance(t *testing.T) {
 		}
 		defer cs.Close()
 
-		// Match the implementation info from mockHooks
+		// Match the implementation info from hookstest.NewMockHooks
 		if want, got := "test-server", cs.InitializeResult().ServerInfo.Name; want != got {
 			t.Errorf("Unexpected server name: want %q, got %q", want, got)
 		}
 
-		params := &sdk.CallToolParams{
-			Name:      "greet",
-			Arguments: map[string]any{"name": "you"},
-		}
-		res, err := cs.CallTool(ctx, params)
+		res, err := cs.ListTools(ctx, &sdk.ListToolsParams{})
 		if err != nil {
 			t.Fatalf("CallTool failed: %v", err)
 		}
 
-		if res.IsError {
-			t.Fatalf("CallTool returned error: %v", res.Content)
+		if want, got := 0, len(res.Tools); want != got {
+			t.Errorf("Unexpected number of tools: want %d, got %d", want, got)
 		}
 	})
 }
-
-// ============================================================================
-
-// mockHooks provides a minimal implementation of hooks.Hooks for testing
-type mockHooks struct{}
-
-func (m *mockHooks) Initialize(ctx context.Context, session hooks.Session, req *mcp.InitializeRequest) (*mcp.InitializeResult, error) {
-	return &mcp.InitializeResult{
-		ProtocolVersion: "2024-11-05",
-		Capabilities: mcp.ServerCapabilities{
-			Tools: &struct {
-				ListChanged bool `json:"listChanged"`
-			}{
-				ListChanged: false,
-			},
-		},
-		ServerInfo: mcp.ImplementationInfo{
-			Name:    "test-server",
-			Version: "1.0.0",
-		},
-	}, nil
-}
-
-func (m *mockHooks) GetToolsCapability() hooks.ToolsCapability             { return nil }
-func (m *mockHooks) GetResourcesCapability() hooks.ResourcesCapability     { return nil }
-func (m *mockHooks) GetPromptsCapability() hooks.PromptsCapability         { return nil }
-func (m *mockHooks) GetLoggingCapability() hooks.LoggingCapability         { return nil }
-func (m *mockHooks) GetCompletionsCapability() hooks.CompletionsCapability { return nil }
 
 // ============================================================================
 

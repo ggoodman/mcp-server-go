@@ -1,4 +1,4 @@
-package test
+package authtest
 
 import (
 	"net/http"
