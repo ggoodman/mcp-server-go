@@ -209,11 +209,9 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		session, err := h.sessions.CreateSession(ctx, authResult.userInfo.Subject, &sessions.SessionMetadata{
 			ClientInfo: struct {
 				Name    string
-				Title   string
 				Version string
 			}{
 				Name:    initializeReq.ClientInfo.Name,
-				Title:   initializeReq.ClientInfo.Title,
 				Version: initializeReq.ClientInfo.Version,
 			},
 			Capabilities: struct {
@@ -274,7 +272,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			w.WriteHeader(http.StatusAccepted)
 
 			switch req.Method {
-			case string(mcp.InitializedNotification):
+			case string(mcp.InitializedNotificationMethod):
 			}
 
 			return

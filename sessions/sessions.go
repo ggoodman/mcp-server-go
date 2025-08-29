@@ -23,7 +23,6 @@ type MessageHandlerFunction func(ctx context.Context, msg MessageEnvelope) error
 type SessionMetadata struct {
 	ClientInfo struct {
 		Name    string
-		Title   string
 		Version string
 	}
 	Capabilities struct {

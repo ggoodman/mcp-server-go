@@ -8,5 +8,5 @@ import (
 )
 
 type ModelContextProtocolHooks interface {
-	Initialize(ctx context.Context, session sessions.Session, req *mcp.InitializeRequest) (*mcp.InitializeResponse, error)
+	Initialize(ctx context.Context, session sessions.Session, req *mcp.InitializeRequest) (*mcp.InitializeResult, error)
 }
