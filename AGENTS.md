@@ -17,8 +17,14 @@ This library MUST adhere to the following specs.
 - Horizontally scalable. JSON-RPC requests, notifications and responses may land on any node and the library must support coordination in such an environment.
 - Designed for production users with minimal internal library opinions
 - Security is a first-class concern. We take no risks when it comes to cross-user contamination.
+- Aim for mutually exclusive and collectively exhaustive capabilities. Avoid having duplicate ways of doing things but make sure everything can be done.
 
 ## Tool usage
 
 1. NEVER run `go build` if a similar outcome can be achieved by using the "Go Please" tool suite. It is the language server and will give faster more easily-understood feedback.
 2. AVOID running `go test` if the built-in test runner can achieve the same thing.
+3. NEVER run a shell command when a tool can provide the same outcome.
+
+## Behaviour
+
+- Consider different approaches and their trade-offs. When the balance of trade-offs is unclear, confirm with the user.

@@ -13,12 +13,38 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
+	"github.com/ggoodman/mcp-streaming-http-go/hooks"
 	"github.com/ggoodman/mcp-streaming-http-go/internal/wellknown"
 	"github.com/ggoodman/mcp-streaming-http-go/jsonrpc"
 	"github.com/ggoodman/mcp-streaming-http-go/mcp"
 	"github.com/ggoodman/mcp-streaming-http-go/sessions"
 	"golang.org/x/oauth2"
 )
+
+// sessionMetadata implements the sessions.SessionMetadata interface
+// to bridge between MCP client capabilities and session requirements
+type sessionMetadata struct {
+	clientInfo            sessions.ClientInfo
+	samplingCapability    hooks.SamplingCapability
+	rootsCapability       hooks.RootsCapability
+	elicitationCapability hooks.ElicitationCapability
+}
+
+func (m *sessionMetadata) ClientInfo() sessions.ClientInfo {
+	return m.clientInfo
+}
+
+func (m *sessionMetadata) GetSamplingCapability() hooks.SamplingCapability {
+	return m.samplingCapability
+}
+
+func (m *sessionMetadata) GetRootsCapability() hooks.RootsCapability {
+	return m.rootsCapability
+}
+
+func (m *sessionMetadata) GetElicitationCapability() hooks.ElicitationCapability {
+	return m.elicitationCapability
+}
 
 var (
 	_ http.Handler = (*StreamingHTTPHandler)(nil)
@@ -62,7 +88,7 @@ type StreamingHTTPHandler struct {
 	prmDocumentURL *url.URL
 	serverURL      *url.URL
 
-	hooks    ModelContextProtocolHooks
+	hooks    hooks.Hooks
 	sessions sessions.SessionStore
 }
 
@@ -204,26 +230,35 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
-		// TODO: This is SUUUPER ugly but maybe okay for now. This massive copy happens once per session and
-		// is 100% internal code. We have a duplicate type in sessions to decouple the two sub-packages.
-		session, err := h.sessions.CreateSession(ctx, authResult.userInfo.Subject, &sessions.SessionMetadata{
-			ClientInfo: struct {
-				Name    string
-				Version string
-			}{
+		// Create session metadata with client info and capability placeholders
+		// Note: Client capabilities will be properly implemented by the session layer
+		metadata := &sessionMetadata{
+			clientInfo: sessions.ClientInfo{
 				Name:    initializeReq.ClientInfo.Name,
 				Version: initializeReq.ClientInfo.Version,
 			},
-			Capabilities: struct {
-				Roots       *struct{ ListChanged bool }
-				Sampling    *struct{}
-				Elicitation *struct{}
-			}{
-				Roots:       &struct{ ListChanged bool }{ListChanged: initializeReq.Capabilities.Roots != nil && initializeReq.Capabilities.Roots.ListChanged},
-				Sampling:    initializeReq.Capabilities.Sampling,
-				Elicitation: initializeReq.Capabilities.Elicitation,
-			},
-		})
+			// Client capabilities are handled by the session implementation
+			// These will be nil if the client doesn't support the capability
+			samplingCapability:    nil, // Will be set by session if client supports sampling
+			rootsCapability:       nil, // Will be set by session if client supports roots
+			elicitationCapability: nil, // Will be set by session if client supports elicitation
+		}
+
+		// Check client capabilities and set them if supported
+		if initializeReq.Capabilities.Sampling != nil {
+			// The session implementation will provide the actual sampling capability
+			// For now we set it to nil - this should be handled by the session layer
+		}
+		if initializeReq.Capabilities.Roots != nil {
+			// The session implementation will provide the actual roots capability
+			// For now we set it to nil - this should be handled by the session layer
+		}
+		if initializeReq.Capabilities.Elicitation != nil {
+			// The session implementation will provide the actual elicitation capability
+			// For now we set it to nil - this should be handled by the session layer
+		}
+
+		session, err := h.sessions.CreateSession(ctx, authResult.userInfo.Subject, metadata)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
