@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
-	"github.com/ggoodman/mcp-streaming-http-go/jsonrpc"
+	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 )
 
 type Session interface {

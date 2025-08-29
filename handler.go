@@ -13,12 +13,12 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
+	"github.com/ggoodman/mcp-streaming-http-go/auth"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
+	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-streaming-http-go/internal/wellknown"
-	"github.com/ggoodman/mcp-streaming-http-go/jsonrpc"
 	"github.com/ggoodman/mcp-streaming-http-go/mcp"
 	"github.com/ggoodman/mcp-streaming-http-go/sessions"
-	"golang.org/x/oauth2"
 )
 
 // sessionMetadata implements the sessions.SessionMetadata interface
@@ -88,6 +88,7 @@ type StreamingHTTPHandler struct {
 	prmDocumentURL *url.URL
 	serverURL      *url.URL
 
+	auth     auth.Authenticator
 	hooks    hooks.Hooks
 	sessions sessions.SessionStore
 }
@@ -103,8 +104,8 @@ func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*
 		return nil, fmt.Errorf("invalid server URL %q: %w", config.ServerURL, err)
 	}
 
-	if mcpURL.Scheme != "https" {
-		return nil, fmt.Errorf("server URL must use HTTPS scheme, got %q", mcpURL.Scheme)
+	if mcpURL.Scheme != "https" && mcpURL.Scheme != "http" {
+		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
 	}
 
 	provider, err := oidc.NewProvider(ctx, config.AuthorizationServerURL)
@@ -185,16 +186,35 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	authResult := h.checkAuthentication(r)
-	if !authResult.isAuthenticated {
-		if authResult.wwwAuthenticateHeader != "" {
-			w.Header().Add(wwwAuthenticateHeader, authResult.wwwAuthenticateHeader)
+	authResult, err := h.auth.CheckAuthentication(r)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if !authResult.IsAuthenticated() {
+		challenge := authResult.GetAuthenticationChallenge()
+
+		if challenge == nil {
+			// Invalid implementation of the interface
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if challenge.WWWAuthenticate != "" {
+			w.Header().Add(wwwAuthenticateHeader, challenge.WWWAuthenticate)
 		}
 		status := http.StatusUnauthorized
-		if authResult.status != 0 {
-			status = authResult.status
+		if challenge.Status != 0 {
+			status = challenge.Status
 		}
 		w.WriteHeader(status)
+		return
+	}
+
+	userInfo, err := authResult.UserInfo()
+	if err != nil || userInfo == nil {
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -258,7 +278,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			// For now we set it to nil - this should be handled by the session layer
 		}
 
-		session, err := h.sessions.CreateSession(ctx, authResult.userInfo.Subject, metadata)
+		session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), metadata)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -282,7 +302,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	// An MCP-Session-ID header is required for all other requests. The session MUST exist and be
 	// bound to the authenticated user.
-	session, err := h.sessions.LoadSession(ctx, sessID, authResult.userInfo.Subject)
+	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID())
 	if err != nil {
 		if errors.Is(err, ErrInvalidSession) {
 			// Signal that the session is invalid and that the client needs to re-initialize
@@ -298,7 +318,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	// We have a valid session now. Let's see what kind of message it is.
 	if req := msg.AsRequest(); req != nil {
 		if req.ID.IsNil() {
-			if err := h.handleNotification(ctx, session, authResult.userInfo, req); err != nil {
+			if err := h.handleNotification(ctx, session, userInfo, req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -314,7 +334,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		}
 
 		// This is a request with an ID, so we need to handle it appropriately.
-		res, err := h.handleRequest(ctx, session, authResult.userInfo, req)
+		res, err := h.handleRequest(ctx, session, userInfo, req)
 		if err != nil {
 			res = &jsonrpc.Response{
 				JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -336,7 +356,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	if res := msg.AsResponse(); res != nil {
 		// TODO: Dispatch the response to the communication mesh.
 
-		if err := h.handleResponse(ctx, session, authResult.userInfo, res); err != nil {
+		if err := h.handleResponse(ctx, session, userInfo, res); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -361,16 +381,35 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	authResult := h.checkAuthentication(r)
-	if !authResult.isAuthenticated {
-		if authResult.wwwAuthenticateHeader != "" {
-			w.Header().Add("WWW-Authenticate", authResult.wwwAuthenticateHeader)
+	authResult, err := h.auth.CheckAuthentication(r)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if !authResult.IsAuthenticated() {
+		challenge := authResult.GetAuthenticationChallenge()
+
+		if challenge == nil {
+			// Invalid implementation of the interface
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if challenge.WWWAuthenticate != "" {
+			w.Header().Add(wwwAuthenticateHeader, challenge.WWWAuthenticate)
 		}
 		status := http.StatusUnauthorized
-		if authResult.status != 0 {
-			status = authResult.status
+		if challenge.Status != 0 {
+			status = challenge.Status
 		}
 		w.WriteHeader(status)
+		return
+	}
+
+	userInfo, err := authResult.UserInfo()
+	if err != nil || userInfo == nil {
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -385,7 +424,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	wroteHeadersCh := make(chan struct{})
 
-	session, err := h.sessions.LoadSession(ctx, sessionHeader, authResult.userInfo.Subject)
+	session, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID())
 	if err != nil {
 		if errors.Is(err, ErrInvalidSession) {
 			w.WriteHeader(http.StatusNotFound)
@@ -464,12 +503,12 @@ func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.Respons
 	}
 }
 
-func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo *oidc.UserInfo, req *jsonrpc.Request) error {
+func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
 	// TODO: Actually handle the notification
 	return nil
 }
 
-func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo *oidc.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	// TODO: Actually handle the request
 	return &jsonrpc.Response{
 		JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -484,70 +523,70 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 	}, nil
 }
 
-func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, userInfo *oidc.UserInfo, res *jsonrpc.Response) error {
+func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, res *jsonrpc.Response) error {
 	// TODO: Actually handle the response
 	return nil
 }
 
-type authenticationResult struct {
-	isAuthenticated       bool
-	userInfo              *oidc.UserInfo
-	status                int
-	wwwAuthenticateHeader string
-	err                   error
-}
+// type authenticationResult struct {
+// 	isAuthenticated       bool
+// 	userInfo              auth.UserInfo
+// 	status                int
+// 	wwwAuthenticateHeader string
+// 	err                   error
+// }
 
-func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) authenticationResult {
-	_, cancel := context.WithCancel(r.Context())
-	defer cancel()
+// func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) authenticationResult {
+// 	_, cancel := context.WithCancel(r.Context())
+// 	defer cancel()
 
-	prmDocumentURL := h.prmDocumentURL.String()
+// 	prmDocumentURL := h.prmDocumentURL.String()
 
-	if strings.ContainsAny(prmDocumentURL, "\\\"") {
-		return authenticationResult{
-			isAuthenticated: false,
-			status:          http.StatusInternalServerError,
-			err:             fmt.Errorf("protected resource metadata URL contains invalid characters"),
-		}
-	}
+// 	if strings.ContainsAny(prmDocumentURL, "\\\"") {
+// 		return authenticationResult{
+// 			isAuthenticated: false,
+// 			status:          http.StatusInternalServerError,
+// 			err:             fmt.Errorf("protected resource metadata URL contains invalid characters"),
+// 		}
+// 	}
 
-	authzHeader := r.Header.Get(authorizationHeader)
-	if authzHeader == "" {
-		return authenticationResult{
-			isAuthenticated:       false,
-			status:                http.StatusUnauthorized,
-			wwwAuthenticateHeader: fmt.Sprintf("resource_metadata=\"%s\"", prmDocumentURL),
-		}
-	}
+// 	authzHeader := r.Header.Get(authorizationHeader)
+// 	if authzHeader == "" {
+// 		return authenticationResult{
+// 			isAuthenticated:       false,
+// 			status:                http.StatusUnauthorized,
+// 			wwwAuthenticateHeader: fmt.Sprintf("resource_metadata=\"%s\"", prmDocumentURL),
+// 		}
+// 	}
 
-	prefix, value, ok := strings.Cut(authzHeader, " ")
-	if !ok || prefix != "Bearer" || value == "" {
-		return authenticationResult{
-			isAuthenticated: false,
-			status:          http.StatusBadRequest,
-		}
-	}
+// 	prefix, value, ok := strings.Cut(authzHeader, " ")
+// 	if !ok || prefix != "Bearer" || value == "" {
+// 		return authenticationResult{
+// 			isAuthenticated: false,
+// 			status:          http.StatusBadRequest,
+// 		}
+// 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
+// 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+// 	defer cancel()
 
-	userInfo, err := h.oidcProvider.UserInfo(ctx, oauth2.StaticTokenSource(&oauth2.Token{
-		AccessToken: value,
-	}))
-	if err != nil {
-		return authenticationResult{
-			isAuthenticated: false,
-			status:          http.StatusInternalServerError,
-			err:             err,
-		}
-	}
+// 	userInfo, err := h.oidcProvider.UserInfo(ctx, oauth2.StaticTokenSource(&oauth2.Token{
+// 		AccessToken: value,
+// 	}))
+// 	if err != nil {
+// 		return authenticationResult{
+// 			isAuthenticated: false,
+// 			status:          http.StatusInternalServerError,
+// 			err:             err,
+// 		}
+// 	}
 
-	// Fallback
-	return authenticationResult{
-		isAuthenticated: true,
-		userInfo:        userInfo,
-	}
-}
+// 	// Fallback
+// 	return authenticationResult{
+// 		isAuthenticated: true,
+// 		userInfo:        userInfo,
+// 	}
+// }
 
 // writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.
 // The message will be JSON encoded and written as the data field of the SSE event.
