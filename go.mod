@@ -7,6 +7,7 @@ require (
 	github.com/elnormous/contenttype v1.0.4
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v0.3.0
+	golang.org/x/sync v0.16.0
 )
 
 require (

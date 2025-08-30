@@ -371,76 +371,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	if sessID == "" {
 		// If the session header is missing, the client MUST be establishing a new session
 		// via an initialize MCP request.
-
-		req := msg.AsRequest()
-		if req == nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		if req.Method != "initialize" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		var initializeReq mcp.InitializeRequest
-
-		if err := json.Unmarshal(req.Params, &initializeReq); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		// Create session metadata with client info and capability placeholders
-		// Note: Client capabilities will be properly implemented by the session layer
-		metadata := &sessionMetadata{
-			clientInfo: sessions.ClientInfo{
-				Name:    initializeReq.ClientInfo.Name,
-				Version: initializeReq.ClientInfo.Version,
-			},
-			// Client capabilities are handled by the session implementation
-			// These will be nil if the client doesn't support the capability
-			samplingCapability:    nil, // Will be set by session if client supports sampling
-			rootsCapability:       nil, // Will be set by session if client supports roots
-			elicitationCapability: nil, // Will be set by session if client supports elicitation
-		}
-
-		// Check client capabilities and set them if supported
-		if initializeReq.Capabilities.Sampling != nil {
-			// The session implementation will provide the actual sampling capability
-			// For now we set it to nil - this should be handled by the session layer
-		}
-		if initializeReq.Capabilities.Roots != nil {
-			// The session implementation will provide the actual roots capability
-			// For now we set it to nil - this should be handled by the session layer
-		}
-		if initializeReq.Capabilities.Elicitation != nil {
-			// The session implementation will provide the actual elicitation capability
-			// For now we set it to nil - this should be handled by the session layer
-		}
-
-		session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), metadata)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		initializeRes, err := h.hooks.Initialize(ctx, session, &initializeReq)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set(mcpSessionIdHeader, session.SessionID())
-		w.Header().Set("Content-Type", eventStreamMediaType.String())
-		w.WriteHeader(http.StatusOK)
-		if err := writeSSEEvent(wf, "response", "", res); err != nil {
-			// At this point headers are already written, so we can't change the status code
+		if err := h.handleSessionInitialization(ctx, wf, w, userInfo, msg); err != nil {
+			// Error handling is done within handleSessionInitialization
 			return
 		}
 		return
@@ -657,6 +589,83 @@ func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.Respons
 
 func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
 	// TODO: Actually handle the notification
+	return nil
+}
+
+// handleSessionInitialization handles the initialization of a new MCP session
+// when no mcp-session-id header is present in the request.
+func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, wf writeFlusher, w http.ResponseWriter, userInfo auth.UserInfo, msg jsonrpc.AnyMessage) error {
+	req := msg.AsRequest()
+	if req == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return fmt.Errorf("expected request message for session initialization")
+	}
+
+	if req.Method != "initialize" {
+		w.WriteHeader(http.StatusNotFound)
+		return fmt.Errorf("expected initialize method, got %s", req.Method)
+	}
+
+	var initializeReq mcp.InitializeRequest
+	if err := json.Unmarshal(req.Params, &initializeReq); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return fmt.Errorf("failed to unmarshal initialize request: %w", err)
+	}
+
+	// Create session metadata with client info and capability placeholders
+	// Note: Client capabilities will be properly implemented by the session layer
+	metadata := &sessionMetadata{
+		clientInfo: sessions.ClientInfo{
+			Name:    initializeReq.ClientInfo.Name,
+			Version: initializeReq.ClientInfo.Version,
+		},
+		// Client capabilities are handled by the session implementation
+		// These will be nil if the client doesn't support the capability
+		samplingCapability:    nil, // Will be set by session if client supports sampling
+		rootsCapability:       nil, // Will be set by session if client supports roots
+		elicitationCapability: nil, // Will be set by session if client supports elicitation
+	}
+
+	// Check client capabilities and set them if supported
+	if initializeReq.Capabilities.Sampling != nil {
+		// The session implementation will provide the actual sampling capability
+		// For now we set it to nil - this should be handled by the session layer
+	}
+	if initializeReq.Capabilities.Roots != nil {
+		// The session implementation will provide the actual roots capability
+		// For now we set it to nil - this should be handled by the session layer
+	}
+	if initializeReq.Capabilities.Elicitation != nil {
+		// The session implementation will provide the actual elicitation capability
+		// For now we set it to nil - this should be handled by the session layer
+	}
+
+	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), metadata)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to create session: %w", err)
+	}
+
+	initializeRes, err := h.hooks.Initialize(ctx, session, &initializeReq)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to initialize session: %w", err)
+	}
+
+	res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to create initialize response: %w", err)
+	}
+
+	w.Header().Set(mcpSessionIdHeader, session.SessionID())
+	w.Header().Set("Content-Type", eventStreamMediaType.String())
+	w.WriteHeader(http.StatusOK)
+	if err := writeSSEEvent(wf, "response", "", res); err != nil {
+		// At this point headers are already written, so we can't change the status code
+		return fmt.Errorf("failed to write SSE event: %w", err)
+	}
+
 	return nil
 }
 

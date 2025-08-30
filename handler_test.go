@@ -8,18 +8,22 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ggoodman/mcp-streaming-http-go/auth"
 	"github.com/ggoodman/mcp-streaming-http-go/auth/authtest"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks/hookstest"
+	"github.com/ggoodman/mcp-streaming-http-go/mcp"
 	"github.com/ggoodman/mcp-streaming-http-go/sessions"
 	"github.com/ggoodman/mcp-streaming-http-go/sessions/memory"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestSingleInstance(t *testing.T) {
+
 	t.Run("Basic list tools", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
@@ -57,11 +61,120 @@ func TestSingleInstance(t *testing.T) {
 	})
 }
 
+func TestMultiInstance(t *testing.T) {
+
+	t.Run("Invalid router index", func(t *testing.T) {
+		// Create server with a router that returns invalid indices
+		srv := mustMultiInstanceServer(t, 2,
+			func(r *http.Request, handlerCount int) int {
+				return 5 // Out of bounds
+			},
+			withServerName("invalid-router-test"),
+		)
+		defer srv.Close()
+
+		// Make a direct HTTP request since the SDK client won't work
+		// when the server returns 404
+		resp, err := http.Get(srv.URL + "/")
+		if err != nil {
+			t.Fatalf("HTTP request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if want, got := http.StatusNotFound, resp.StatusCode; want != got {
+			t.Errorf("Expected HTTP status %d, got %d", want, got)
+		}
+	})
+
+	t.Run("Tool call request and cancellation routed to different instances", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		blockCh := make(chan struct{})
+		defer close(blockCh)
+
+		toolStartedCh := make(chan struct{}, 1)
+		defer close(toolStartedCh)
+
+		toolStartedFlag := atomic.Bool{}
+
+		didCancel := atomic.Bool{}
+
+		srv := mustMultiInstanceServer(t, 2,
+			func(r *http.Request, handlerCount int) int {
+				if toolStartedFlag.Load() {
+					return 1
+				}
+
+				return 0
+			},
+			withHooks(
+				hookstest.NewMockHooks(
+					hookstest.WithToolsCapability(
+						hookstest.NewMockToolsCapability(
+							hookstest.WithCallToolHandler(func(ctx context.Context, session hooks.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+								toolStartedFlag.Store(true)
+								toolStartedCh <- struct{}{}
+
+								select {
+								case <-blockCh:
+									t.Fatalf("Tool call should have been cancelled")
+								case <-ctx.Done():
+									didCancel.Store(true)
+									return nil, ctx.Err()
+								}
+
+								return nil, nil
+							}),
+						),
+					),
+				),
+			),
+		)
+		defer srv.Close()
+
+		cs := mustClient(t, srv)
+		defer cs.Close()
+
+		g, ctx := errgroup.WithContext(ctx)
+
+		toolCtx, toolCancel := context.WithCancel(ctx)
+		defer toolCancel()
+
+		g.Go(func() error {
+			_, err := cs.CallTool(toolCtx, &sdk.CallToolParams{
+				Name:      "test-tool",
+				Arguments: map[string]any{},
+			})
+
+			if want, got := true, didCancel.Load(); want != got {
+				t.Errorf("Expected tool handler to be cancelled: want %v, got %v", want, got)
+			}
+
+			return err
+		})
+
+		g.Go(func() error {
+			<-toolStartedCh
+
+			toolCancel()
+
+			return nil
+		})
+
+		err := g.Wait()
+		if err == nil {
+			t.Fatalf("Expected CallTool to be cancelled, got nil error")
+		}
+
+	})
+}
+
 // ============================================================================
 
-// Bridge is an implementation of slog.Handler that works
+// logBridge is an implementation of slog.Handler that works
 // with the stdlib testing pkg.
-type Bridge struct {
+type logBridge struct {
 	slog.Handler
 	t   testing.TB
 	buf *bytes.Buffer
@@ -69,7 +182,7 @@ type Bridge struct {
 }
 
 // Handle implements slog.Handler.
-func (b *Bridge) Handle(ctx context.Context, rec slog.Record) error {
+func (b *logBridge) Handle(ctx context.Context, rec slog.Record) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -97,8 +210,8 @@ func (b *Bridge) Handle(ctx context.Context, rec slog.Record) error {
 }
 
 // WithAttrs implements slog.Handler.
-func (b *Bridge) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &Bridge{
+func (b *logBridge) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &logBridge{
 		t:       b.t,
 		buf:     b.buf,
 		mu:      b.mu,
@@ -107,8 +220,8 @@ func (b *Bridge) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 // WithGroup implements slog.Handler.
-func (b *Bridge) WithGroup(name string) slog.Handler {
-	return &Bridge{
+func (b *logBridge) WithGroup(name string) slog.Handler {
+	return &logBridge{
 		t:       b.t,
 		buf:     b.buf,
 		mu:      b.mu,
@@ -116,8 +229,8 @@ func (b *Bridge) WithGroup(name string) slog.Handler {
 	}
 }
 
-func testLogHandler(t *testing.T) *Bridge {
-	b := &Bridge{
+func testLogHandler(t *testing.T) *logBridge {
+	b := &logBridge{
 		t:   t,
 		buf: &bytes.Buffer{},
 		mu:  &sync.Mutex{},
@@ -267,6 +380,89 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 	}
 
 	handler = streamingHandler
+
+	return srv
+}
+
+// RouterFunc is a function that selects which handler instance should handle a request.
+// It receives the incoming request and should return the index of the handler to use.
+// If the returned index is out of bounds, the request will result in a 404.
+type RouterFunc func(r *http.Request, handlerCount int) int
+
+// mustMultiInstanceServer creates a test HTTP server with multiple StreamingHTTPHandler instances
+// and a configurable routing function to direct requests between them.
+// This is useful for testing distributed systems scenarios where different requests
+// need to be handled by different server instances.
+//
+// Example usage:
+//
+//	// Create 3 handlers with round-robin routing
+//	var counter int32
+//	srv := mustMultiInstanceServer(t, 3,
+//		func(r *http.Request, handlerCount int) int {
+//			return int(atomic.AddInt32(&counter, 1) - 1) % handlerCount
+//		},
+//		withServerName("multi-test-server"),
+//	)
+//	defer srv.Close()
+func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, options ...serverOption) *httptest.Server {
+	if handlerCount <= 0 {
+		t.Fatalf("Handler count must be positive, got %d", handlerCount)
+	}
+	if router == nil {
+		t.Fatalf("Router function cannot be nil")
+	}
+
+	ctx := t.Context()
+
+	// Create all handler instances
+	handlers := make([]*StreamingHTTPHandler, handlerCount)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := router(r, handlerCount)
+		if idx < 0 || idx >= handlerCount {
+			http.NotFound(w, r)
+			return
+		}
+
+		handlers[idx].ServeHTTP(w, r)
+	}))
+
+	for i := 0; i < handlerCount; i++ {
+		// Apply default configuration
+		cfg := &serverConfig{
+			authenticator: authtest.NewNoAuth(""),
+			hooks:         hookstest.NewMockHooks(),
+			sessions:      memory.NewStore(),
+			logHandler:    testLogHandler(t),
+			serverName:    "multi-test-server",
+			issuer:        "http://127.0.0.1:0",
+			jwksURI:       "http://127.0.0.1/.well-known/jwks.json",
+		}
+
+		// Apply configuration options
+		for _, opt := range options {
+			opt(cfg)
+		}
+
+		// Each instance gets the same configuration
+		streamingHandler, err := NewStreamingHTTPHandlerWithManualOIDC(ctx, ManualOIDCConfig{
+			ServerURL:     srv.URL,
+			ServerName:    cfg.serverName,
+			Issuer:        cfg.issuer,
+			JwksURI:       cfg.jwksURI,
+			Authenticator: cfg.authenticator,
+			Hooks:         cfg.hooks,
+			Sessions:      cfg.sessions,
+			LogHandler:    cfg.logHandler,
+		})
+		if err != nil {
+			srv.Close()
+			t.Fatalf("Failed to create streaming HTTP handler for instance %d: %v", i, err)
+		}
+
+		handlers[i] = streamingHandler
+	}
 
 	return srv
 }
