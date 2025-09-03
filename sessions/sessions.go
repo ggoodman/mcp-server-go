@@ -11,7 +11,10 @@ type Session interface {
 	SessionID() string
 	UserID() string
 
-	ConsumeMessages(ctx context.Context, writeMsgFn MessageHandlerFunction) error
+	// ConsumeMessages starts consuming messages for the session as of an optional lastEventID cursor
+	// cursor value. ConsumeMessages calls writeMsgFn for each message until the supplied context is
+	// cancelled or the session is destroyed.
+	ConsumeMessages(ctx context.Context, lastEventID string, writeMsgFn MessageHandlerFunction) error
 
 	// Client capability access - returns nil if client doesn't support the capability
 	// These are now fully typed thanks to the hooks package!
@@ -39,7 +42,7 @@ type SessionMetadata interface {
 	GetElicitationCapability() hooks.ElicitationCapability
 }
 
-type SessionStore interface {
+type SessionManager interface {
 	CreateSession(ctx context.Context, userID string, meta SessionMetadata) (Session, error)
 
 	LoadSession(ctx context.Context, sessID string, userID string) (Session, error)

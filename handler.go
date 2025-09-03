@@ -63,6 +63,7 @@ var (
 )
 
 const (
+	lastEventIDHeader     = "last-event-id"
 	mcpSessionIdHeader    = "mcp-session-id"
 	authorizationHeader   = "authorization"
 	wwwAuthenticateHeader = "www-authenticate"
@@ -85,7 +86,7 @@ type StreamingHTTPConfig struct {
 	Hooks hooks.Hooks
 
 	// Sessions manages session state for the MCP server.
-	Sessions sessions.SessionStore
+	Sessions sessions.SessionManager
 
 	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
 	LogHandler slog.Handler
@@ -122,7 +123,7 @@ type ManualOIDCConfig struct {
 	Hooks hooks.Hooks
 
 	// Sessions manages session state for the MCP server.
-	Sessions sessions.SessionStore
+	Sessions sessions.SessionManager
 
 	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
 	LogHandler slog.Handler
@@ -140,7 +141,7 @@ type StreamingHTTPHandler struct {
 
 	auth     auth.Authenticator
 	hooks    hooks.Hooks
-	sessions sessions.SessionStore
+	sessions sessions.SessionManager
 }
 
 type writeFlusher interface {
@@ -517,10 +518,13 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	lastEventID := r.Header.Get(lastEventIDHeader)
+
 	// Requests to the GET /mcp endpoint MUST be in the context of an already
 	// established session. Session establishment can only happen in POST /mcp.
 	// As a result, we can respond with an error in the case of a missing session.
-	if err := session.ConsumeMessages(ctx, func(ctx context.Context, env sessions.MessageEnvelope) error {
+	if err := session.ConsumeMessages(ctx, lastEventID, func(ctx context.Context, env sessions.MessageEnvelope) error {
 		var msg jsonrpc.AnyMessage
 
 		if err := json.Unmarshal(env.Message, &msg); err != nil {

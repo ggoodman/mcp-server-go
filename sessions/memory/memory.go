@@ -172,7 +172,7 @@ func (s *Session) UserID() string {
 }
 
 // ConsumeMessages implements sessions.Session
-func (s *Session) ConsumeMessages(ctx context.Context, writeMsgFn sessions.MessageHandlerFunction) error {
+func (s *Session) ConsumeMessages(ctx context.Context, lastEventID string, writeMsgFn sessions.MessageHandlerFunction) error {
 	// Create a subscriber channel for this consumption
 	subID := uuid.New().String()
 	subChan := make(chan sessions.MessageEnvelope, 10)

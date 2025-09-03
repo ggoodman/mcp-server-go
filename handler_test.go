@@ -269,7 +269,7 @@ type serverOption func(*serverConfig)
 type serverConfig struct {
 	authenticator auth.Authenticator
 	hooks         hooks.Hooks
-	sessions      sessions.SessionStore
+	sessions      sessions.SessionManager
 	logHandler    slog.Handler
 	serverName    string
 	issuer        string
@@ -291,7 +291,7 @@ func withHooks(hooks hooks.Hooks) serverOption {
 }
 
 // withSessions configures the server to use the provided session store.
-func withSessions(sessions sessions.SessionStore) serverOption {
+func withSessions(sessions sessions.SessionManager) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.sessions = sessions
 	}
