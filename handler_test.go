@@ -1,4 +1,4 @@
-package streaminghttp
+package streaminghttp_test
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	streaminghttp "github.com/ggoodman/mcp-streaming-http-go"
 	"github.com/ggoodman/mcp-streaming-http-go/auth"
 	"github.com/ggoodman/mcp-streaming-http-go/auth/authtest"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
@@ -96,6 +97,9 @@ func TestMultiInstance(t *testing.T) {
 		toolStartedCh := make(chan struct{}, 1)
 		defer close(toolStartedCh)
 
+		toolCancelledCh := make(chan struct{}, 1)
+		defer close(toolCancelledCh)
+
 		toolStartedFlag := atomic.Bool{}
 
 		didCancel := atomic.Bool{}
@@ -108,6 +112,7 @@ func TestMultiInstance(t *testing.T) {
 
 				return 0
 			},
+			withLogHandler(testLogHandler(t)),
 			withHooks(
 				hookstest.NewMockHooks(
 					hookstest.WithToolsCapability(
@@ -121,6 +126,7 @@ func TestMultiInstance(t *testing.T) {
 									t.Fatalf("Tool call should have been cancelled")
 								case <-ctx.Done():
 									didCancel.Store(true)
+									toolCancelledCh <- struct{}{}
 									return nil, ctx.Err()
 								}
 
@@ -142,7 +148,10 @@ func TestMultiInstance(t *testing.T) {
 		defer toolCancel()
 
 		g.Go(func() error {
-			_, err := cs.CallTool(toolCtx, &sdk.CallToolParams{
+			// The SDK optimistically returns an error after sending a cancellation
+			// notification. This won't give us time to verify the cancellation handler
+			// was invoked, so we ignore the error here and check the cancellation flag instead.
+			cs.CallTool(toolCtx, &sdk.CallToolParams{
 				Name:      "test-tool",
 				Arguments: map[string]any{},
 			})
@@ -151,7 +160,7 @@ func TestMultiInstance(t *testing.T) {
 				t.Errorf("Expected tool handler to be cancelled: want %v, got %v", want, got)
 			}
 
-			return err
+			return nil
 		})
 
 		g.Go(func() error {
@@ -159,12 +168,18 @@ func TestMultiInstance(t *testing.T) {
 
 			toolCancel()
 
+			<-toolCancelledCh
+
 			return nil
 		})
 
 		err := g.Wait()
-		if err == nil {
-			t.Fatalf("Expected CallTool to be cancelled, got nil error")
+		if err != nil {
+			t.Fatalf("Tool call goroutines failed: %v", err)
+		}
+
+		if want, got := true, didCancel.Load(); want != got {
+			t.Errorf("Expected tool handler to be cancelled: want %v, got %v", want, got)
 		}
 
 	})
@@ -364,7 +379,7 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 	}))
 
 	// Create the streaming HTTP handler with the test server URL
-	streamingHandler, err := NewStreamingHTTPHandlerWithManualOIDC(ctx, ManualOIDCConfig{
+	streamingHandler, err := streaminghttp.NewStreamingHTTPHandlerWithManualOIDC(ctx, streaminghttp.ManualOIDCConfig{
 		ServerURL:     srv.URL,
 		ServerName:    cfg.serverName,
 		Issuer:        cfg.issuer,
@@ -416,7 +431,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 	ctx := t.Context()
 
 	// Create all handler instances
-	handlers := make([]*StreamingHTTPHandler, handlerCount)
+	handlers := make([]*streaminghttp.StreamingHTTPHandler, handlerCount)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		idx := router(r, handlerCount)
@@ -446,7 +461,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 		}
 
 		// Each instance gets the same configuration
-		streamingHandler, err := NewStreamingHTTPHandlerWithManualOIDC(ctx, ManualOIDCConfig{
+		streamingHandler, err := streaminghttp.NewStreamingHTTPHandlerWithManualOIDC(ctx, streaminghttp.ManualOIDCConfig{
 			ServerURL:     srv.URL,
 			ServerName:    cfg.serverName,
 			Issuer:        cfg.issuer,

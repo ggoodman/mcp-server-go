@@ -307,7 +307,7 @@ func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
-	h.log.Debug("handlePostMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
+	// h.log.Debug("handlePostMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
 	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
 	if err != nil {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -415,7 +415,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
 		w.WriteHeader(http.StatusOK)
 
-		// This is a request with an ID, so we need to handle it appropriately.
+		// This is a request with an ID, so we need to handle it as a request.
 		res, err := h.handleRequest(ctx, session, userInfo, req)
 		if err != nil {
 			res = &jsonrpc.Response{
@@ -588,6 +588,7 @@ func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.Respons
 }
 
 func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
+	h.log.Debug("handleNotification", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
 	// TODO: Actually handle the notification
 	return nil
 }
@@ -684,6 +685,8 @@ func mapHooksErrorToJSONRPCError(requestID *jsonrpc.RequestID, err error) *jsonr
 }
 
 func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	h.log.Debug("handleRequest", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
+
 	switch req.Method {
 	case string(mcp.PingMethod):
 		return jsonrpc.NewResultResponse(req.ID, struct{}{})
@@ -892,6 +895,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 }
 
 func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, res *jsonrpc.Response) error {
+	h.log.Debug("handleResponse", slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
 	// TODO: Actually handle the response
 	return nil
 }
