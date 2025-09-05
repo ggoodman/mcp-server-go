@@ -46,22 +46,22 @@ type Hooks interface {
 type ToolsChangedListener func(ctx context.Context) error
 
 type ToolsCapability interface {
-	ListTools(ctx context.Context, session Session) ([]mcp.Tool, error)
+	ListTools(ctx context.Context, session Session, cursor *string) (tools []mcp.Tool, nextCursor *string, err error)
 	CallTool(ctx context.Context, session Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error)
 
 	// RegisterToolsChangedListener will be called with a listener function that the implementation can call to
 	// indicate that tools have changed. If the implementation does not support this functionality, it can
 	// return (false, nil) and the MCP server will not register the listener. If the implementation does support
 	// this functionality, it should return (true, nil) and call the listener function whenever tools change.
-	RegisterToolsChangedListener(ctx context.Context, session Session, listener ToolsChangedListener) (bool, error)
+	RegisterToolsChangedListener(ctx context.Context, session Session, listener ToolsChangedListener) (supported bool, err error)
 }
 
 type ResourcesListChangedListener func(ctx context.Context) error
 type ResourceUpdatedListener func(ctx context.Context, uri string) error
 
 type ResourcesCapability interface {
-	ListResources(ctx context.Context, session Session, cursor *string) ([]mcp.Resource, *string, error)
-	ListResourceTemplates(ctx context.Context, session Session, cursor *string) ([]mcp.ResourceTemplate, *string, error)
+	ListResources(ctx context.Context, session Session, cursor *string) (resources []mcp.Resource, nextCursor *string, err error)
+	ListResourceTemplates(ctx context.Context, session Session, cursor *string) (templates []mcp.ResourceTemplate, nextCursor *string, err error)
 	ReadResource(ctx context.Context, session Session, uri string) ([]mcp.ResourceContents, error)
 
 	SubscribeToResource(ctx context.Context, session Session, uri string) error
@@ -71,26 +71,26 @@ type ResourcesCapability interface {
 	// indicate that the list of resources has changed. If the implementation does not support this functionality, it can
 	// return (false, nil) and the MCP server will not register the listener. If the implementation does support
 	// this functionality, it should return (true, nil) and call the listener function whenever the resource list changes.
-	RegisterResourcesListChangedListener(ctx context.Context, session Session, listener ResourcesListChangedListener) (bool, error)
+	RegisterResourcesListChangedListener(ctx context.Context, session Session, listener ResourcesListChangedListener) (supported bool, err error)
 
 	// RegisterResourceUpdatedListener will be called with a listener function that the implementation can call to
 	// indicate that a specific resource has been updated. If the implementation does not support this functionality, it can
 	// return (false, nil) and the MCP server will not register the listener. If the implementation does support
 	// this functionality, it should return (true, nil) and call the listener function whenever a subscribed resource is updated.
-	RegisterResourceUpdatedListener(ctx context.Context, session Session, listener ResourceUpdatedListener) (bool, error)
+	RegisterResourceUpdatedListener(ctx context.Context, session Session, listener ResourceUpdatedListener) (supported bool, err error)
 }
 
 type PromptsListChangedListener func(ctx context.Context) error
 
 type PromptsCapability interface {
-	ListPrompts(ctx context.Context, session Session, cursor *string) ([]mcp.Prompt, *string, error)
+	ListPrompts(ctx context.Context, session Session, cursor *string) (prompts []mcp.Prompt, nextCursor *string, err error)
 	GetPrompt(ctx context.Context, session Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error)
 
 	// RegisterPromptsListChangedListener will be called with a listener function that the implementation can call to
 	// indicate that the list of prompts has changed. If the implementation does not support this functionality, it can
 	// return (false, nil) and the MCP server will not register the listener. If the implementation does support
 	// this functionality, it should return (true, nil) and call the listener function whenever the prompt list changes.
-	RegisterPromptsListChangedListener(ctx context.Context, session Session, listener PromptsListChangedListener) (bool, error)
+	RegisterPromptsListChangedListener(ctx context.Context, session Session, listener PromptsListChangedListener) (supported bool, err error)
 }
 
 type LoggingMessageListener func(ctx context.Context, level mcp.LoggingLevel, data any, logger *string) error
@@ -102,7 +102,7 @@ type LoggingCapability interface {
 	// send log messages to the client. If the implementation does not support this functionality, it can
 	// return (false, nil) and the MCP server will not register the listener. If the implementation does support
 	// this functionality, it should return (true, nil) and call the listener function to send log messages.
-	RegisterLoggingMessageListener(ctx context.Context, session Session, listener LoggingMessageListener) (bool, error)
+	RegisterLoggingMessageListener(ctx context.Context, session Session, listener LoggingMessageListener) (supported bool, err error)
 }
 
 type CompletionsCapability interface {

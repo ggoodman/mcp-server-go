@@ -701,13 +701,21 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
 		}
 
-		tools, err := toolsCap.ListTools(ctx, session)
+		var listToolsReq mcp.ListToolsRequest
+		if err := json.Unmarshal(req.Params, &listToolsReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		tools, nextCursor, err := toolsCap.ListTools(ctx, session, listToolsReq.Cursor)
 		if err != nil {
 			return mapHooksErrorToJSONRPCError(req.ID, err), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListToolsResult{
 			Tools: tools,
+			PaginatedResult: mcp.PaginatedResult{
+				NextCursor: nextCursor,
+			},
 		})
 	case string(mcp.ToolsCallMethod):
 		toolsCap := h.hooks.GetToolsCapability()

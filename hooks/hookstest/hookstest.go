@@ -69,8 +69,8 @@ func WithToolsChangedSupport() ToolsCapabilityOption {
 	}
 }
 
-func (m *MockToolsCapability) ListTools(ctx context.Context, session hooks.Session) ([]mcp.Tool, error) {
-	return m.tools, nil
+func (m *MockToolsCapability) ListTools(ctx context.Context, session hooks.Session, cursor *string) ([]mcp.Tool, *string, error) {
+	return m.tools, nil, nil
 }
 
 func (m *MockToolsCapability) CallTool(ctx context.Context, session hooks.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {

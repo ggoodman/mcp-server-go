@@ -1,12 +1,8 @@
-// Package memory provides an in-memory implementation of the broker.Broker interface
-// using Go channels for message delivery. This implementation is suitable for
-// single-node deployments and testing scenarios.
 package memory
 
 import (
 	"context"
 	"fmt"
-	"io"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,222 +11,219 @@ import (
 	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 )
 
-// Broker implements broker.Broker using in-memory channels and storage.
-// It provides namespace isolation and ordered message delivery within each namespace.
-// This implementation is not suitable for multi-node deployments as state is local.
+// Broker is an in-memory implementation of the broker.Broker interface.
+// It provides namespace-based message isolation and ordered delivery guarantees
+// within each namespace using in-memory storage.
 type Broker struct {
-	mu           sync.RWMutex
-	namespaces   map[string]*namespace
-	eventCounter atomic.Int64
+	mu         sync.RWMutex
+	namespaces map[string]*namespaceData
+	counter    atomic.Int64
 }
 
-// namespace represents an isolated message queue with its subscribers
-type namespace struct {
+type namespaceData struct {
 	mu          sync.RWMutex
 	messages    []broker.MessageEnvelope
 	subscribers map[*subscription]struct{}
-	closed      bool
 }
 
-// subscription represents an active subscription to a namespace
 type subscription struct {
-	namespace   *namespace
-	lastEventID string
-	ch          chan broker.MessageEnvelope
-	ctx         context.Context
-	cancel      context.CancelFunc
-	closed      atomic.Bool
+	ctx       context.Context
+	handler   broker.MessageHandler
+	startIdx  int
+	stopCh    chan struct{}
+	errorCh   chan error
+	namespace *namespaceData
 }
 
-// New creates a new memory-based broker instance.
+// New creates a new in-memory broker instance.
 func New() *Broker {
 	return &Broker{
-		namespaces: make(map[string]*namespace),
+		namespaces: make(map[string]*namespaceData),
 	}
 }
 
-// Publish implements broker.Broker.Publish
-func (b *Broker) Publish(ctx context.Context, namespaceName string, message jsonrpc.Message) (eventID string, err error) {
-	if ctx.Err() != nil {
-		return "", ctx.Err()
-	}
+// Publish creates envelope with generated event ID and publishes to namespace.
+// Returns the generated event ID for the published message.
+func (b *Broker) Publish(ctx context.Context, namespace string, message jsonrpc.Message) (string, error) {
+	data := []byte(message)
 
-	// Generate unique event ID
-	eventID = strconv.FormatInt(b.eventCounter.Add(1), 10)
-
-	// Create message envelope
+	eventID := strconv.FormatInt(b.counter.Add(1), 10)
 	envelope := broker.MessageEnvelope{
 		ID:   eventID,
-		Data: []byte(message),
+		Data: data,
 	}
 
 	b.mu.Lock()
-	ns, exists := b.namespaces[namespaceName]
+	ns, exists := b.namespaces[namespace]
 	if !exists {
-		ns = &namespace{
+		ns = &namespaceData{
 			messages:    make([]broker.MessageEnvelope, 0),
 			subscribers: make(map[*subscription]struct{}),
 		}
-		b.namespaces[namespaceName] = ns
+		b.namespaces[namespace] = ns
 	}
 	b.mu.Unlock()
 
 	ns.mu.Lock()
-	defer ns.mu.Unlock()
-
-	if ns.closed {
-		return "", fmt.Errorf("namespace %q has been cleaned up", namespaceName)
-	}
-
-	// Store message
 	ns.messages = append(ns.messages, envelope)
+	messageIdx := len(ns.messages) - 1
 
-	// Notify subscribers
+	// Notify all active subscribers
+	var subsToNotify []*subscription
 	for sub := range ns.subscribers {
+		if messageIdx >= sub.startIdx {
+			subsToNotify = append(subsToNotify, sub)
+		}
+	}
+	ns.mu.Unlock()
+
+	// Deliver to subscribers outside of lock to avoid deadlock
+	for _, sub := range subsToNotify {
 		select {
-		case sub.ch <- envelope:
 		case <-sub.ctx.Done():
-			// Subscriber context cancelled, remove from set
-			delete(ns.subscribers, sub)
+			// Subscriber context cancelled, skip
+			continue
+		case <-sub.stopCh:
+			// Subscription stopped, skip
+			continue
 		default:
-			// Channel is full, skip this subscriber
-			// In a production implementation, you might want to handle this differently
+			go func(s *subscription) {
+				if err := s.handler(s.ctx, envelope); err != nil {
+					// Handler returned error, send to error channel
+					select {
+					case s.errorCh <- err:
+					case <-s.ctx.Done():
+					case <-s.stopCh:
+					}
+				}
+			}(sub)
 		}
 	}
 
 	return eventID, nil
 }
 
-// Subscribe implements broker.Broker.Subscribe
-func (b *Broker) Subscribe(ctx context.Context, namespaceName string, lastEventID string) (broker.MessageStream, error) {
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-
+// Subscribe to namespace messages, calling handler for each message.
+// If lastEventID is empty, subscription starts from the next published message.
+// If lastEventID is provided, subscription resumes from the message after that ID.
+func (b *Broker) Subscribe(ctx context.Context, namespace string, lastEventID string, handler broker.MessageHandler) error {
 	b.mu.Lock()
-	ns, exists := b.namespaces[namespaceName]
+	ns, exists := b.namespaces[namespace]
 	if !exists {
-		ns = &namespace{
+		ns = &namespaceData{
 			messages:    make([]broker.MessageEnvelope, 0),
 			subscribers: make(map[*subscription]struct{}),
 		}
-		b.namespaces[namespaceName] = ns
+		b.namespaces[namespace] = ns
 	}
 	b.mu.Unlock()
 
-	ns.mu.Lock()
-	defer ns.mu.Unlock()
-
-	if ns.closed {
-		return nil, fmt.Errorf("namespace %q has been cleaned up", namespaceName)
-	}
-
-	subCtx, cancel := context.WithCancel(ctx)
-	sub := &subscription{
-		namespace:   ns,
-		lastEventID: lastEventID,
-		ch:          make(chan broker.MessageEnvelope, 100), // Buffer to avoid blocking publishers
-		ctx:         subCtx,
-		cancel:      cancel,
-	}
-
-	// Add to subscribers set
-	ns.subscribers[sub] = struct{}{}
-
-	// Send historical messages if resuming from a specific event ID
+	var startIdx int
 	if lastEventID != "" {
-		startIdx := -1
+		ns.mu.RLock()
+		// Find the message after the last event ID
+		found := false
 		for i, msg := range ns.messages {
 			if msg.ID == lastEventID {
-				startIdx = i + 1 // Start from message after lastEventID
+				startIdx = i + 1
+				found = true
 				break
 			}
 		}
+		if !found {
+			ns.mu.RUnlock()
+			return fmt.Errorf("last event ID %s not found in namespace %s", lastEventID, namespace)
+		}
+		ns.mu.RUnlock()
+	} else {
+		ns.mu.RLock()
+		startIdx = len(ns.messages) // Start from next message
+		ns.mu.RUnlock()
+	}
 
-		if startIdx >= 0 {
-			// Send historical messages in order
-			for i := startIdx; i < len(ns.messages); i++ {
-				select {
-				case sub.ch <- ns.messages[i]:
-				case <-sub.ctx.Done():
-					delete(ns.subscribers, sub)
-					return nil, sub.ctx.Err()
-				}
+	sub := &subscription{
+		ctx:       ctx,
+		handler:   handler,
+		startIdx:  startIdx,
+		stopCh:    make(chan struct{}),
+		errorCh:   make(chan error, 1),
+		namespace: ns,
+	}
+
+	// Register subscription
+	ns.mu.Lock()
+	ns.subscribers[sub] = struct{}{}
+
+	// Replay any existing messages from startIdx
+	var messagesToReplay []broker.MessageEnvelope
+	if startIdx < len(ns.messages) {
+		messagesToReplay = make([]broker.MessageEnvelope, len(ns.messages)-startIdx)
+		copy(messagesToReplay, ns.messages[startIdx:])
+	}
+	ns.mu.Unlock()
+
+	// Replay messages outside of lock
+	for _, msg := range messagesToReplay {
+		select {
+		case <-ctx.Done():
+			sub.stop()
+			return ctx.Err()
+		case <-sub.stopCh:
+			return nil
+		case err := <-sub.errorCh:
+			sub.stop()
+			return err
+		default:
+			if err := handler(ctx, msg); err != nil {
+				sub.stop()
+				return err
 			}
 		}
 	}
 
-	return sub, nil
+	// Wait for context cancellation, subscription stop, or handler error
+	select {
+	case <-ctx.Done():
+		sub.stop()
+		return ctx.Err()
+	case <-sub.stopCh:
+		return nil
+	case err := <-sub.errorCh:
+		sub.stop()
+		return err
+	}
 }
 
-// Cleanup implements broker.Broker.Cleanup
-func (b *Broker) Cleanup(ctx context.Context, namespaceName string) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
+// Cleanup removes all resources associated with a namespace.
+func (b *Broker) Cleanup(ctx context.Context, namespace string) error {
 	b.mu.Lock()
-	ns, exists := b.namespaces[namespaceName]
+	ns, exists := b.namespaces[namespace]
 	if !exists {
 		b.mu.Unlock()
-		return nil // Nothing to clean up
+		return nil
 	}
-	delete(b.namespaces, namespaceName)
+	delete(b.namespaces, namespace)
 	b.mu.Unlock()
 
+	// Stop all subscribers
 	ns.mu.Lock()
-	defer ns.mu.Unlock()
-
-	ns.closed = true
-
-	// Close all subscribers
 	for sub := range ns.subscribers {
-		sub.cancel()
-		close(sub.ch)
+		sub.stop()
 	}
-
-	// Clear the subscribers map
-	ns.subscribers = make(map[*subscription]struct{})
-	ns.messages = nil
+	ns.mu.Unlock()
 
 	return nil
 }
 
-// Next implements broker.MessageStream.Next
-func (s *subscription) Next(ctx context.Context) (broker.MessageEnvelope, error) {
-	if s.closed.Load() {
-		return broker.MessageEnvelope{}, io.EOF
-	}
+func (s *subscription) stop() {
+	s.namespace.mu.Lock()
+	delete(s.namespace.subscribers, s)
+	s.namespace.mu.Unlock()
 
 	select {
-	case msg, ok := <-s.ch:
-		if !ok {
-			return broker.MessageEnvelope{}, io.EOF
-		}
-		s.lastEventID = msg.ID
-		return msg, nil
-	case <-ctx.Done():
-		return broker.MessageEnvelope{}, ctx.Err()
-	case <-s.ctx.Done():
-		return broker.MessageEnvelope{}, s.ctx.Err()
+	case <-s.stopCh:
+		// Already stopped
+	default:
+		close(s.stopCh)
 	}
 }
-
-// Close implements broker.MessageStream.Close
-func (s *subscription) Close() error {
-	if s.closed.CompareAndSwap(false, true) {
-		s.namespace.mu.Lock()
-		delete(s.namespace.subscribers, s)
-		s.namespace.mu.Unlock()
-
-		s.cancel()
-		close(s.ch)
-	}
-	return nil
-}
-
-// Compile-time interface checks
-var (
-	_ broker.Broker        = (*Broker)(nil)
-	_ broker.MessageStream = (*subscription)(nil)
-)

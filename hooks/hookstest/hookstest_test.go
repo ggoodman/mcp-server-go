@@ -46,12 +46,15 @@ func TestMockCapabilities(t *testing.T) {
 		)
 
 		// Test ListTools
-		tools, err := toolsCapability.ListTools(ctx, &mockSession{})
+		tools, nextCursor, err := toolsCapability.ListTools(ctx, &mockSession{}, nil)
 		if err != nil {
 			t.Fatalf("ListTools failed: %v", err)
 		}
 		if len(tools) != 1 || tools[0].Name != "test-tool" {
 			t.Errorf("Expected 1 tool named 'test-tool', got %d tools", len(tools))
+		}
+		if nextCursor != nil {
+			t.Errorf("Expected nextCursor to be nil for mock implementation, got %s", *nextCursor)
 		}
 
 		// Test CallTool
