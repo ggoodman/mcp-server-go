@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -327,13 +328,13 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	authResult, err := h.auth.CheckAuthentication(r)
+	userInfo, authResult, err := h.checkAuthentication(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	if !authResult.IsAuthenticated() {
+	if authResult != nil {
 		challenge := authResult.GetAuthenticationChallenge()
 
 		if challenge == nil {
@@ -353,8 +354,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	userInfo, err := authResult.UserInfo()
-	if err != nil || userInfo == nil {
+	if userInfo == nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -465,13 +465,13 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	authResult, err := h.auth.CheckAuthentication(r)
+	userInfo, authResult, err := h.checkAuthentication(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	if !authResult.IsAuthenticated() {
+	if authResult != nil {
 		challenge := authResult.GetAuthenticationChallenge()
 
 		if challenge == nil {
@@ -491,8 +491,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	userInfo, err := authResult.UserInfo()
-	if err != nil || userInfo == nil {
+	if userInfo == nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -910,6 +909,30 @@ func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessi
 	h.log.Debug("handleResponse", slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
 	// TODO: Actually handle the response
 	return nil
+}
+
+func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) (auth.UserInfo, auth.AuthenticationResult, error) {
+	authHeader := r.Header.Get(authorizationHeader)
+
+	if authHeader == "" {
+		return nil, auth.NewAuthenticationRequired(h.prmDocumentURL.String()), nil
+	}
+
+	tok, ok := strings.CutPrefix(authHeader, "Bearer ")
+	if !ok || tok == "" {
+		return nil, auth.NewInvalidAuthorizationHeader(h.serverURL.String()), nil
+	}
+
+	// TODO: Make timeout configurable
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	userInfo, err := h.auth.CheckAuthentication(ctx, tok)
+	if err != nil {
+		return nil, nil, fmt.Errorf("authentication check failed: %w", err)
+	}
+
+	return userInfo, nil, nil
 }
 
 // writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.

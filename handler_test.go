@@ -13,7 +13,6 @@ import (
 
 	streaminghttp "github.com/ggoodman/mcp-streaming-http-go"
 	"github.com/ggoodman/mcp-streaming-http-go/auth"
-	"github.com/ggoodman/mcp-streaming-http-go/auth/authtest"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks/hookstest"
 	"github.com/ggoodman/mcp-streaming-http-go/mcp"
@@ -34,7 +33,7 @@ func TestSingleInstance(t *testing.T) {
 		)
 		defer srv.Close()
 
-		cs := mustClient(t, srv)
+		cs := mustClient(t, srv, withClientAuthToken("test-token"))
 		defer cs.Close()
 
 		// Verify we can list tools (should be empty due to empty tools capability)
@@ -139,7 +138,7 @@ func TestMultiInstance(t *testing.T) {
 		)
 		defer srv.Close()
 
-		cs := mustClient(t, srv)
+		cs := mustClient(t, srv, withClientAuthToken("test-token"))
 		defer cs.Close()
 
 		g, ctx := errgroup.WithContext(ctx)
@@ -358,7 +357,7 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 
 	// Apply default configuration
 	cfg := &serverConfig{
-		authenticator: authtest.NewNoAuth(""),
+		authenticator: new(noAuth),
 		hooks:         hookstest.NewMockHooks(),
 		sessions:      memory.NewStore(),
 		logHandler:    testLogHandler(t),
@@ -446,7 +445,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 	for i := 0; i < handlerCount; i++ {
 		// Apply default configuration
 		cfg := &serverConfig{
-			authenticator: authtest.NewNoAuth(""),
+			authenticator: new(noAuth),
 			hooks:         hookstest.NewMockHooks(),
 			sessions:      memory.NewStore(),
 			logHandler:    testLogHandler(t),
@@ -492,6 +491,7 @@ type clientConfig struct {
 	name    string
 	version string
 	title   string
+	rt      http.RoundTripper
 }
 
 // withClientName configures the client name (defaults to "test-client").
@@ -513,6 +513,31 @@ func withClientTitle(title string) clientOption {
 	return func(cfg *clientConfig) {
 		cfg.title = title
 	}
+}
+
+func withClientAuthToken(token string) clientOption {
+	return func(cfg *clientConfig) {
+		rt := cfg.rt
+
+		cfg.rt = &authTransport{
+			base:      rt,
+			authToken: token,
+		}
+	}
+}
+
+type authTransport struct {
+	base      http.RoundTripper
+	authToken string
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.authToken != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set("Authorization", "Bearer "+t.authToken)
+	}
+
+	return t.base.RoundTrip(req)
 }
 
 // mustClient creates a test MCP client connected to the given server with intelligent defaults.
@@ -550,6 +575,7 @@ func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) *sd
 		name:    "test-client",
 		version: "1.0.0",
 		title:   "Test Client",
+		rt:      http.DefaultTransport,
 	}
 
 	// Apply provided options
@@ -565,6 +591,9 @@ func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) *sd
 
 	transport := &sdk.StreamableClientTransport{
 		Endpoint: srv.URL + "/",
+		HTTPClient: &http.Client{
+			Transport: cfg.rt,
+		},
 	}
 
 	cs, err := client.Connect(ctx, transport, &sdk.ClientSessionOptions{})
@@ -590,3 +619,16 @@ func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) *sd
 
 	return cs
 }
+
+type noAuth struct{}
+
+func (a *noAuth) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
+	return fakeUser, nil
+}
+
+type fakeUserInfo struct{}
+
+func (u *fakeUserInfo) UserID() string       { return "fake-user" }
+func (u *fakeUserInfo) Claims(ref any) error { return nil }
+
+var fakeUser = &fakeUserInfo{}
