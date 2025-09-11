@@ -37,9 +37,11 @@ func (sm *sessionManager) CreateSession(ctx context.Context, userID string, opts
 		opt(session)
 	}
 
-	return nil, fmt.Errorf("not implemented")
+	return session, nil
 }
 
 func (sm *sessionManager) LoadSession(ctx context.Context, sessID string, userID string) (Session, error) {
+	// TODO: Loading sessions requires some form of persistence.
+	//       We'll try to see if we can use the Storage interface for this next.
 	return nil, fmt.Errorf("not implemented")
 }

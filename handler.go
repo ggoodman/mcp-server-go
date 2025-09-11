@@ -16,6 +16,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
 	"github.com/ggoodman/mcp-streaming-http-go/auth"
+	"github.com/ggoodman/mcp-streaming-http-go/broker"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
 	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-streaming-http-go/internal/wellknown"
@@ -87,8 +88,8 @@ type StreamingHTTPConfig struct {
 	// Hooks provides the MCP server logic implementation.
 	Hooks hooks.Hooks
 
-	// Sessions manages session state for the MCP server.
-	Sessions sessions.SessionManager
+	// Broker handles message queuing and delivery for MCP sessions.
+	Broker broker.Broker
 
 	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
 	LogHandler slog.Handler
@@ -124,8 +125,8 @@ type ManualOIDCConfig struct {
 	// Hooks provides the MCP server logic implementation.
 	Hooks hooks.Hooks
 
-	// Sessions manages session state for the MCP server.
-	Sessions sessions.SessionManager
+	// Broker handles message queuing and delivery for MCP sessions.
+	Broker broker.Broker
 
 	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
 	LogHandler slog.Handler
@@ -141,9 +142,9 @@ type StreamingHTTPHandler struct {
 	prmDocumentURL *url.URL
 	serverURL      *url.URL
 
-	auth     auth.Authenticator
-	hooks    hooks.Hooks
-	sessions sessions.SessionManager
+	auth   auth.Authenticator
+	hooks  hooks.Hooks
+	broker broker.Broker
 }
 
 type writeFlusher interface {
@@ -160,8 +161,8 @@ func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*
 		return nil, fmt.Errorf("hooks is required")
 	}
 
-	if config.Sessions == nil {
-		return nil, fmt.Errorf("sessions is required")
+	if config.Broker == nil {
+		return nil, fmt.Errorf("broker is required")
 	}
 
 	// Perform OIDC discovery
@@ -194,7 +195,7 @@ func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*
 		OpTosUri:                                   asm.OpTosUri,
 		Authenticator:                              config.Authenticator,
 		Hooks:                                      config.Hooks,
-		Sessions:                                   config.Sessions,
+		Broker:                                     config.Broker,
 		LogHandler:                                 config.LogHandler,
 	}
 
@@ -238,8 +239,8 @@ func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOID
 		return nil, fmt.Errorf("hooks is required")
 	}
 
-	if config.Sessions == nil {
-		return nil, fmt.Errorf("sessions is required")
+	if config.Broker == nil {
+		return nil, fmt.Errorf("broker is required")
 	}
 
 	logHandler := slog.DiscardHandler
@@ -256,7 +257,7 @@ func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOID
 		oidcProvider: nil, // Not needed for manual configuration
 		auth:         config.Authenticator,
 		hooks:        config.Hooks,
-		sessions:     config.Sessions,
+		broker:       config.Broker,
 		prmDocument: wellknown.ProtectedResourceMetadata{
 			Resource:                              mcpURL.String(),
 			AuthorizationServers:                  []string{config.Issuer},
@@ -356,7 +357,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	// An MCP-Session-ID header is required for all other requests. The session MUST exist and be
 	// bound to the authenticated user.
-	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID())
+	manager := sessions.NewManager(h.broker)
+	session, err := manager.LoadSession(ctx, sessID, userInfo.UserID())
 	if err != nil {
 		if errors.Is(err, ErrInvalidSession) {
 			// Signal that the session is invalid and that the client needs to re-initialize
@@ -461,7 +463,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	wroteHeadersCh := make(chan struct{})
 
-	session, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID())
+	manager := sessions.NewManager(h.broker)
+	session, err := manager.LoadSession(ctx, sessionHeader, userInfo.UserID())
 	if err != nil {
 		if errors.Is(err, ErrInvalidSession) {
 			w.WriteHeader(http.StatusNotFound)
@@ -589,7 +592,8 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		// For now we set it to nil - this should be handled by the session layer
 	}
 
-	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), opts...)
+	manager := sessions.NewManager(h.broker)
+	session, err := manager.CreateSession(ctx, userInfo.UserID(), opts...)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return fmt.Errorf("failed to create session: %w", err)
