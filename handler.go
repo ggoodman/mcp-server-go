@@ -27,24 +27,24 @@ import (
 // to bridge between MCP client capabilities and session requirements
 type sessionMetadata struct {
 	clientInfo            sessions.ClientInfo
-	samplingCapability    hooks.SamplingCapability
-	rootsCapability       hooks.RootsCapability
-	elicitationCapability hooks.ElicitationCapability
+	samplingCapability    sessions.SamplingCapability
+	rootsCapability       sessions.RootsCapability
+	elicitationCapability sessions.ElicitationCapability
 }
 
 func (m *sessionMetadata) ClientInfo() sessions.ClientInfo {
 	return m.clientInfo
 }
 
-func (m *sessionMetadata) GetSamplingCapability() hooks.SamplingCapability {
+func (m *sessionMetadata) GetSamplingCapability() sessions.SamplingCapability {
 	return m.samplingCapability
 }
 
-func (m *sessionMetadata) GetRootsCapability() hooks.RootsCapability {
+func (m *sessionMetadata) GetRootsCapability() sessions.RootsCapability {
 	return m.rootsCapability
 }
 
-func (m *sessionMetadata) GetElicitationCapability() hooks.ElicitationCapability {
+func (m *sessionMetadata) GetElicitationCapability() sessions.ElicitationCapability {
 	return m.elicitationCapability
 }
 
@@ -477,15 +477,15 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	// Requests to the GET /mcp endpoint MUST be in the context of an already
 	// established session. Session establishment can only happen in POST /mcp.
 	// As a result, we can respond with an error in the case of a missing session.
-	if err := session.ConsumeMessages(ctx, lastEventID, func(ctx context.Context, env sessions.MessageEnvelope) error {
+	if err := session.ConsumeMessages(ctx, lastEventID, func(ctx context.Context, msgID string, bytes []byte) error {
 		var msg jsonrpc.AnyMessage
 
-		if err := json.Unmarshal(env.Message, &msg); err != nil {
+		if err := json.Unmarshal(bytes, &msg); err != nil {
 			return fmt.Errorf("failed to unmarshal session message: %w", err)
 		}
 
-		if env.MessageID != "" {
-			if _, err := w.Write([]byte(fmt.Sprintf("id: %s\n", env.MessageID))); err != nil {
+		if msgID != "" {
+			if _, err := w.Write([]byte(fmt.Sprintf("id: %s\n", msgID))); err != nil {
 				return fmt.Errorf("failed to write session message to http response: %w", err)
 			}
 		}
@@ -496,13 +496,13 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 				msgType = "notification"
 			}
 
-			if err := writeSSEEvent(wf, msgType, env.MessageID, res); err != nil {
+			if err := writeSSEEvent(wf, msgType, msgID, res); err != nil {
 				return fmt.Errorf("failed to write session message to http response: %w", err)
 			}
 		}
 
 		if res := msg.AsResponse(); res != nil {
-			if err := writeSSEEvent(wf, "response", env.MessageID, res); err != nil {
+			if err := writeSSEEvent(wf, "response", msgID, res); err != nil {
 				return fmt.Errorf("failed to write session message to http response: %w", err)
 			}
 		}
@@ -570,35 +570,26 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		return fmt.Errorf("failed to unmarshal initialize request: %w", err)
 	}
 
-	// Create session metadata with client info and capability placeholders
-	// Note: Client capabilities will be properly implemented by the session layer
-	metadata := &sessionMetadata{
-		clientInfo: sessions.ClientInfo{
-			Name:    initializeReq.ClientInfo.Name,
-			Version: initializeReq.ClientInfo.Version,
-		},
-		// Client capabilities are handled by the session implementation
-		// These will be nil if the client doesn't support the capability
-		samplingCapability:    nil, // Will be set by session if client supports sampling
-		rootsCapability:       nil, // Will be set by session if client supports roots
-		elicitationCapability: nil, // Will be set by session if client supports elicitation
-	}
+	opts := []sessions.SessionOption{}
 
 	// Check client capabilities and set them if supported
 	if initializeReq.Capabilities.Sampling != nil {
+		opts = append(opts, sessions.WithSamplingCapability())
 		// The session implementation will provide the actual sampling capability
 		// For now we set it to nil - this should be handled by the session layer
 	}
 	if initializeReq.Capabilities.Roots != nil {
+		opts = append(opts, sessions.WithRootsCapability(initializeReq.Capabilities.Roots.ListChanged))
 		// The session implementation will provide the actual roots capability
 		// For now we set it to nil - this should be handled by the session layer
 	}
 	if initializeReq.Capabilities.Elicitation != nil {
+		opts = append(opts, sessions.WithElicitationCapability())
 		// The session implementation will provide the actual elicitation capability
 		// For now we set it to nil - this should be handled by the session layer
 	}
 
-	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), metadata)
+	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), opts...)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return fmt.Errorf("failed to create session: %w", err)
@@ -928,6 +919,8 @@ func writeSSEEvent(wf writeFlusher, eventType string, msgID string, message any)
 	return nil
 }
 
+var _ sessions.Session = (*sessionWithWriter)(nil)
+
 func newSessionWithWriter(ctx context.Context, session sessions.Session, wf writeFlusher) sessions.Session {
 	return &sessionWithWriter{
 		Session: session,
@@ -944,7 +937,7 @@ type sessionWithWriter struct {
 	mu     sync.Mutex // Guards concurrent writes to wf
 }
 
-func (s *sessionWithWriter) WriteMessage(ctx context.Context, msg sessions.MessageEnvelope) error {
+func (s *sessionWithWriter) WriteMessage(ctx context.Context, bytes []byte) error {
 	// Check the request context has been cancelled. If it has, we should not
 	// attempt to write to the response writer as it may be closed.
 	// Instead, we fall back to the original session's WriteMessage method.
@@ -952,18 +945,24 @@ func (s *sessionWithWriter) WriteMessage(ctx context.Context, msg sessions.Messa
 	// a message to the response.
 	if s.reqCtx.Err() != nil {
 		// The underlying write flusher should no longer be used so fall back to the original session
-		return s.Session.WriteMessage(ctx, msg)
+		return s.Session.WriteMessage(ctx, bytes)
+	}
+
+	var msg jsonrpc.AnyMessage
+	if err := json.Unmarshal(bytes, &msg); err != nil {
+		// We failed to unmarshal the message. There's no point writing it to the session.
+		return err
 	}
 
 	s.mu.Lock()
-	err := writeSSEEvent(s.wf, string(msg.Type), msg.MessageID, json.RawMessage(msg.Message))
+	err := writeSSEEvent(s.wf, msg.Type(), "", bytes)
 	s.mu.Unlock()
 
 	if err != nil {
 		// TODO: Log error?
 
 		// We failed to write the message to the HTTP response. We'll fall back to writing to the Session.
-		return s.Session.WriteMessage(ctx, msg)
+		return s.Session.WriteMessage(ctx, bytes)
 	}
 
 	return nil

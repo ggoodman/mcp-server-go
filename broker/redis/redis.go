@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/ggoodman/mcp-streaming-http-go/broker"
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -54,7 +53,7 @@ func (b *Broker) Close() error {
 
 // Publish creates envelope with generated event ID and publishes to namespace.
 // Returns the generated event ID for the published message.
-func (b *Broker) Publish(ctx context.Context, namespace string, message jsonrpc.Message) (string, error) {
+func (b *Broker) Publish(ctx context.Context, namespace string, message []byte) (string, error) {
 	data := []byte(message)
 
 	streamKey := b.streamKey(namespace)

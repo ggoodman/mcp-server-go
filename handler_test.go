@@ -14,11 +14,11 @@ import (
 
 	streaminghttp "github.com/ggoodman/mcp-streaming-http-go"
 	"github.com/ggoodman/mcp-streaming-http-go/auth"
+	"github.com/ggoodman/mcp-streaming-http-go/broker/memory"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks/hookstest"
 	"github.com/ggoodman/mcp-streaming-http-go/mcp"
 	"github.com/ggoodman/mcp-streaming-http-go/sessions"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions/memory"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/sync/errgroup"
 )
@@ -390,7 +390,7 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 	cfg := &serverConfig{
 		authenticator: new(noAuth),
 		hooks:         hookstest.NewMockHooks(),
-		sessions:      memory.NewStore(),
+		sessions:      sessions.NewManager(memory.New()),
 		logHandler:    testLogHandler(t),
 		serverName:    "test-server",
 		issuer:        "http://127.0.0.1:0",
@@ -478,7 +478,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 		cfg := &serverConfig{
 			authenticator: new(noAuth),
 			hooks:         hookstest.NewMockHooks(),
-			sessions:      memory.NewStore(),
+			sessions:      sessions.NewManager(memory.New()),
 			logHandler:    testLogHandler(t),
 			serverName:    "multi-test-server",
 			issuer:        "http://127.0.0.1:0",

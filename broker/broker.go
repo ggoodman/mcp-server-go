@@ -2,8 +2,6 @@ package broker
 
 import (
 	"context"
-
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 )
 
 // MessageHandler is called for each message received during subscription.
@@ -17,7 +15,7 @@ type Broker interface {
 	// Publish creates envelope with generated event ID and publishes to namespace.
 	// Returns the generated event ID for the published message.
 	// The message will be JSON-marshaled and stored as the envelope's data.
-	Publish(ctx context.Context, namespace string, message jsonrpc.Message) (eventID string, err error)
+	Publish(ctx context.Context, namespace string, message []byte) (eventID string, err error)
 
 	// Subscribe to namespace messages, calling handler for each message.
 	// If lastEventID is empty, subscription starts from the next published message.
@@ -33,7 +31,7 @@ type Broker interface {
 // MessageEnvelope wraps a message with metadata for ordered delivery.
 type MessageEnvelope struct {
 	// ID is a unique, monotonically increasing identifier for this message within the namespace
-	ID string `json:"id"`
+	ID string
 	// Data is the JSON-serialized message content
-	Data []byte `json:"data"`
+	Data []byte
 }

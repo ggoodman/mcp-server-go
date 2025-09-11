@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 
 	"github.com/ggoodman/mcp-streaming-http-go/broker"
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 )
 
 // Broker is an in-memory implementation of the broker.Broker interface.
@@ -44,7 +43,7 @@ func New() *Broker {
 
 // Publish creates envelope with generated event ID and publishes to namespace.
 // Returns the generated event ID for the published message.
-func (b *Broker) Publish(ctx context.Context, namespace string, message jsonrpc.Message) (string, error) {
+func (b *Broker) Publish(ctx context.Context, namespace string, message []byte) (string, error) {
 	data := []byte(message)
 
 	eventID := strconv.FormatInt(b.counter.Add(1), 10)

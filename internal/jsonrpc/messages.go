@@ -117,6 +117,17 @@ func (m *AnyMessage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Type returns "request" if the message is a request, "response" if it's a response, or "notification" if it's a notification
+func (m *AnyMessage) Type() string {
+	if m.Method != "" {
+		if m.ID == nil {
+			return "notification"
+		}
+		return "request"
+	}
+	return "response"
+}
+
 // AsRequest returns the message as a Request if it is a request message, otherwise nil
 func (m *AnyMessage) AsRequest() *Request {
 	if m.Method == "" {
