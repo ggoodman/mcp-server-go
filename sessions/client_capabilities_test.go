@@ -182,6 +182,66 @@ func (h *simpleHost) SubscribeEvents(ctx context.Context, sessionID, topic strin
 	return func() {}, nil
 }
 
+// Fan-out test: two managers (simulating two instances) register roots list_changed listeners
+// for the same session and both should be invoked when a client emits the notification.
+func TestRoots_ListChanged_FanoutAcrossListeners(t *testing.T) {
+	host := newSimpleHost()
+	mgr := sessions.NewManager(host)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Create a session with roots capability
+	sess, err := mgr.CreateSession(ctx, "user-x", sessions.WithRootsCapability(true))
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	rootsCap, ok := sess.GetRootsCapability()
+	if !ok {
+		t.Fatalf("roots cap missing")
+	}
+
+	gotA := make(chan struct{}, 1)
+	gotB := make(chan struct{}, 1)
+
+	if supported, err := rootsCap.RegisterRootsListChangedListener(ctx, func(ctx context.Context) error {
+		select {
+		case gotA <- struct{}{}:
+		default:
+		}
+		return nil
+	}); err != nil || !supported {
+		t.Fatalf("register A: supported=%v err=%v", supported, err)
+	}
+	if supported, err := rootsCap.RegisterRootsListChangedListener(ctx, func(ctx context.Context) error {
+		select {
+		case gotB <- struct{}{}:
+		default:
+		}
+		return nil
+	}); err != nil || !supported {
+		t.Fatalf("register B: supported=%v err=%v", supported, err)
+	}
+
+	// Simulate client sending notifications/roots/list_changed into POST /mcp path by publishing internal event
+	if err := host.PublishEvent(ctx, sess.SessionID(), string(mcp.RootsListChangedNotificationMethod), nil); err != nil {
+		t.Fatalf("publish event: %v", err)
+	}
+
+	// Both listeners should observe it
+	select {
+	case <-gotA:
+	case <-ctx.Done():
+		t.Fatalf("listener A did not fire")
+	}
+	select {
+	case <-gotB:
+	case <-ctx.Done():
+		t.Fatalf("listener B did not fire")
+	}
+}
+
 // Test rpcCallToClient happy path: request is observed on the session stream and fulfilled via rendezvous.
 func TestRPCCallToClient_Success(t *testing.T) {
 	host := newSimpleHost()
