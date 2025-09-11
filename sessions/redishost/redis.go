@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/joeshaw/envdecode"
 	"github.com/redis/go-redis/v9"
 )

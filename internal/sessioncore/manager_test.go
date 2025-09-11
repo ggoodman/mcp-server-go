@@ -1,4 +1,4 @@
-package sessions
+package sessioncore
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 // testHost is a minimal in-memory SessionHost for tests.
@@ -33,7 +35,7 @@ func newTestHost() *testHost {
 func (h *testHost) PublishSession(ctx context.Context, sessionID string, data []byte) (string, error) {
 	return "", nil
 }
-func (h *testHost) SubscribeSession(ctx context.Context, sessionID string, lastEventID string, handler MessageHandlerFunction) error {
+func (h *testHost) SubscribeSession(ctx context.Context, sessionID string, lastEventID string, handler sessions.MessageHandlerFunction) error {
 	return nil
 }
 func (h *testHost) CleanupSession(ctx context.Context, sessionID string) error {
@@ -61,7 +63,7 @@ func (h *testHost) IsRevoked(ctx context.Context, sessionID string) (bool, error
 	delete(h.revoked, sessionID)
 	return false, nil
 }
-func (h *testHost) BumpEpoch(ctx context.Context, scope RevocationScope) (int64, error) {
+func (h *testHost) BumpEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {
 	if scope.UserID == "" {
 		return 0, errors.New("missing user id")
 	}
@@ -70,7 +72,7 @@ func (h *testHost) BumpEpoch(ctx context.Context, scope RevocationScope) (int64,
 	h.epochByUser[scope.UserID] = h.epochByUser[scope.UserID] + 1
 	return h.epochByUser[scope.UserID], nil
 }
-func (h *testHost) GetEpoch(ctx context.Context, scope RevocationScope) (int64, error) {
+func (h *testHost) GetEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {
 	if scope.UserID == "" {
 		return 0, errors.New("missing user id")
 	}
@@ -160,7 +162,7 @@ func (h *testHost) PublishEvent(ctx context.Context, sessionID, topic string, pa
 	return nil
 }
 
-func (h *testHost) SubscribeEvents(ctx context.Context, sessionID, topic string, handler EventHandlerFunction) (func(), error) {
+func (h *testHost) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) (func(), error) {
 	key := sessionID + "|" + topic
 	ch := make(chan []byte, 4)
 	h.mu.Lock()
@@ -249,7 +251,7 @@ func TestLoadSession_EpochRevokedByBump(t *testing.T) {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
-	if _, err := host.BumpEpoch(ctx, RevocationScope{UserID: user}); err != nil {
+	if _, err := host.BumpEpoch(ctx, sessions.RevocationScope{UserID: user}); err != nil {
 		t.Fatalf("BumpEpoch: %v", err)
 	}
 

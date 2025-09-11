@@ -25,6 +25,12 @@ This library MUST adhere to the following specs.
 2. AVOID running `go test` if the built-in test runner can achieve the same thing.
 3. NEVER run a shell command when a tool can provide the same outcome.
 
+## Discussion style
+
+- Format your content in markdown.
+- Wrap tiny bits of code in inline code markup.
+- Wrap multi-line bits of code in fenced code blocks and tag the block according to the language therein.
+
 ## Behaviour
 
 - Consider different approaches and their trade-offs. When the balance of trade-offs is unclear, confirm with the user.

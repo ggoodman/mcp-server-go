@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 // HostFactory creates a new SessionHost instance for testing.
@@ -430,7 +431,7 @@ func testManagerIntegrationJWS(t *testing.T, factory HostFactory) {
 	defer cleanupHost(t, h)
 
 	// Setup MemoryJWS with a single active Ed25519 key
-	j := sessions.NewMemoryJWS()
+	j := sessioncore.NewMemoryJWS()
 	_, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatalf("ed25519.GenerateKey: %v", err)
@@ -441,7 +442,7 @@ func testManagerIntegrationJWS(t *testing.T, factory HostFactory) {
 	}
 
 	issuer := "test-issuer"
-	mgr := sessions.NewManager(h, sessions.WithJWSSigner(j), sessions.WithIssuer(issuer), sessions.WithRevocationTTL(5*time.Minute))
+	mgr := sessioncore.NewManager(h, sessioncore.WithJWSSigner(j), sessioncore.WithIssuer(issuer), sessioncore.WithRevocationTTL(5*time.Minute))
 
 	// Create a session for a user; token should embed epoch if supported
 	ctx, cancel := context.WithCancel(context.Background())

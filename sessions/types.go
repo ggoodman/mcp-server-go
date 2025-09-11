@@ -3,15 +3,14 @@ package sessions
 import (
 	"context"
 
-	"github.com/ggoodman/mcp-streaming-http-go/mcp"
+	"github.com/ggoodman/mcp-server-go/mcp"
 )
 
 type Session interface {
 	SessionID() string
 	UserID() string
-
-	ConsumeMessages(ctx context.Context, lastEventID string, handleMsgFn MessageHandlerFunction) error
-	WriteMessage(ctx context.Context, msg []byte) error
+	// ProtocolVersion is the negotiated MCP protocol version baked into the session.
+	ProtocolVersion() string
 
 	GetSamplingCapability() (cap SamplingCapability, ok bool)
 	GetRootsCapability() (cap RootsCapability, ok bool)
@@ -19,14 +18,6 @@ type Session interface {
 }
 
 type MessageHandlerFunction func(ctx context.Context, msgID string, msg []byte) error
-
-type MessageType string
-
-const (
-	MessageTypeRequest  MessageType = "request"
-	MessageTypeResponse MessageType = "response"
-	MessageTypeEvent    MessageType = "notification"
-)
 
 type ClientInfo struct {
 	Name    string

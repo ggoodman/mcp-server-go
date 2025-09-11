@@ -11,16 +11,16 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
-	"github.com/ggoodman/mcp-streaming-http-go/auth"
-	"github.com/ggoodman/mcp-streaming-http-go/hooks"
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-streaming-http-go/internal/wellknown"
-	"github.com/ggoodman/mcp-streaming-http-go/mcp"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
+	"github.com/ggoodman/mcp-server-go/auth"
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
+	"github.com/ggoodman/mcp-server-go/internal/wellknown"
+	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 var (
@@ -40,48 +40,25 @@ var (
 )
 
 const (
-	lastEventIDHeader     = "last-event-id"
-	mcpSessionIdHeader    = "mcp-session-id"
-	authorizationHeader   = "authorization"
-	wwwAuthenticateHeader = "www-authenticate"
+	// Use canonical header names for clarity; Go matches headers case-insensitively.
+	lastEventIDHeader        = "Last-Event-ID"
+	mcpSessionIdHeader       = "MCP-Session-ID"
+	mcpProtocolVersionHeader = "MCP-Protocol-Version"
+	authorizationHeader      = "Authorization"
+	wwwAuthenticateHeader    = "WWW-Authenticate"
 )
 
-type StreamingHTTPConfig struct {
-	// ServerURL is the fully qualified URL of the streaming HTTP MCP server
-	// endpoint.
-	ServerURL string
+// Option configures the StreamingHTTPHandler.
+type Option func(*newConfig)
 
-	ServerName string
+// (no legacy config structs)
+// (no legacy manual OIDC config struct)
 
-	// AuthorizationServerURL is the URL of the OIDC authorization server.
-	AuthorizationServerURL string
-
-	// Authenticator provides authentication logic for the MCP server.
-	Authenticator auth.Authenticator
-
-	// Hooks provides the MCP server logic implementation.
-	Hooks hooks.Hooks
-
-	// SessionHost provides session messaging and revocation. Preferred.
-	SessionHost sessions.SessionHost
-
-	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
-	LogHandler slog.Handler
-}
-
-// ManualOIDCConfig allows configuring the StreamingHTTPHandler with pre-configured
-// OAuth/OIDC details, bypassing the need for OIDC discovery. This is particularly
-// useful for testing or environments where OIDC discovery is not available.
-type ManualOIDCConfig struct {
-	// ServerURL is the fully qualified URL of the streaming HTTP MCP server endpoint.
-	ServerURL string
-
-	// ServerName is the human-readable name of the server.
-	ServerName string
-
+// ManualOIDC provides manual OAuth/OIDC details and PRM fields when bypassing
+// OIDC discovery.
+type ManualOIDC struct {
 	// Issuer is the OAuth2 authorization server issuer URL.
 	Issuer string
-
 	// JwksURI is the URL of the JSON Web Key Set document.
 	JwksURI string
 
@@ -90,20 +67,38 @@ type ManualOIDCConfig struct {
 	TokenEndpointAuthMethodsSupported          []string
 	TokenEndpointAuthSigningAlgValuesSupported []string
 	ServiceDocumentation                       string
-	OpPolicyUri                                string
-	OpTosUri                                   string
+	OpPolicyURI                                string
+	OpTosURI                                   string
+}
 
-	// Authenticator provides authentication logic for the MCP server.
-	Authenticator auth.Authenticator
+type newConfig struct {
+	serverName string
+	logHandler slog.Handler
+	// auth mode: exactly one must be set
+	discoveryURL string
+	manualOIDC   *ManualOIDC
+}
 
-	// Hooks provides the MCP server logic implementation.
-	Hooks hooks.Hooks
+// WithServerName sets a human-readable server name surfaced in PRM.
+func WithServerName(name string) Option {
+	return func(c *newConfig) { c.serverName = name }
+}
 
-	// SessionHost provides session messaging and revocation. Preferred.
-	SessionHost sessions.SessionHost
+// WithLogger sets the slog handler used by the server. If not provided, logs are discarded.
+func WithLogger(h slog.Handler) Option {
+	return func(c *newConfig) { c.logHandler = h }
+}
 
-	// LogHandler is an optional slog.Handler for logging within the handler. If nil, logging is discarded.
-	LogHandler slog.Handler
+// WithAuthorizationServerDiscovery enables auto-configuration via OAuth 2.0
+// Authorization Server Metadata (RFC 8414) at the provided issuer URL. OIDC
+// issuers are supported since their discovery document is a superset.
+func WithAuthorizationServerDiscovery(authorizationServerURL string) Option {
+	return func(c *newConfig) { c.discoveryURL = authorizationServerURL }
+}
+
+// WithManualOIDC sets manual OIDC/PRM configuration without discovery.
+func WithManualOIDC(cfg ManualOIDC) Option {
+	return func(c *newConfig) { c.manualOIDC = &cfg }
 }
 
 // StreamingHTTPHandler implements the stream HTTP transport protocol of
@@ -117,9 +112,23 @@ type StreamingHTTPHandler struct {
 	serverURL      *url.URL
 
 	auth        auth.Authenticator
-	hooks       hooks.Hooks
-	sessions    sessions.SessionManager
+	mcp         mcpserver.ServerCapabilities
+	sessions    *sessioncore.SessionManager
 	sessionHost sessions.SessionHost
+
+	// Per-session subscription bridges for resources/updated notifications.
+	// Map: sessionID -> (uri -> cancel)
+	subMu      sync.Mutex
+	subCancels map[string]map[string]context.CancelFunc
+
+	// Per-session parent contexts for long-lived activities (e.g., resource
+	// subscription forwarders). Each session gets a parent derived from the
+	// request context via context.WithoutCancel to preserve values while
+	// decoupling from request cancellation. The cancel function is invoked
+	// when the session ends or is deemed invalid.
+	sessMu      sync.Mutex
+	sessParents map[string]context.Context
+	sessCancel  map[string]context.CancelFunc
 }
 
 type writeFlusher interface {
@@ -127,134 +136,146 @@ type writeFlusher interface {
 	http.Flusher
 }
 
-func NewStreamingHTTPHandler(ctx context.Context, config StreamingHTTPConfig) (*StreamingHTTPHandler, error) {
-	if config.Authenticator == nil {
+// bootstrapSession is a minimal sessions.Session used during initialize before a real
+// session handle exists. It only carries the user ID; capabilities are absent.
+type bootstrapSession struct {
+	userID string
+}
+
+func (b *bootstrapSession) SessionID() string       { return "" }
+func (b *bootstrapSession) UserID() string          { return b.userID }
+func (b *bootstrapSession) ProtocolVersion() string { return "" }
+func (b *bootstrapSession) GetSamplingCapability() (sessions.SamplingCapability, bool) {
+	return nil, false
+}
+func (b *bootstrapSession) GetRootsCapability() (sessions.RootsCapability, bool) { return nil, false }
+func (b *bootstrapSession) GetElicitationCapability() (sessions.ElicitationCapability, bool) {
+	return nil, false
+}
+
+// New constructs a StreamingHTTPHandler using required formal parameters and optional settings.
+//
+// Required:
+//   - publicEndpoint: externally visible URL of the MCP endpoint (scheme, host, path)
+//   - host: sessions.SessionHost implementation (horizontal-scale ready)
+//   - server: mcpserver.ServerCapabilities implementation
+//   - authenticator: auth.Authenticator implementation
+//
+// Exactly one auth mode option must be provided:
+//   - WithAuthorizationServerDiscovery
+//   - WithManualOIDC
+func New(
+	ctx context.Context,
+	publicEndpoint string,
+	host sessions.SessionHost,
+	server mcpserver.ServerCapabilities,
+	authenticator auth.Authenticator,
+	opts ...Option,
+) (*StreamingHTTPHandler, error) {
+	if authenticator == nil {
 		return nil, fmt.Errorf("authenticator is required")
 	}
-
-	if config.Hooks == nil {
-		return nil, fmt.Errorf("hooks is required")
+	if server == nil {
+		return nil, fmt.Errorf("server is required")
 	}
-
-	// Either Host or Broker must be provided (Host preferred)
-	if config.SessionHost == nil {
+	if host == nil {
 		return nil, fmt.Errorf("SessionHost is required")
 	}
 
-	// Perform OIDC discovery
-	provider, err := oidc.NewProvider(ctx, config.AuthorizationServerURL)
+	mcpURL, err := url.Parse(publicEndpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OIDC provider: %w", err)
+		return nil, fmt.Errorf("invalid server URL %q: %w", publicEndpoint, err)
 	}
-
-	var asm *wellknown.AuthServerMetadata
-
-	if err := provider.Claims(&asm); err != nil {
-		return nil, fmt.Errorf("unexpected or invalid authorization server metadata: %w", err)
-	}
-
-	if asm.JwksUri == "" {
-		return nil, fmt.Errorf("the supplied authorization server does not declare support for a JWKS URI in its metadata")
-	}
-
-	// Create manual config from discovered metadata and delegate to manual constructor
-	manualConfig := ManualOIDCConfig{
-		ServerURL:                         config.ServerURL,
-		ServerName:                        config.ServerName,
-		Issuer:                            asm.Issuer,
-		JwksURI:                           asm.JwksUri,
-		ScopesSupported:                   asm.ScopesSupported,
-		TokenEndpointAuthMethodsSupported: asm.TokenEndpointAuthMethodsSupported,
-		TokenEndpointAuthSigningAlgValuesSupported: asm.TokenEndpointAuthSigningAlgValuesSupported,
-		ServiceDocumentation:                       asm.ServiceDocumentation,
-		OpPolicyUri:                                asm.OpPolicyUri,
-		OpTosUri:                                   asm.OpTosUri,
-		Authenticator:                              config.Authenticator,
-		Hooks:                                      config.Hooks,
-		SessionHost:                                config.SessionHost,
-		LogHandler:                                 config.LogHandler,
-	}
-
-	handler, err := NewStreamingHTTPHandlerWithManualOIDC(ctx, manualConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	// Set the OIDC provider for the discovery-based path
-	handler.oidcProvider = provider
-
-	return handler, nil
-}
-
-// NewStreamingHTTPHandlerWithManualOIDC creates a new StreamingHTTPHandler with
-// manually provided OAuth/OIDC configuration, bypassing OIDC discovery.
-// This is useful for testing or environments where OIDC discovery is not available.
-func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOIDCConfig) (*StreamingHTTPHandler, error) {
-	mcpURL, err := url.Parse(config.ServerURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid server URL %q: %w", config.ServerURL, err)
-	}
-
 	if mcpURL.Scheme != "https" && mcpURL.Scheme != "http" {
 		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
 	}
 
-	if config.Issuer == "" {
-		return nil, fmt.Errorf("issuer is required")
+	cfg := &newConfig{}
+	for _, opt := range opts {
+		opt(cfg)
 	}
 
-	if config.JwksURI == "" {
-		return nil, fmt.Errorf("JwksURI is required")
-	}
-
-	if config.Authenticator == nil {
-		return nil, fmt.Errorf("authenticator is required")
-	}
-
-	if config.Hooks == nil {
-		return nil, fmt.Errorf("hooks is required")
-	}
-
-	if config.SessionHost == nil {
-		return nil, fmt.Errorf("SessionHost is required")
+	if (cfg.discoveryURL == "" && cfg.manualOIDC == nil) || (cfg.discoveryURL != "" && cfg.manualOIDC != nil) {
+		return nil, fmt.Errorf("exactly one of WithAuthorizationServerDiscovery or WithManualOIDC must be provided")
 	}
 
 	logHandler := slog.DiscardHandler
-
-	if config.LogHandler != nil {
-		logHandler = config.LogHandler
+	if cfg.logHandler != nil {
+		logHandler = cfg.logHandler
 	}
-
 	log := slog.New(logHandler)
-	sessions := sessions.NewManager(config.SessionHost)
+	sm := sessioncore.NewManager(host)
 
 	h := &StreamingHTTPHandler{
-		log:          log,
-		serverURL:    mcpURL,
-		oidcProvider: nil, // Not needed for manual configuration
-		auth:         config.Authenticator,
-		hooks:        config.Hooks,
-		sessions:     sessions,
-		sessionHost:  config.SessionHost,
-		prmDocument: wellknown.ProtectedResourceMetadata{
-			Resource:                              mcpURL.String(),
-			AuthorizationServers:                  []string{config.Issuer},
-			JwksURI:                               config.JwksURI,
-			ScopesSupported:                       config.ScopesSupported,
-			BearerMethodsSupported:                config.TokenEndpointAuthMethodsSupported,
-			ResourceSigningAlgValuesSupported:     config.TokenEndpointAuthSigningAlgValuesSupported,
-			ResourceName:                          config.ServerName,
-			ResourceDocumentation:                 config.ServiceDocumentation,
-			ResourcePolicyURI:                     config.OpPolicyUri,
-			ResourceTosURI:                        config.OpTosUri,
-			TlsClientCertificateBoundAccessTokens: false,
-			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
-		},
+		log:         log,
+		serverURL:   mcpURL,
+		auth:        authenticator,
+		mcp:         server,
+		sessions:    sm,
+		sessionHost: host,
+		subCancels:  make(map[string]map[string]context.CancelFunc),
+		sessParents: make(map[string]context.Context),
+		sessCancel:  make(map[string]context.CancelFunc),
 	}
 
-	// The protected resource URL should be based on the MCP server URL but with
-	// the path `.well-known/oauth-protected-resource<suffix>` where `suffix` is the
-	// path of the MCP Server itself. We create a new URL to avoid mutating the original.
+	// Build PRM based on auth mode
+	switch {
+	case cfg.manualOIDC != nil:
+		manual := cfg.manualOIDC
+		if manual.Issuer == "" {
+			return nil, fmt.Errorf("issuer is required for manual OIDC")
+		}
+		if manual.JwksURI == "" {
+			return nil, fmt.Errorf("JwksURI is required for manual OIDC")
+		}
+		h.prmDocument = wellknown.ProtectedResourceMetadata{
+			Resource:             mcpURL.String(),
+			AuthorizationServers: []string{manual.Issuer},
+			JwksURI:              manual.JwksURI,
+			ScopesSupported:      manual.ScopesSupported,
+			// Per RFC 9728, bearer methods describe how the token is sent to the resource.
+			// We support the Authorization header mechanism.
+			BearerMethodsSupported: []string{"authorization_header"},
+			// ResourceSigningAlgValuesSupported applies if the RESOURCE signs challenges; leave empty unless explicitly supported.
+			// ResourceSigningAlgValuesSupported:  manual.ResourceSigningAlgValuesSupported, // not set by default
+			ResourceName:                          cfg.serverName,
+			ResourceDocumentation:                 manual.ServiceDocumentation,
+			ResourcePolicyURI:                     manual.OpPolicyURI,
+			ResourceTosURI:                        manual.OpTosURI,
+			TlsClientCertificateBoundAccessTokens: false,
+			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
+		}
+		h.oidcProvider = nil
+
+	case cfg.discoveryURL != "":
+		provider, err := oidc.NewProvider(ctx, cfg.discoveryURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create OIDC provider: %w", err)
+		}
+		var asm *wellknown.AuthServerMetadata
+		if err := provider.Claims(&asm); err != nil {
+			return nil, fmt.Errorf("unexpected or invalid authorization server metadata: %w", err)
+		}
+		if asm.JwksUri == "" {
+			return nil, fmt.Errorf("the supplied authorization server does not declare support for a JWKS URI in its metadata")
+		}
+		h.prmDocument = wellknown.ProtectedResourceMetadata{
+			Resource:                              mcpURL.String(),
+			AuthorizationServers:                  []string{asm.Issuer},
+			JwksURI:                               asm.JwksUri,
+			ScopesSupported:                       asm.ScopesSupported,
+			BearerMethodsSupported:                []string{"authorization_header"},
+			ResourceName:                          cfg.serverName,
+			ResourceDocumentation:                 asm.ServiceDocumentation,
+			ResourcePolicyURI:                     asm.OpPolicyUri,
+			ResourceTosURI:                        asm.OpTosUri,
+			TlsClientCertificateBoundAccessTokens: false,
+			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
+		}
+		h.oidcProvider = provider
+	}
+
+	// Construct PRM document URL
 	h.prmDocumentURL = &url.URL{
 		Scheme: mcpURL.Scheme,
 		Host:   mcpURL.Host,
@@ -262,28 +283,91 @@ func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOID
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(fmt.Sprintf("POST %s", hostPath(mcpURL)), h.handlePostMCP)
-	mux.HandleFunc(fmt.Sprintf("GET %s", hostPath(mcpURL)), h.handleGetMCP)
-	mux.HandleFunc(fmt.Sprintf("GET %s", hostPath(h.prmDocumentURL)), h.handleGetProtectedResourceMetadata)
-
+	mux.HandleFunc(fmt.Sprintf("POST %s", pathOnly(mcpURL)), h.handlePostMCP)
+	mux.HandleFunc(fmt.Sprintf("GET %s", pathOnly(mcpURL)), h.handleGetMCP)
+	mux.HandleFunc(fmt.Sprintf("DELETE %s", pathOnly(mcpURL)), h.handleDeleteMCP)
+	mux.HandleFunc(fmt.Sprintf("GET %s", pathOnly(h.prmDocumentURL)), h.handleGetProtectedResourceMetadata)
 	h.mux = mux
 
 	return h, nil
 }
 
-// hostPath takes a url.URL and returns the host and path components concatenated.
-// For example, for URL "https://example.com:8080/foo/bar", it returns "example.com/foo/bar".
-// If the path is empty, it returns
-func hostPath(u *url.URL) string {
-	path := u.Path
-	if path == "" || path == "/" {
-		path = "/{$}"
+// hostPath builds the key used for ServeMux's host-aware patterns: "host[:port]" + path.
+// For example, for URL "https://example.com:8080/foo/bar", it returns "example.com:8080/foo/bar".
+// If the path is empty or "/", treat it as root "/".
+// pathOnly returns just the URL path or "/" if empty.
+func pathOnly(u *url.URL) string {
+	if u == nil {
+		return "/"
 	}
-	return u.Hostname() + path
+	if u.Path == "" {
+		return "/"
+	}
+	return u.Path
 }
 
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+// handleDeleteMCP handles the DELETE /mcp endpoint, which terminates an existing
+// session. Authentication is required. On success, both persistent host-side
+// resources and any process-local ephemeral resources associated with the
+// session are cleaned up.
+func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handleDeleteMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
+
+	ctx := r.Context()
+
+	userInfo := h.checkAuthentication(ctx, r, w)
+	if userInfo == nil {
+		return
+	}
+
+	sessID := r.Header.Get(mcpSessionIdHeader)
+	if sessID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// Verify the session belongs to the authenticated user before deletion and
+	// capture its protocol version for response headers.
+	sh, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID())
+	if err != nil {
+		// Regardless of validity, ensure any local ephemerals are torn down.
+		h.teardownSession(sessID)
+		// Do not reveal existence; return 404 for invalid or non-owned sessions.
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	respProtoVersion := sh.Session().ProtocolVersion()
+
+	// Protocol version handling: if a session-bound protocol version exists, enforce
+	// that any provided header matches it. If the header is missing, allow the request
+	// (especially important when the session token doesn't encode a version, e.g., non-JWS).
+	if pv := r.Header.Get(mcpProtocolVersionHeader); respProtoVersion != "" && pv != "" && pv != respProtoVersion {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+
+	// Revoke and cleanup persistent resources via the session manager.
+	if err := h.sessions.DeleteSession(ctx, sessID); err != nil {
+		// Best-effort local teardown even on error.
+		h.teardownSession(sessID)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// Also tear down any local per-session forwarders/parents.
+	h.teardownSession(sessID)
+
+	// If we captured a protocol version, advertise it
+	if respProtoVersion != "" {
+		w.Header().Set(mcpProtocolVersionHeader, respProtoVersion)
+	}
+
+	// Success: no content.
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
@@ -308,8 +392,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
+	// Tie processing to the request context (no artificial timeouts here).
+	ctx := r.Context()
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
@@ -335,33 +419,45 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	// An MCP-Session-ID header is required for all other requests. The session MUST exist and be
 	// bound to the authenticated user.
-	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID())
+	sh, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID())
 	if err != nil {
-		if errors.Is(err, ErrInvalidSession) {
-			// Signal that the session is invalid and that the client needs to re-initialize
-			// to start a new session.
-			w.WriteHeader(http.StatusNotFound)
+		// Treat any load failure as not found; best-effort local teardown.
+		w.WriteHeader(http.StatusNotFound)
+		h.teardownSession(sessID)
+		return
+	}
+
+	// Protocol version handling: if the session is bound to a version, require that
+	// any provided header matches. If the header is missing, allow the request to
+	// proceed (tests may not yet set this header; spec allows servers to infer).
+	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
+		if spv := sh.Session().ProtocolVersion(); spv != "" && pv != spv {
+			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
-
-		w.WriteHeader(http.StatusInternalServerError)
-		return
 	}
 
 	// We have a valid session now. Let's see what kind of message it is.
 	if req := msg.AsRequest(); req != nil {
 		if req.ID.IsNil() {
-			if err := h.handleNotification(ctx, session, userInfo, req); err != nil {
+			if err := h.handleNotification(ctx, sh.Session(), userInfo, req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
 			// The notification was handled successfully.
+			if spv := sh.Session().ProtocolVersion(); spv != "" {
+				w.Header().Set(mcpProtocolVersionHeader, spv)
+			}
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 
-		// Set the content type for the SSE response
+		// Set the content type for the SSE response now that preconditions are satisfied
+		// and advertise the session's protocol version if available
+		if spv := sh.Session().ProtocolVersion(); spv != "" {
+			w.Header().Set(mcpProtocolVersionHeader, spv)
+		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
 		w.WriteHeader(http.StatusOK)
 
@@ -372,10 +468,10 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		// try to write that session's messages back to the client as part of
 		// handling this request. The wrapper will fall back to writing to
 		// the session backend if writing to the client fails.
-		session = newSessionWithWriter(ctx, session, wf)
+		sess := newSessionWithWriter(ctx, sh.Session(), wf, sh.WriteMessage)
 
 		// This is a request with an ID, so we need to handle it as a request.
-		res, err := h.handleRequest(ctx, session, userInfo, req)
+		res, err := h.handleRequest(ctx, sess, userInfo, req)
 		if err != nil {
 			res = &jsonrpc.Response{
 				JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -397,11 +493,13 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	if res := msg.AsResponse(); res != nil {
 		// TODO: Dispatch the response to the communication mesh.
 
-		if err := h.handleResponse(ctx, session, userInfo, res); err != nil {
+		if err := h.handleResponse(ctx, sh.Session(), userInfo, res); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-
+		if spv := sh.Session().ProtocolVersion(); spv != "" {
+			w.Header().Set(mcpProtocolVersionHeader, spv)
+		}
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -423,8 +521,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
+	// Tie SSE stream to the request context; client disconnect cancels ctx.
+	ctx := r.Context()
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
@@ -437,25 +535,97 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	wroteHeadersCh := make(chan struct{})
-
-	session, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID())
+	sh, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID())
 	if err != nil {
-		if errors.Is(err, ErrInvalidSession) {
-			w.WriteHeader(http.StatusNotFound)
+		// Treat any load failure as not found; best-effort cleanup of local resources.
+		w.WriteHeader(http.StatusNotFound)
+		h.teardownSession(sessionHeader)
+		return
+	}
+
+	// Protocol version handling for stream consumption: if header provided and
+	// session has a bound version, require match; otherwise allow.
+	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
+		if spv := sh.Session().ProtocolVersion(); spv != "" && pv != spv {
+			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
-
-		w.WriteHeader(http.StatusInternalServerError)
-		return
 	}
 
 	lastEventID := r.Header.Get(lastEventIDHeader)
 
+	// Option B wiring for resources list_changed notifications:
+	// 1) Subscribe to internal fan-out topic and forward as JSON-RPC to the client.
+	// 2) Register a local publisher that publishes to the internal topic when the
+	//    process-local resources notifier ticks; registration is tied to this GET lifetime.
+	const resourcesListChangedTopic = string(mcp.ResourcesListChangedNotificationMethod)
+
+	// Subscribe before we register the publisher to avoid a race dropping first events.
+	unsub, subErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), resourcesListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+		// payload is unused for list_changed; deliver JSON-RPC notification into the session.
+		n := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ResourcesListChangedNotificationMethod),
+		}
+		b, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		return sh.WriteMessage(evtCtx, b)
+	})
+	if subErr != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer unsub()
+
+	// Bridge resources/updated notifications via the internal bus as well.
+	const resourcesUpdatedTopic = string(mcp.ResourcesUpdatedNotificationMethod)
+	unsubUpdated, subUpdatedErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), resourcesUpdatedTopic, func(evtCtx context.Context, payload []byte) error {
+		// payload is JSON: {"uri": string}
+		n := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ResourcesUpdatedNotificationMethod),
+			Params:         payload,
+		}
+		b, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		return sh.WriteMessage(evtCtx, b)
+	})
+	if subUpdatedErr != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer unsubUpdated()
+
+	// Discover resources capability and (optionally) listChanged capability
+	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, sh.Session()); err == nil && ok {
+		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {
+			// Register a local publisher tied to this GET context lifetime
+			_, _ = lc.Register(ctx, sh.Session(), func(cbCtx context.Context, sess sessions.Session, _ string) {
+				// best-effort publish to internal topic; no payload required
+				_ = h.sessionHost.PublishEvent(cbCtx, sess.SessionID(), resourcesListChangedTopic, nil)
+			})
+		}
+	}
+
+	// At this point we have a valid session and subscriptions are established.
+	// Proactively set SSE headers and advertise protocol version so the client observes the stream
+	// immediately, even if the first event arrives later.
+	if spv := sh.Session().ProtocolVersion(); spv != "" {
+		w.Header().Set(mcpProtocolVersionHeader, spv)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	wf.Flush()
+
 	// Requests to the GET /mcp endpoint MUST be in the context of an already
 	// established session. Session establishment can only happen in POST /mcp.
 	// As a result, we can respond with an error in the case of a missing session.
-	if err := session.ConsumeMessages(ctx, lastEventID, func(ctx context.Context, msgID string, bytes []byte) error {
+	if err := sh.ConsumeMessages(ctx, lastEventID, func(ctx context.Context, msgID string, bytes []byte) error {
 		var msg jsonrpc.AnyMessage
 
 		if err := json.Unmarshal(bytes, &msg); err != nil {
@@ -463,7 +633,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 
 		if msgID != "" {
-			if _, err := w.Write([]byte(fmt.Sprintf("id: %s\n", msgID))); err != nil {
+			if _, err := fmt.Fprintf(w, "id: %s\n", msgID); err != nil {
 				return fmt.Errorf("failed to write session message to http response: %w", err)
 			}
 		}
@@ -487,27 +657,11 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 		return nil
 	}); err != nil {
-		if errors.Is(err, ErrSessionHeaderMissing) || errors.Is(err, ErrSessionHeaderInvalid) {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		if errors.Is(err, ErrInvalidSession) {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		w.WriteHeader(http.StatusInternalServerError)
+		// Headers have already been sent; simply return.
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-
-	wf.Flush()
-
-	close(wroteHeadersCh)
+	// Stream ended (client closed, context canceled, or no further messages).
 }
 
 // handleGetProtectedResourceMetadata serves the OAuth2 Protected Resource Metadata
@@ -552,23 +706,28 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		return fmt.Errorf("failed to unmarshal initialize request: %w", err)
 	}
 
-	opts := []sessions.SessionOption{}
+	// Resolve protocol version preference BEFORE minting the session id so the
+	// negotiated version can be baked into the token.
+	negotiatedVersion := initializeReq.ProtocolVersion
+	if v, ok, err := h.mcp.GetPreferredProtocolVersion(ctx, &bootstrapSession{userID: userInfo.UserID()}); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get preferred protocol version: %w", err)
+	} else if ok && v != "" {
+		negotiatedVersion = v
+	}
+
+	// Build session options, including negotiated protocol version.
+	opts := []sessioncore.SessionOption{sessioncore.WithProtocolVersion(negotiatedVersion)}
 
 	// Check client capabilities and set them if supported
 	if initializeReq.Capabilities.Sampling != nil {
-		opts = append(opts, sessions.WithSamplingCapability())
-		// The session implementation will provide the actual sampling capability
-		// For now we set it to nil - this should be handled by the session layer
+		opts = append(opts, sessioncore.WithSamplingCapability())
 	}
 	if initializeReq.Capabilities.Roots != nil {
-		opts = append(opts, sessions.WithRootsCapability(initializeReq.Capabilities.Roots.ListChanged))
-		// The session implementation will provide the actual roots capability
-		// For now we set it to nil - this should be handled by the session layer
+		opts = append(opts, sessioncore.WithRootsCapability(initializeReq.Capabilities.Roots.ListChanged))
 	}
 	if initializeReq.Capabilities.Elicitation != nil {
-		opts = append(opts, sessions.WithElicitationCapability())
-		// The session implementation will provide the actual elicitation capability
-		// For now we set it to nil - this should be handled by the session layer
+		opts = append(opts, sessioncore.WithElicitationCapability())
 	}
 
 	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), opts...)
@@ -577,10 +736,70 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		return fmt.Errorf("failed to create session: %w", err)
 	}
 
-	initializeRes, err := h.hooks.Initialize(ctx, session, &initializeReq)
+	// We're going to introspect the capabilities supported by the MCP server and
+	// use that to inform the client what capabilities are available to this session.
+	serverInfo, err := h.mcp.GetServerInfo(ctx, session.Session())
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to initialize session: %w", err)
+		return fmt.Errorf("failed to get server info: %w", err)
+	}
+
+	initializeRes := &mcp.InitializeResult{
+		ProtocolVersion: negotiatedVersion,
+		ServerInfo:      serverInfo,
+	}
+
+	// Optional instructions
+	if instr, ok, err := h.mcp.GetInstructions(ctx, session.Session()); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get instructions: %w", err)
+	} else if ok {
+		initializeRes.Instructions = instr
+	}
+
+	resCap, hasResourcesCap, err := h.mcp.GetResourcesCapability(ctx, session.Session())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get resources capability: %w", err)
+	}
+	if hasResourcesCap {
+		_, hasChangeSubCap, err := resCap.GetSubscriptionCapability(ctx, session.Session())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return fmt.Errorf("failed to get resources subscription capability: %w", err)
+		}
+
+		_, hasListChangedCap, err := resCap.GetListChangedCapability(ctx, session.Session())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return fmt.Errorf("failed to get resources listChanged capability: %w", err)
+		}
+
+		initializeRes.Capabilities.Resources = &struct {
+			ListChanged bool "json:\"listChanged\""
+			Subscribe   bool "json:\"subscribe\""
+		}{
+			ListChanged: hasListChangedCap,
+			Subscribe:   hasChangeSubCap,
+		}
+	}
+
+	// Discover tools capability and (optionally) listChanged capability
+	if toolsCap, hasToolsCap, err := h.mcp.GetToolsCapability(ctx, session.Session()); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get tools capability: %w", err)
+	} else if hasToolsCap {
+		_, hasToolsListChanged, err := toolsCap.GetListChangedCapability(ctx, session.Session())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return fmt.Errorf("failed to get tools listChanged capability: %w", err)
+		}
+
+		initializeRes.Capabilities.Tools = &struct {
+			ListChanged bool "json:\"listChanged\""
+		}{
+			ListChanged: hasToolsListChanged,
+		}
 	}
 
 	res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
@@ -590,6 +809,10 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 	}
 
 	w.Header().Set(mcpSessionIdHeader, session.SessionID())
+	// Advertise the negotiated protocol version on the response
+	if negotiatedVersion != "" {
+		w.Header().Set(mcpProtocolVersionHeader, negotiatedVersion)
+	}
 	w.Header().Set("Content-Type", eventStreamMediaType.String())
 	w.WriteHeader(http.StatusOK)
 	if err := writeSSEEvent(wf, "response", "", res); err != nil {
@@ -602,13 +825,7 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 
 // mapHooksErrorToJSONRPCError maps specific hooks errors to appropriate JSON-RPC error responses
 func mapHooksErrorToJSONRPCError(requestID *jsonrpc.RequestID, err error) *jsonrpc.Response {
-	switch e := err.(type) {
-	case *hooks.NotFoundError:
-		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeMethodNotFound, e.Error(), nil)
-	case *hooks.AlreadySubscribedError, *hooks.NotSubscribedError, *hooks.InvalidParamsError:
-		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInvalidParams, e.Error(), nil)
-	case *hooks.UnsupportedOperationError:
-		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeMethodNotFound, e.Error(), nil)
+	switch err.(type) {
 	default:
 		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
 	}
@@ -621,9 +838,11 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 	case string(mcp.PingMethod):
 		return jsonrpc.NewResultResponse(req.ID, struct{}{})
 	case string(mcp.ToolsListMethod):
-		toolsCap := h.hooks.GetToolsCapability()
-
-		if toolsCap == nil {
+		toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || toolsCap == nil {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
 		}
 
@@ -632,21 +851,34 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
 		}
 
-		tools, nextCursor, err := toolsCap.ListTools(ctx, session, listToolsReq.Cursor)
+		page, err := toolsCap.ListTools(ctx, session, func() *string {
+			if listToolsReq.Cursor == "" {
+				return nil
+			}
+			s := listToolsReq.Cursor
+			return &s
+		}())
 		if err != nil {
 			return mapHooksErrorToJSONRPCError(req.ID, err), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListToolsResult{
-			Tools: tools,
+			Tools: page.Items,
 			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: nextCursor,
+				NextCursor: func() string {
+					if page.NextCursor == nil {
+						return ""
+					}
+					return *page.NextCursor
+				}(),
 			},
 		})
 	case string(mcp.ToolsCallMethod):
-		toolsCap := h.hooks.GetToolsCapability()
-
-		if toolsCap == nil {
+		toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || toolsCap == nil {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
 		}
 
@@ -662,9 +894,11 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		return jsonrpc.NewResultResponse(req.ID, result)
 	case string(mcp.ResourcesListMethod):
-		resourcesCap := h.hooks.GetResourcesCapability()
-
-		if resourcesCap == nil {
+		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
 		}
 
@@ -673,21 +907,34 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
 		}
 
-		resources, nextCursor, err := resourcesCap.ListResources(ctx, session, listResourcesReq.Cursor)
+		page, err := resourcesCap.ListResources(ctx, session, func() *string {
+			if listResourcesReq.Cursor == "" {
+				return nil
+			}
+			s := listResourcesReq.Cursor
+			return &s
+		}())
 		if err != nil {
 			return mapHooksErrorToJSONRPCError(req.ID, err), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourcesResult{
-			Resources: resources,
+			Resources: page.Items,
 			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: nextCursor,
+				NextCursor: func() string {
+					if page.NextCursor == nil {
+						return ""
+					}
+					return *page.NextCursor
+				}(),
 			},
 		})
 	case string(mcp.ResourcesReadMethod):
-		resourcesCap := h.hooks.GetResourcesCapability()
-
-		if resourcesCap == nil {
+		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
 		}
 
@@ -705,9 +952,11 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			Contents: contents,
 		})
 	case string(mcp.ResourcesSubscribeMethod):
-		resourcesCap := h.hooks.GetResourcesCapability()
-
-		if resourcesCap == nil {
+		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
 		}
 
@@ -716,107 +965,198 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
 		}
 
-		err := resourcesCap.SubscribeToResource(ctx, session, subscribeReq.URI)
+		subCap, ok, err := resourcesCap.GetSubscriptionCapability(ctx, session)
 		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || subCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources subscription capability not supported", nil), nil
+		}
+
+		if err := subCap.Subscribe(ctx, session, subscribeReq.URI); err != nil {
 			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		// Maintain a per-session, per-URI forwarder that listens for local update ticks
+		// and publishes notifications/resources/updated onto the session bus. If a forwarder
+		// already exists for this (session, uri), do nothing (idempotent).
+		// Establish forwarder only if the capability is our fs-backed implementation or any implementation
+		// that exposes an internal Subscriber channel via ChangeNotifier pattern.
+		if fsCap, ok, _ := h.mcp.GetResourcesCapability(ctx, session); ok {
+			// Best-effort: try to access a subscriber channel for this URI if supported by the implementation.
+			type uriSubscriber interface {
+				SubscriberForURI(uri string) <-chan struct{}
+			}
+			if us, uok := any(fsCap).(uriSubscriber); uok {
+				ch := us.SubscriberForURI(subscribeReq.URI)
+				if ch != nil {
+					sid := session.SessionID()
+					h.subMu.Lock()
+					if _, ok := h.subCancels[sid]; !ok {
+						h.subCancels[sid] = make(map[string]context.CancelFunc)
+					}
+					if _, exists := h.subCancels[sid][subscribeReq.URI]; !exists {
+						// Forwarder lifetime is tied to the session (until unsubscribe).
+						// Derive from the per-session parent context that preserves values
+						// but is not canceled by the request.
+						pctx := h.ensureSessionParentContext(ctx, sid)
+						fctx, cancel := context.WithCancel(pctx)
+						h.subCancels[sid][subscribeReq.URI] = cancel
+						go func(sess sessions.Session, uri string, ch <-chan struct{}) {
+							defer func() {
+								// On forwarder exit, clean up cancel map entry if still present
+								h.subMu.Lock()
+								if m, ok := h.subCancels[sid]; ok {
+									if _, ok := m[subscribeReq.URI]; ok {
+										delete(m, subscribeReq.URI)
+										if len(m) == 0 {
+											delete(h.subCancels, sid)
+										}
+									}
+								}
+								h.subMu.Unlock()
+							}()
+							for {
+								select {
+								case <-fctx.Done():
+									return
+								case _, ok := <-ch:
+									if !ok {
+										return
+									}
+									// Publish JSON payload {"uri": uri}
+									payload, _ := json.Marshal(&mcp.ResourceUpdatedNotification{URI: uri})
+									_ = h.sessionHost.PublishEvent(fctx, sess.SessionID(), string(mcp.ResourcesUpdatedNotificationMethod), payload)
+								}
+							}
+						}(session, subscribeReq.URI, ch)
+					}
+					h.subMu.Unlock()
+				}
+			}
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, struct{}{})
 	case string(mcp.ResourcesUnsubscribeMethod):
-		resourcesCap := h.hooks.GetResourcesCapability()
-
-		if resourcesCap == nil {
+		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
 		}
 
-		var unsubscribeReq mcp.UnsubscribeRequest
-		if err := json.Unmarshal(req.Params, &unsubscribeReq); err != nil {
+		var subscribeReq mcp.SubscribeRequest
+		if err := json.Unmarshal(req.Params, &subscribeReq); err != nil {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
 		}
 
-		err := resourcesCap.UnsubscribeFromResource(ctx, session, unsubscribeReq.URI)
+		subCap, ok, err := resourcesCap.GetSubscriptionCapability(ctx, session)
 		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || subCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources subscription capability not supported", nil), nil
+		}
+
+		if err := subCap.Unsubscribe(ctx, session, subscribeReq.URI); err != nil {
 			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		// Tear down the forwarder if present
+		{
+			sid := session.SessionID()
+			h.subMu.Lock()
+			if m, ok := h.subCancels[sid]; ok {
+				if cancel, ok := m[subscribeReq.URI]; ok {
+					cancel()
+					delete(m, subscribeReq.URI)
+					if len(m) == 0 {
+						delete(h.subCancels, sid)
+					}
+				}
+			}
+			h.subMu.Unlock()
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-	case string(mcp.PromptsListMethod):
-		promptsCap := h.hooks.GetPromptsCapability()
+		// case string(mcp.PromptsListMethod):
+		// 	promptsCap := h.hooks.GetPromptsCapability()
 
-		if promptsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
-		}
+		// 	if promptsCap == nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+		// 	}
 
-		var listPromptsReq mcp.ListPromptsRequest
-		if err := json.Unmarshal(req.Params, &listPromptsReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
+		// 	var listPromptsReq mcp.ListPromptsRequest
+		// 	if err := json.Unmarshal(req.Params, &listPromptsReq); err != nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		// 	}
 
-		prompts, nextCursor, err := promptsCap.ListPrompts(ctx, session, listPromptsReq.Cursor)
-		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		}
+		// 	prompts, nextCursor, err := promptsCap.ListPrompts(ctx, session, listPromptsReq.Cursor)
+		// 	if err != nil {
+		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		// 	}
 
-		return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
-			Prompts: prompts,
-			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: nextCursor,
-			},
-		})
-	case string(mcp.PromptsGetMethod):
-		promptsCap := h.hooks.GetPromptsCapability()
+		// 	return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
+		// 		Prompts: prompts,
+		// 		PaginatedResult: mcp.PaginatedResult{
+		// 			NextCursor: nextCursor,
+		// 		},
+		// 	})
+		// case string(mcp.PromptsGetMethod):
+		// 	promptsCap := h.hooks.GetPromptsCapability()
 
-		if promptsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
-		}
+		// 	if promptsCap == nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+		// 	}
 
-		var getPromptReq mcp.GetPromptRequestReceived
-		if err := json.Unmarshal(req.Params, &getPromptReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
+		// 	var getPromptReq mcp.GetPromptRequestReceived
+		// 	if err := json.Unmarshal(req.Params, &getPromptReq); err != nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		// 	}
 
-		result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
-		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		}
+		// 	result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
+		// 	if err != nil {
+		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		// 	}
 
-		return jsonrpc.NewResultResponse(req.ID, result)
-	case string(mcp.LoggingSetLevelMethod):
-		loggingCap := h.hooks.GetLoggingCapability()
+		// 	return jsonrpc.NewResultResponse(req.ID, result)
+		// case string(mcp.LoggingSetLevelMethod):
+		// 	loggingCap := h.hooks.GetLoggingCapability()
 
-		if loggingCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
-		}
+		// 	if loggingCap == nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
+		// 	}
 
-		var setLevelReq mcp.SetLevelRequest
-		if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
+		// 	var setLevelReq mcp.SetLevelRequest
+		// 	if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		// 	}
 
-		err := loggingCap.SetLevel(ctx, session, setLevelReq.Level)
-		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		}
+		// 	err := loggingCap.SetLevel(ctx, session, setLevelReq.Level)
+		// 	if err != nil {
+		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		// 	}
 
-		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-	case string(mcp.CompletionCompleteMethod):
-		completionsCap := h.hooks.GetCompletionsCapability()
+		// 	return jsonrpc.NewResultResponse(req.ID, struct{}{})
+		// case string(mcp.CompletionCompleteMethod):
+		// 	completionsCap := h.hooks.GetCompletionsCapability()
 
-		if completionsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
-		}
+		// 	if completionsCap == nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
+		// 	}
 
-		var completeReq mcp.CompleteRequest
-		if err := json.Unmarshal(req.Params, &completeReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
+		// 	var completeReq mcp.CompleteRequest
+		// 	if err := json.Unmarshal(req.Params, &completeReq); err != nil {
+		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		// 	}
 
-		result, err := completionsCap.Complete(ctx, session, &completeReq)
-		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		}
+		// 	result, err := completionsCap.Complete(ctx, session, &completeReq)
+		// 	if err != nil {
+		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		// 	}
 
-		return jsonrpc.NewResultResponse(req.ID, result)
+		// 	return jsonrpc.NewResultResponse(req.ID, result)
 	}
 	// TODO: Actually handle the request
 	return &jsonrpc.Response{
@@ -894,12 +1234,12 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 // It automatically flushes the response after writing.
 func writeSSEEvent(wf writeFlusher, eventType string, msgID string, message any) error {
 	if msgID != "" {
-		if _, err := wf.Write([]byte(fmt.Sprintf("id: %s\n", msgID))); err != nil {
+		if _, err := fmt.Fprintf(wf, "id: %s\n", msgID); err != nil {
 			return fmt.Errorf("failed to write SSE event ID: %w", err)
 		}
 	}
 
-	if _, err := wf.Write([]byte(fmt.Sprintf("event: %s\ndata: ", eventType))); err != nil {
+	if _, err := fmt.Fprintf(wf, "event: %s\ndata: ", eventType); err != nil {
 		return fmt.Errorf("failed to write SSE event header: %w", err)
 	}
 
@@ -917,20 +1257,22 @@ func writeSSEEvent(wf writeFlusher, eventType string, msgID string, message any)
 
 var _ sessions.Session = (*sessionWithWriter)(nil)
 
-func newSessionWithWriter(ctx context.Context, session sessions.Session, wf writeFlusher) sessions.Session {
+func newSessionWithWriter(ctx context.Context, session sessions.Session, wf writeFlusher, fallback func(context.Context, []byte) error) sessions.Session {
 	return &sessionWithWriter{
-		Session: session,
-		reqCtx:  ctx,
-		wf:      wf,
-		mu:      sync.Mutex{},
+		Session:  session,
+		reqCtx:   ctx,
+		wf:       wf,
+		mu:       sync.Mutex{},
+		fallback: fallback,
 	}
 }
 
 type sessionWithWriter struct {
 	sessions.Session
-	reqCtx context.Context
-	wf     writeFlusher
-	mu     sync.Mutex // Guards concurrent writes to wf
+	reqCtx   context.Context
+	wf       writeFlusher
+	mu       sync.Mutex // Guards concurrent writes to wf
+	fallback func(context.Context, []byte) error
 }
 
 func (s *sessionWithWriter) WriteMessage(ctx context.Context, bytes []byte) error {
@@ -940,8 +1282,11 @@ func (s *sessionWithWriter) WriteMessage(ctx context.Context, bytes []byte) erro
 	// This can happen if the client disconnects while we're trying to write
 	// a message to the response.
 	if s.reqCtx.Err() != nil {
-		// The underlying write flusher should no longer be used so fall back to the original session
-		return s.Session.WriteMessage(ctx, bytes)
+		// The underlying write flusher should no longer be used so fall back to the original writer
+		if s.fallback != nil {
+			return s.fallback(ctx, bytes)
+		}
+		return fmt.Errorf("no fallback available for session WriteMessage")
 	}
 
 	var msg jsonrpc.AnyMessage
@@ -957,9 +1302,66 @@ func (s *sessionWithWriter) WriteMessage(ctx context.Context, bytes []byte) erro
 	if err != nil {
 		// TODO: Log error?
 
-		// We failed to write the message to the HTTP response. We'll fall back to writing to the Session.
-		return s.Session.WriteMessage(ctx, bytes)
+		// We failed to write the message to the HTTP response. We'll fall back to the provided writer.
+		if s.fallback != nil {
+			return s.fallback(ctx, bytes)
+		}
+		return err
 	}
 
 	return nil
+}
+
+// ensureSessionParentContext returns a per-session parent context that preserves
+// the values of parent (using context.WithoutCancel) but is not canceled with it.
+// The returned context is canceled only when teardownSession is called for the
+// session, or when all per-URI forwarders are explicitly unsubscribed and a
+// later teardown occurs. Safe for concurrent use.
+func (h *StreamingHTTPHandler) ensureSessionParentContext(parent context.Context, sessionID string) context.Context {
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	if ctx, ok := h.sessParents[sessionID]; ok && ctx != nil {
+		return ctx
+	}
+	base := context.WithoutCancel(parent)
+	ctx, cancel := context.WithCancel(base)
+	if h.sessParents == nil {
+		h.sessParents = make(map[string]context.Context)
+	}
+	if h.sessCancel == nil {
+		h.sessCancel = make(map[string]context.CancelFunc)
+	}
+	h.sessParents[sessionID] = ctx
+	h.sessCancel[sessionID] = cancel
+	return ctx
+}
+
+// teardownSession cancels the per-session parent context (if any) and cancels
+// all per-URI forwarders. It also removes bookkeeping entries. This does not
+// delete the session from the host; it only tears down local resources.
+func (h *StreamingHTTPHandler) teardownSession(sessionID string) {
+	// Cancel per-session parent first to cascade cancellation to children.
+	h.sessMu.Lock()
+	if h.sessCancel != nil {
+		if cancel, ok := h.sessCancel[sessionID]; ok && cancel != nil {
+			cancel()
+			delete(h.sessCancel, sessionID)
+		}
+	}
+	if h.sessParents != nil {
+		delete(h.sessParents, sessionID)
+	}
+	h.sessMu.Unlock()
+
+	// Also cancel any lingering per-URI forwarders and clear their entries.
+	h.subMu.Lock()
+	if m, ok := h.subCancels[sessionID]; ok {
+		for _, c := range m {
+			if c != nil {
+				c()
+			}
+		}
+		delete(h.subCancels, sessionID)
+	}
+	h.subMu.Unlock()
 }

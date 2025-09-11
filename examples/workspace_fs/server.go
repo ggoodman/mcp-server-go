@@ -1,0 +1,311 @@
+package workspace_fs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+
+	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/sessions"
+)
+
+// New constructs a local MCP server that exposes a configurable slice of the host
+// filesystem as Resources and provides a set of tools for reading and modifying
+// files within that sandbox. Tools return resource references where relevant.
+//
+// Security: access is confined to the provided root directory. All tool paths
+// are validated to remain within the root (symlinks are resolved for reads via
+// FSResources; tool writes also enforce containment).
+func New(root string) mcpserver.ServerCapabilities {
+	const baseURI = "fs://workspace"
+
+	// Resources backed by the OS directory
+	fsCap := mcpserver.NewFSResources(
+		mcpserver.WithOSDir(root),
+		mcpserver.WithBaseURI(baseURI),
+		mcpserver.WithFSPageSize(200),
+		// fsnotify will power listChanged/updated when possible
+	)
+
+	// Helper to convert a relative path to a resource URI (percent-escape segments)
+	relToURI := func(rel string) string {
+		segs := strings.Split(filepath.ToSlash(rel), "/")
+		for i, s := range segs {
+			segs[i] = url.PathEscape(s)
+		}
+		return baseURI + "/" + strings.Join(segs, "/")
+	}
+
+	// Helper to turn a resource URI back into a relative path in the sandbox
+	uriToRel := func(u string) (string, bool) {
+		prefix := strings.TrimRight(baseURI, "/") + "/"
+		if !strings.HasPrefix(u, prefix) {
+			return "", false
+		}
+		p := strings.TrimPrefix(u, prefix)
+		segs := strings.Split(p, "/")
+		for i, s := range segs {
+			dec, err := url.PathUnescape(s)
+			if err != nil {
+				return "", false
+			}
+			segs[i] = dec
+		}
+		rel := path.Clean(strings.Join(segs, "/"))
+		if rel == "." || strings.HasPrefix(rel, "../") {
+			return "", false
+		}
+		return rel, true
+	}
+
+	// Enforce that the absolute path remains inside root
+	ensureInsideRoot := func(abs string) error {
+		real := abs
+		if a, err := filepath.Abs(abs); err == nil {
+			real = a
+		}
+		r, err := filepath.Abs(root)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(r, real)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || strings.HasPrefix(rel, "../") {
+			return errors.New("path escapes sandbox root")
+		}
+		return nil
+	}
+
+	// Helpers to build content blocks
+	resourceLink := func(uri, name, mime string) mcp.ContentBlock {
+		return mcp.ContentBlock{Type: "resource_link", URI: uri, Name: name, MimeType: mime}
+	}
+	embeddedText := func(uri, mime, text string) mcp.ContentBlock {
+		return mcp.ContentBlock{Type: "resource", Resource: &mcp.ResourceContents{URI: uri, MimeType: mime, Text: text}}
+	}
+
+	// Tool: fs.read — read a file by uri or path and return embedded contents
+	type ReadArgs struct {
+		URI  string `json:"uri,omitempty"`
+		Path string `json:"path,omitempty"`
+	}
+	readTool := mcpserver.NewTool("fs.read", func(ctx context.Context, _ sessions.Session, a ReadArgs) (*mcp.CallToolResult, error) {
+		var rel string
+		switch {
+		case a.URI != "":
+			r, ok := uriToRel(a.URI)
+			if !ok {
+				return mcpserver.Errorf("invalid uri: %s", a.URI), nil
+			}
+			rel = r
+		case a.Path != "":
+			rel = path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
+			if rel == "." || strings.HasPrefix(rel, "../") {
+				return mcpserver.Errorf("invalid path: %s", a.Path), nil
+			}
+		default:
+			return mcpserver.Errorf("must provide either uri or path"), nil
+		}
+
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		if err := ensureInsideRoot(abs); err != nil {
+			return mcpserver.Errorf("access denied: %v", err), nil
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return mcpserver.Errorf("not found: %s", rel), nil
+			}
+			return nil, err
+		}
+		uri := relToURI(rel)
+		mime := mimeByExt(abs)
+		return &mcp.CallToolResult{Content: []mcp.ContentBlock{
+			embeddedText(uri, mime, string(data)),
+		}}, nil
+	},
+		mcpserver.WithToolDescription("Read a file by URI or path and return its contents as an embedded resource."),
+	)
+
+	// Tool: fs.write — create/overwrite a file at path with content
+	type WriteArgs struct {
+		Path       string `json:"path"`
+		Content    string `json:"content"`
+		CreateDirs bool   `json:"createDirs,omitempty"`
+		Overwrite  bool   `json:"overwrite,omitempty"`
+	}
+	writeTool := mcpserver.NewTool("fs.write", func(ctx context.Context, _ sessions.Session, a WriteArgs) (*mcp.CallToolResult, error) {
+		if a.Path == "" {
+			return mcpserver.Errorf("path is required"), nil
+		}
+		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
+		if rel == "." || strings.HasPrefix(rel, "../") {
+			return mcpserver.Errorf("invalid path: %s", a.Path), nil
+		}
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		if err := ensureInsideRoot(abs); err != nil {
+			return mcpserver.Errorf("access denied: %v", err), nil
+		}
+		if a.CreateDirs {
+			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+				return nil, err
+			}
+		}
+		if !a.Overwrite {
+			if _, err := os.Stat(abs); err == nil {
+				return mcpserver.Errorf("file exists: %s", rel), nil
+			}
+		}
+		if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
+			return nil, err
+		}
+		uri := relToURI(rel)
+		mime := mimeByExt(abs)
+		return &mcp.CallToolResult{Content: []mcp.ContentBlock{
+			resourceLink(uri, path.Base(rel), mime),
+			embeddedText(uri, mime, a.Content),
+		}}, nil
+	},
+		mcpserver.WithToolDescription("Write text to a file at the given path (relative to the workspace root). Returns a resource link and the embedded contents."),
+	)
+
+	// Tool: fs.append — append content to a file
+	type AppendArgs struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	appendTool := mcpserver.NewTool("fs.append", func(ctx context.Context, _ sessions.Session, a AppendArgs) (*mcp.CallToolResult, error) {
+		if a.Path == "" {
+			return mcpserver.Errorf("path is required"), nil
+		}
+		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
+		if rel == "." || strings.HasPrefix(rel, "../") {
+			return mcpserver.Errorf("invalid path: %s", a.Path), nil
+		}
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		if err := ensureInsideRoot(abs); err != nil {
+			return mcpserver.Errorf("access denied: %v", err), nil
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		if _, err := f.WriteString(a.Content); err != nil {
+			return nil, err
+		}
+		data, _ := os.ReadFile(abs)
+		uri := relToURI(rel)
+		mime := mimeByExt(abs)
+		return &mcp.CallToolResult{Content: []mcp.ContentBlock{
+			resourceLink(uri, path.Base(rel), mime),
+			embeddedText(uri, mime, string(data)),
+		}}, nil
+	},
+		mcpserver.WithToolDescription("Append text to a file. Returns a resource link and the full embedded contents after append."),
+	)
+
+	// Tool: fs.move — move/rename a file
+	type MoveArgs struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	moveTool := mcpserver.NewTool("fs.move", func(ctx context.Context, _ sessions.Session, a MoveArgs) (*mcp.CallToolResult, error) {
+		if a.From == "" || a.To == "" {
+			return mcpserver.Errorf("from and to are required"), nil
+		}
+		fromRel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.From), "/"))
+		toRel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.To), "/"))
+		if fromRel == "." || strings.HasPrefix(fromRel, "../") || toRel == "." || strings.HasPrefix(toRel, "../") {
+			return mcpserver.Errorf("invalid path"), nil
+		}
+		fromAbs := filepath.Join(root, filepath.FromSlash(fromRel))
+		toAbs := filepath.Join(root, filepath.FromSlash(toRel))
+		if err := ensureInsideRoot(fromAbs); err != nil {
+			return mcpserver.Errorf("access denied: %v", err), nil
+		}
+		if err := ensureInsideRoot(toAbs); err != nil {
+			return mcpserver.Errorf("access denied: %v", err), nil
+		}
+		if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(fromAbs, toAbs); err != nil {
+			return nil, err
+		}
+		uri := relToURI(toRel)
+		return &mcp.CallToolResult{Content: []mcp.ContentBlock{resourceLink(uri, path.Base(toRel), mimeByExt(toAbs))}}, nil
+	},
+		mcpserver.WithToolDescription("Move or rename a file within the workspace."),
+	)
+
+	// Tool: fs.delete — delete a file
+	type DeleteArgs struct {
+		Path string `json:"path"`
+	}
+	deleteTool := mcpserver.NewTool("fs.delete", func(ctx context.Context, _ sessions.Session, a DeleteArgs) (*mcp.CallToolResult, error) {
+		if a.Path == "" {
+			return mcpserver.Errorf("path is required"), nil
+		}
+		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
+		if rel == "." || strings.HasPrefix(rel, "../") {
+			return mcpserver.Errorf("invalid path: %s", a.Path), nil
+		}
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		if err := ensureInsideRoot(abs); err != nil {
+			return mcpserver.Errorf("access denied: %v", err), nil
+		}
+		if err := os.Remove(abs); err != nil {
+			return nil, err
+		}
+		return mcpserver.TextResult(fmt.Sprintf("deleted %s", rel)), nil
+	},
+		mcpserver.WithToolDescription("Delete a file within the workspace."),
+	)
+
+	tools := mcpserver.NewStaticTools(readTool, writeTool, appendTool, moveTool, deleteTool)
+
+	return mcpserver.NewServer(
+		mcpserver.WithServerInfo(mcp.ImplementationInfo{Name: "examples-workspace-fs", Version: "0.1.0", Title: "Workspace FS"}),
+		mcpserver.WithResourcesCapability(fsCap),
+		mcpserver.WithToolsOptions(mcpserver.WithStaticToolsContainer(tools)),
+	)
+}
+
+// mimeByExt returns a best-effort MIME type based on file extension.
+func mimeByExt(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".txt":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".json":
+		return "application/json"
+	case ".yaml", ".yml":
+		return "application/yaml"
+	case ".go":
+		return "text/x-go"
+	default:
+		if ext != "" {
+			// As a lightweight default, prefer octet-stream if unknown
+			return "application/octet-stream"
+		}
+		return "application/octet-stream"
+	}
+}

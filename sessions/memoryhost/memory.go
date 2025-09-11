@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 // Host is an in-memory implementation of sessions.SessionHost.
@@ -187,14 +187,22 @@ func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
 	for sub := range sd.subscribers {
 		subs = append(subs, sub)
 	}
-	// stop all event subscribers
+	// Collect all event subscribers under lock
+	var evSubs []*eventSub
 	for _, set := range sd.eventSubs {
 		for sub := range set {
-			sub.stop()
+			evSubs = append(evSubs, sub)
 		}
 	}
+	// Clear event subscriber map so subsequent stops don't contend on delete
 	sd.eventSubs = make(map[string]map[*eventSub]struct{})
 	sd.mu.Unlock()
+
+	// Stop event subscribers outside the lock to avoid self-deadlock in eventSub.stop()
+	for _, es := range evSubs {
+		es.stop()
+	}
+	// Stop session message subscribers outside the lock as well
 	for _, sub := range subs {
 		sub.stop()
 	}

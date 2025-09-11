@@ -1,42 +1,20 @@
-package sessions
+package sessioncore
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-streaming-http-go/mcp"
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/google/uuid"
 )
-
-// SessionOption is a functional option for configuring a session created
-// by the SessionManager. These options can be used to enable or disable
-// specific capabilities for the session.
-type SessionOption func(*session)
-
-func WithSamplingCapability() SessionOption {
-	return func(s *session) {
-		s.sampling = &samplingCapabilityImpl{sess: s}
-	}
-}
-
-func WithRootsCapability(supportsListChanged bool) SessionOption {
-	return func(s *session) {
-		s.roots = &rootsCapabilityImpl{sess: s, supportsListChanged: supportsListChanged}
-	}
-}
-
-func WithElicitationCapability() SessionOption {
-	return func(s *session) {
-		s.elicitation = &elicitationCapabilityImpl{sess: s}
-	}
-}
 
 // Private concrete implementations for capabilities
 
 type samplingCapabilityImpl struct {
-	sess *session
+	sess *SessionHandle
 }
 
 func (s *samplingCapabilityImpl) CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
@@ -51,7 +29,7 @@ func (s *samplingCapabilityImpl) CreateMessage(ctx context.Context, req *mcp.Cre
 }
 
 type rootsCapabilityImpl struct {
-	sess                *session
+	sess                *SessionHandle
 	supportsListChanged bool
 }
 
@@ -63,7 +41,7 @@ func (r *rootsCapabilityImpl) ListRoots(ctx context.Context) (*mcp.ListRootsResu
 	return &out, nil
 }
 
-func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Context, listener RootsListChangedListener) (supported bool, err error) {
+func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Context, listener sessions.RootsListChangedListener) (supported bool, err error) {
 	if !r.supportsListChanged {
 		return false, nil
 	}
@@ -78,7 +56,7 @@ func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Conte
 }
 
 type elicitationCapabilityImpl struct {
-	sess *session
+	sess *SessionHandle
 }
 
 func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
@@ -94,7 +72,7 @@ func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitR
 
 // rpcCallToClient sends a JSON-RPC request to the client via the session's
 // message stream and awaits the corresponding response using the host rendezvous.
-func rpcCallToClient[T any](ctx context.Context, sess *session, method mcp.Method, params any, out *T) error {
+func rpcCallToClient[T any](ctx context.Context, sess *SessionHandle, method mcp.Method, params any, out *T) error {
 	if sess == nil || sess.backend == nil {
 		return fmt.Errorf("session backend unavailable")
 	}

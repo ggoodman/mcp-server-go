@@ -1,4 +1,4 @@
-package sessions
+package sessioncore
 
 import (
 	"crypto/ed25519"

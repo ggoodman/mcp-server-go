@@ -3,8 +3,8 @@ package memoryhost
 import (
 	"testing"
 
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions/sessionhosttest"
+	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/sessionhosttest"
 )
 
 func TestMemorySessionHost(t *testing.T) {

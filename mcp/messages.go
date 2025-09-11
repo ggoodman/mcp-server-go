@@ -53,11 +53,11 @@ const (
 
 // Base types for pagination and metadata
 type PaginatedRequest struct {
-	Cursor *string `json:"cursor,omitempty"`
+	Cursor string `json:"cursor,omitzero"`
 }
 
 type PaginatedResult struct {
-	NextCursor *string `json:"nextCursor,omitempty"`
+	NextCursor string `json:"nextCursor,omitzero"`
 }
 
 type BaseMetadata struct {
@@ -68,14 +68,14 @@ type BaseMetadata struct {
 type ProgressToken any // string | number
 
 type CancelledNotification struct {
-	RequestID string  `json:"requestId"`
-	Reason    *string `json:"reason,omitempty"`
+	RequestID string `json:"requestId"`
+	Reason    string `json:"reason,omitzero"`
 }
 
 type ProgressNotificationParams struct {
 	ProgressToken ProgressToken `json:"progressToken"`
 	Progress      float64       `json:"progress"`
-	Total         *float64      `json:"total,omitempty"`
+	Total         float64       `json:"total,omitzero"`
 }
 
 // Ping
@@ -92,7 +92,7 @@ type InitializeResult struct {
 	ProtocolVersion string             `json:"protocolVersion"`
 	Capabilities    ServerCapabilities `json:"capabilities"`
 	ServerInfo      ImplementationInfo `json:"serverInfo"`
-	Instructions    *string            `json:"instructions,omitempty"`
+	Instructions    string             `json:"instructions,omitzero"`
 	BaseMetadata
 }
 
@@ -123,7 +123,7 @@ type CreateMessageResultReceived struct {
 	Role       Role            `json:"role"`
 	Content    json.RawMessage `json:"content"`
 	Model      string          `json:"model"`
-	StopReason *string         `json:"stopReason,omitempty"`
+	StopReason string          `json:"stopReason,omitzero"`
 	Meta       json.RawMessage `json:"_meta,omitempty"`
 }
 
@@ -139,7 +139,7 @@ type ElicitResultReceived struct {
 
 type CallToolResult struct {
 	Content []ContentBlock `json:"content,omitempty"`
-	IsError *bool          `json:"isError,omitempty"`
+	IsError bool           `json:"isError,omitzero"`
 	BaseMetadata
 }
 
@@ -206,7 +206,7 @@ type GetPromptRequest struct {
 }
 
 type GetPromptResult struct {
-	Description *string         `json:"description,omitempty"`
+	Description string          `json:"description,omitzero"`
 	Messages    []PromptMessage `json:"messages"`
 	BaseMetadata
 }
@@ -221,17 +221,17 @@ type SetLevelRequest struct {
 type LoggingMessageNotification struct {
 	Level  LoggingLevel `json:"level"`
 	Data   any          `json:"data"`
-	Logger *string      `json:"logger,omitempty"`
+	Logger string       `json:"logger,omitzero"`
 }
 
 // Sampling
 type CreateMessageRequest struct {
 	Messages         []SamplingMessage `json:"messages"`
 	ModelPreferences *ModelPreferences `json:"modelPreferences,omitempty"`
-	SystemPrompt     *string           `json:"systemPrompt,omitempty"`
-	IncludeContext   *string           `json:"includeContext,omitempty"`
-	Temperature      *float64          `json:"temperature,omitempty"`
-	MaxTokens        *int              `json:"maxTokens,omitempty"`
+	SystemPrompt     string            `json:"systemPrompt,omitzero"`
+	IncludeContext   string            `json:"includeContext,omitzero"`
+	Temperature      float64           `json:"temperature,omitzero"`
+	MaxTokens        int               `json:"maxTokens,omitzero"`
 	StopSequences    []string          `json:"stopSequences,omitempty"`
 	Metadata         map[string]any    `json:"metadata,omitempty"`
 }
@@ -240,7 +240,7 @@ type CreateMessageResult struct {
 	Role       Role           `json:"role"`
 	Content    []ContentBlock `json:"content"`
 	Model      string         `json:"model"`
-	StopReason *string        `json:"stopReason,omitempty"`
+	StopReason string         `json:"stopReason,omitzero"`
 	BaseMetadata
 }
 

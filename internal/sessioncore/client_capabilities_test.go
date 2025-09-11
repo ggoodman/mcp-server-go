@@ -1,4 +1,4 @@
-package sessions_test
+package sessioncore_test
 
 import (
 	"context"
@@ -8,9 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-streaming-http-go/mcp"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
+	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 // simpleHost is a minimal in-test sessions.SessionHost used to validate
@@ -81,7 +82,7 @@ func (a *shAwaiter) Recv(ctx context.Context) ([]byte, error) {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			default:
-				return nil, sessions.ErrAwaitCanceled
+				return nil, sessioncore.ErrAwaitCanceled
 			}
 		}
 		return b, nil
@@ -95,10 +96,10 @@ func (a *shAwaiter) Cancel(ctx context.Context) error {
 	return nil
 }
 
-func (h *simpleHost) BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (sessions.Awaiter, error) {
+func (h *simpleHost) BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (sessioncore.Awaiter, error) {
 	key := sessionID + "|" + correlationID
 	if _, ok := h.awaitCh[key]; ok {
-		return nil, sessions.ErrAwaitExists
+		return nil, sessioncore.ErrAwaitExists
 	}
 	ch := make(chan []byte, 1)
 	h.awaitCh[key] = ch
@@ -186,18 +187,18 @@ func (h *simpleHost) SubscribeEvents(ctx context.Context, sessionID, topic strin
 // for the same session and both should be invoked when a client emits the notification.
 func TestRoots_ListChanged_FanoutAcrossListeners(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
+	mgr := sessioncore.NewManager(host)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	// Create a session with roots capability
-	sess, err := mgr.CreateSession(ctx, "user-x", sessions.WithRootsCapability(true))
+	sess, err := mgr.CreateSession(ctx, "user-x", sessioncore.WithRootsCapability(true))
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
-	rootsCap, ok := sess.GetRootsCapability()
+	rootsCap, ok := sess.Session().GetRootsCapability()
 	if !ok {
 		t.Fatalf("roots cap missing")
 	}
@@ -245,7 +246,7 @@ func TestRoots_ListChanged_FanoutAcrossListeners(t *testing.T) {
 // Test rpcCallToClient happy path: request is observed on the session stream and fulfilled via rendezvous.
 func TestRPCCallToClient_Success(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
+	mgr := sessioncore.NewManager(host)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -257,7 +258,7 @@ func TestRPCCallToClient_Success(t *testing.T) {
 	}()
 
 	// Create a session with sampling capability
-	sess, err := mgr.CreateSession(ctx, "u-1", sessions.WithSamplingCapability())
+	sess, err := mgr.CreateSession(ctx, "u-1", sessioncore.WithSamplingCapability())
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -280,7 +281,7 @@ func TestRPCCallToClient_Success(t *testing.T) {
 	}()
 
 	// Issue the client RPC
-	cap, ok := sess.GetSamplingCapability()
+	cap, ok := sess.Session().GetSamplingCapability()
 	if !ok {
 		t.Fatalf("sampling capability not available")
 	}
@@ -296,8 +297,8 @@ func TestRPCCallToClient_Success(t *testing.T) {
 // Test timeout: no subscriber fulfills; await should return ctx error.
 func TestRPCCallToClient_Timeout(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
-	sess, err := mgr.CreateSession(context.Background(), "u-2", sessions.WithSamplingCapability())
+	mgr := sessioncore.NewManager(host)
+	sess, err := mgr.CreateSession(context.Background(), "u-2", sessioncore.WithSamplingCapability())
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -305,7 +306,7 @@ func TestRPCCallToClient_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	cap, ok := sess.GetSamplingCapability()
+	cap, ok := sess.Session().GetSamplingCapability()
 	if !ok {
 		t.Fatalf("sampling capability not available")
 	}
@@ -321,8 +322,8 @@ func TestRPCCallToClient_Timeout(t *testing.T) {
 // Test JSON-RPC error response mapping to Go error.
 func TestRPCCallToClient_ErrorResponse(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
-	sess, err := mgr.CreateSession(context.Background(), "u-3", sessions.WithSamplingCapability())
+	mgr := sessioncore.NewManager(host)
+	sess, err := mgr.CreateSession(context.Background(), "u-3", sessioncore.WithSamplingCapability())
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestRPCCallToClient_ErrorResponse(t *testing.T) {
 		})
 	}()
 
-	cap, ok := sess.GetSamplingCapability()
+	cap, ok := sess.Session().GetSamplingCapability()
 	if !ok {
 		t.Fatalf("sampling capability not available")
 	}
@@ -356,8 +357,8 @@ func TestRPCCallToClient_ErrorResponse(t *testing.T) {
 // Roots capability: success path
 func TestRoots_List_Success(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
-	sess, err := mgr.CreateSession(context.Background(), "u-4", sessions.WithRootsCapability(false))
+	mgr := sessioncore.NewManager(host)
+	sess, err := mgr.CreateSession(context.Background(), "u-4", sessioncore.WithRootsCapability(false))
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -385,7 +386,7 @@ func TestRoots_List_Success(t *testing.T) {
 		})
 	}()
 
-	cap, ok := sess.GetRootsCapability()
+	cap, ok := sess.Session().GetRootsCapability()
 	if !ok {
 		t.Fatalf("roots capability not available")
 	}
@@ -401,8 +402,8 @@ func TestRoots_List_Success(t *testing.T) {
 // Roots capability: error response
 func TestRoots_List_ErrorResponse(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
-	sess, err := mgr.CreateSession(context.Background(), "u-5", sessions.WithRootsCapability(false))
+	mgr := sessioncore.NewManager(host)
+	sess, err := mgr.CreateSession(context.Background(), "u-5", sessioncore.WithRootsCapability(false))
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -426,7 +427,7 @@ func TestRoots_List_ErrorResponse(t *testing.T) {
 		})
 	}()
 
-	cap, ok := sess.GetRootsCapability()
+	cap, ok := sess.Session().GetRootsCapability()
 	if !ok {
 		t.Fatalf("roots capability not available")
 	}
@@ -439,8 +440,8 @@ func TestRoots_List_ErrorResponse(t *testing.T) {
 // Elicitation capability: success path
 func TestElicit_Success(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
-	sess, err := mgr.CreateSession(context.Background(), "u-6", sessions.WithElicitationCapability())
+	mgr := sessioncore.NewManager(host)
+	sess, err := mgr.CreateSession(context.Background(), "u-6", sessioncore.WithElicitationCapability())
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -468,7 +469,7 @@ func TestElicit_Success(t *testing.T) {
 		})
 	}()
 
-	cap, ok := sess.GetElicitationCapability()
+	cap, ok := sess.Session().GetElicitationCapability()
 	if !ok {
 		t.Fatalf("elicitation capability not available")
 	}
@@ -484,8 +485,8 @@ func TestElicit_Success(t *testing.T) {
 // Elicitation capability: error response
 func TestElicit_ErrorResponse(t *testing.T) {
 	host := newSimpleHost()
-	mgr := sessions.NewManager(host)
-	sess, err := mgr.CreateSession(context.Background(), "u-7", sessions.WithElicitationCapability())
+	mgr := sessioncore.NewManager(host)
+	sess, err := mgr.CreateSession(context.Background(), "u-7", sessioncore.WithElicitationCapability())
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -509,7 +510,7 @@ func TestElicit_ErrorResponse(t *testing.T) {
 		})
 	}()
 
-	cap, ok := sess.GetElicitationCapability()
+	cap, ok := sess.Session().GetElicitationCapability()
 	if !ok {
 		t.Fatalf("elicitation capability not available")
 	}

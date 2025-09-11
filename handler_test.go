@@ -1,90 +1,156 @@
 package streaminghttp_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
+	"time"
 
-	streaminghttp "github.com/ggoodman/mcp-streaming-http-go"
-	"github.com/ggoodman/mcp-streaming-http-go/auth"
-	"github.com/ggoodman/mcp-streaming-http-go/hooks"
-	"github.com/ggoodman/mcp-streaming-http-go/hooks/hookstest"
-	"github.com/ggoodman/mcp-streaming-http-go/mcp"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions"
-	"github.com/ggoodman/mcp-streaming-http-go/sessions/memoryhost"
-	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
-	"golang.org/x/sync/errgroup"
+	streaminghttp "github.com/ggoodman/mcp-server-go"
+	"github.com/ggoodman/mcp-server-go/auth"
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
 )
 
 func TestSingleInstance(t *testing.T) {
-
-	t.Run("Basic list tools", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		srv := mustServer(t,
-			withHooks(hookstest.NewMockHooks(hookstest.WithEmptyToolsCapability())),
+	t.Run("Initialize returns session and capabilities", func(t *testing.T) {
+		// Explicit minimal server with empty static tools
+		server := mcpserver.NewServer(
+			mcpserver.WithToolsOptions(
+				mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+			),
 		)
+		srv := mustServer(t, server)
 		defer srv.Close()
 
-		cs, err := mustClient(t, srv, withClientAuthToken("test-token"))
-		if err != nil {
-			t.Fatalf("Failed to create client: %v", err)
-		}
-		defer cs.Close()
-
-		// Verify we can list tools (should be empty due to empty tools capability)
-		res, err := cs.ListTools(ctx, &sdk.ListToolsParams{})
-		if err != nil {
-			t.Fatalf("CallTool failed: %v", err)
-		}
-
-		if want, got := 0, len(res.Tools); want != got {
-			t.Errorf("Unexpected number of tools: want %d, got %d", want, got)
-		}
-
-		// Attempt to call a tool that doesn't exist and make sure
-		// the resulting error is a NotFoundError
-		_, err = cs.CallTool(ctx, &sdk.CallToolParams{
-			Name: "non-existent-tool",
-		})
-		if err == nil {
-			t.Fatalf("Expected error calling non-existent tool, got nil")
+		// Build initialize request
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params: func() json.RawMessage {
+				p, _ := json.Marshal(mcp.InitializeRequest{
+					ProtocolVersion: "2025-06-18",
+					Capabilities:    mcp.ClientCapabilities{},
+					ClientInfo: mcp.ImplementationInfo{
+						Name:    "test-client",
+						Version: "1.0.0",
+						Title:   "Test Client",
+					},
+				})
+				return p
+			}(),
+			ID: jsonrpc.NewRequestID("1"),
 		}
 
-		if want, got := `calling "tools/call": tool not found: non-existent-tool`, err.Error(); want != got {
-			t.Errorf("Unexpected error message: want %q, got %q", want, got)
+		resp, evt := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		defer resp.Body.Close()
+
+		if want, got := http.StatusOK, resp.StatusCode; want != got {
+			t.Fatalf("unexpected status: want %d got %d", want, got)
+		}
+
+		sessID := resp.Header.Get("mcp-session-id")
+		if sessID == "" {
+			t.Fatalf("missing mcp-session-id header")
+		}
+
+		// Parse JSON-RPC response result
+		var res jsonrpc.Response
+		mustUnmarshalJSON(t, evt.data, &res)
+		if res.Error != nil {
+			t.Fatalf("initialize error: %+v", res.Error)
+		}
+		var initRes mcp.InitializeResult
+		mustUnmarshalJSON(t, res.Result, &initRes)
+
+		// Tools should be advertised (empty static container exposes listChanged)
+		if initRes.Capabilities.Tools == nil || !initRes.Capabilities.Tools.ListChanged {
+			t.Fatalf("expected tools listChanged capability to be true, got %#v", initRes.Capabilities.Tools)
+		}
+	})
+
+	t.Run("Tools list over POST is empty", func(t *testing.T) {
+		server := mcpserver.NewServer(
+			mcpserver.WithToolsOptions(
+				mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+			),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize to get a session
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID(1),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		sessID := resp.Header.Get("mcp-session-id")
+		resp.Body.Close()
+
+		// List tools
+		listReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ToolsListMethod),
+			Params:         mustJSON(mcp.ListToolsRequest{}),
+			ID:             jsonrpc.NewRequestID(2),
+		}
+		resp2, evt := mustPostMCP(t, srv, "Bearer test-token", sessID, listReq)
+		defer resp2.Body.Close()
+
+		if want, got := http.StatusOK, resp2.StatusCode; want != got {
+			t.Fatalf("unexpected status: want %d got %d", want, got)
+		}
+		var rpcRes jsonrpc.Response
+		mustUnmarshalJSON(t, evt.data, &rpcRes)
+		if rpcRes.Error != nil {
+			t.Fatalf("tools/list error: %+v", rpcRes.Error)
+		}
+		var listRes mcp.ListToolsResult
+		mustUnmarshalJSON(t, rpcRes.Result, &listRes)
+		if want, got := 0, len(listRes.Tools); want != got {
+			t.Fatalf("unexpected tools length: want %d got %d", want, got)
 		}
 	})
 
 	t.Run("Basic auth with invalid token", func(t *testing.T) {
-		auth := &noAuth{
-			wantToken: "want-token",
-		}
-
-		srv := mustServer(t,
-			withHooks(hookstest.NewMockHooks(hookstest.WithEmptyToolsCapability())),
-			withAuth(auth),
+		auth := &noAuth{wantToken: "want-token"}
+		server := mcpserver.NewServer(
+			mcpserver.WithToolsOptions(
+				mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+			),
 		)
+		srv := mustServer(t, server, withAuth(auth))
 		defer srv.Close()
 
-		cs, err := mustClient(t, srv, withClientAuthToken("bad-token"))
-		if err == nil {
-			t.Fatal("Expected error creating client with bad token, got nil")
+		// Attempt initialize with wrong token
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID("x"),
 		}
-		if cs != nil {
-			defer cs.Close()
-			t.Fatal("Expected nil client session on error")
+		resp, _ := doPostMCP(t, srv, "Bearer bad-token", "", initReq)
+		defer resp.Body.Close()
+		if want, got := http.StatusUnauthorized, resp.StatusCode; want != got {
+			t.Fatalf("unexpected status: want %d got %d", want, got)
 		}
-		if !strings.Contains(err.Error(), "401 Unauthorized") {
-			t.Errorf("Unexpected error message: want 401 Unauthorized, got %q", err.Error())
+		// Should include a WWW-Authenticate header per spec
+		if h := resp.Header.Get("www-authenticate"); !strings.HasPrefix(strings.ToLower(h), "bearer ") {
+			t.Fatalf("expected WWW-Authenticate header, got %q", h)
 		}
 	})
 }
@@ -97,6 +163,7 @@ func TestMultiInstance(t *testing.T) {
 			func(r *http.Request, handlerCount int) int {
 				return 5 // Out of bounds
 			},
+			func() mcpserver.ServerCapabilities { return mcpserver.NewServer() },
 			withServerName("invalid-router-test"),
 		)
 		defer srv.Close()
@@ -114,105 +181,77 @@ func TestMultiInstance(t *testing.T) {
 		}
 	})
 
-	t.Run("Tool call request and cancellation routed to different instances", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
+	t.Run("Resources list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
+		// Shared in-memory session host to simulate distributed coordination
+		sharedHost := memoryhost.New()
 
-		blockCh := make(chan struct{})
-		defer close(blockCh)
-
-		toolStartedCh := make(chan struct{}, 1)
-		defer close(toolStartedCh)
-
-		toolCancelledCh := make(chan struct{}, 1)
-		defer close(toolCancelledCh)
-
-		toolStartedFlag := atomic.Bool{}
-
-		didCancel := atomic.Bool{}
-
-		srv := mustMultiInstanceServer(t, 2,
-			func(r *http.Request, handlerCount int) int {
-				if toolStartedFlag.Load() {
-					return 1
-				}
-
-				return 0
-			},
-			withAuth(&noAuth{}),
-			withLogHandler(testLogHandler(t)),
-			withHooks(
-				hookstest.NewMockHooks(
-					hookstest.WithToolsCapability(
-						hookstest.NewMockToolsCapability(
-							hookstest.WithCallToolHandler(func(ctx context.Context, session hooks.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
-								toolStartedFlag.Store(true)
-								toolStartedCh <- struct{}{}
-
-								select {
-								case <-blockCh:
-									t.Fatalf("Tool call should have been cancelled")
-								case <-ctx.Done():
-									didCancel.Store(true)
-									toolCancelledCh <- struct{}{}
-									return nil, ctx.Err()
-								}
-
-								return nil, nil
-							}),
-						),
-					),
+		// Distinct server instances per handler: each gets its own static resources container
+		mcpFactory := func() mcpserver.ServerCapabilities {
+			sr := mcpserver.NewStaticResources(nil, nil, nil)
+			return mcpserver.NewServer(
+				mcpserver.WithResourcesOptions(
+					mcpserver.WithStaticResourceContainer(sr),
 				),
-			),
+			)
+		}
+
+		// Route GET to handler 0 and POST to handler 1
+		router := func(r *http.Request, handlerCount int) int {
+			if r.Method == http.MethodGet {
+				return 0
+			}
+			if r.Method == http.MethodPost {
+				return 1
+			}
+			return 0
+		}
+
+		srv := mustMultiInstanceServer(t, 2, router,
+			mcpFactory,
+			withServerName("multi-list-changed"),
+			withSessionHost(sharedHost),
 		)
 		defer srv.Close()
 
-		cs, err := mustClient(t, srv, withClientAuthToken("test-token"))
-		if err != nil {
-			t.Fatalf("Failed to create client: %v", err)
+		// Step 1: Initialize via POST (instance 1)
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID("init"),
 		}
-		defer cs.Close()
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		sessID := resp.Header.Get("mcp-session-id")
+		resp.Body.Close()
+		if sessID == "" {
+			t.Fatalf("missing session id")
+		}
 
-		g, ctx := errgroup.WithContext(ctx)
+		// Step 2: Start GET stream on instance 0 and read next SSE event asynchronously
+		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
+		defer respGet.Body.Close()
 
-		toolCtx, toolCancel := context.WithCancel(ctx)
-		defer toolCancel()
+		// Step 3: Trigger a resources list change by publishing the internal server event.
+		// This emulates any instance detecting a change and publishing to the session-scoped topic.
+		ctx := t.Context()
+		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.ResourcesListChangedNotificationMethod), nil)
 
-		g.Go(func() error {
-			// The SDK optimistically returns an error after sending a cancellation
-			// notification. This won't give us time to verify the cancellation handler
-			// was invoked, so we ignore the error here and check the cancellation flag instead.
-			cs.CallTool(toolCtx, &sdk.CallToolParams{
-				Name:      "test-tool",
-				Arguments: map[string]any{},
-			})
-
-			if want, got := true, didCancel.Load(); want != got {
-				t.Errorf("Expected tool handler to be cancelled: want %v, got %v", want, got)
+		// Step 4: Wait for notification
+		select {
+		case evt := <-eventsCh:
+			if evt.event != "notification" {
+				t.Fatalf("expected notification event, got %q", evt.event)
 			}
-
-			return nil
-		})
-
-		g.Go(func() error {
-			<-toolStartedCh
-
-			toolCancel()
-
-			<-toolCancelledCh
-
-			return nil
-		})
-
-		if err := g.Wait(); err != nil {
-			t.Fatalf("Tool call goroutines failed: %v", err)
+			var msg jsonrpc.AnyMessage
+			mustUnmarshalJSON(t, evt.data, &msg)
+			if msg.Method != string(mcp.ResourcesListChangedNotificationMethod) {
+				t.Fatalf("unexpected method: want %q got %q", mcp.ResourcesListChangedNotificationMethod, msg.Method)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for list_changed notification")
 		}
-
-		if want, got := true, didCancel.Load(); want != got {
-			t.Errorf("Expected tool handler to be cancelled: want %v, got %v", want, got)
-		}
-
 	})
+
 }
 
 // ============================================================================
@@ -298,7 +337,7 @@ type serverOption func(*serverConfig)
 
 type serverConfig struct {
 	authenticator auth.Authenticator
-	hooks         hooks.Hooks
+	mcp           mcpserver.ServerCapabilities
 	sessionsHost  sessions.SessionHost
 	logHandler    slog.Handler
 	serverName    string
@@ -310,13 +349,6 @@ type serverConfig struct {
 func withAuth(authenticator auth.Authenticator) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.authenticator = authenticator
-	}
-}
-
-// withHooks configures the server to use the provided hooks implementation.
-func withHooks(hooks hooks.Hooks) serverOption {
-	return func(cfg *serverConfig) {
-		cfg.hooks = hooks
 	}
 }
 
@@ -383,13 +415,13 @@ func withJwksURI(uri string) serverOption {
 //		withSessions(customStore),
 //	)
 //	defer srv.Close()
-func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
+func mustServer(t *testing.T, mcp mcpserver.ServerCapabilities, options ...serverOption) *httptest.Server {
 	ctx := context.Background()
 
 	// Apply default configuration
 	cfg := &serverConfig{
 		authenticator: new(noAuth),
-		hooks:         hookstest.NewMockHooks(),
+		mcp:           mcp,
 		sessionsHost:  memoryhost.New(),
 		logHandler:    testLogHandler(t),
 		serverName:    "test-server",
@@ -404,21 +436,25 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 
 	var handler http.Handler
 
+	if cfg.mcp == nil {
+		t.Fatalf("server capabilities are required")
+	}
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handler.ServeHTTP(w, r)
 	}))
 
 	// Create the streaming HTTP handler with the test server URL
-	streamingHandler, err := streaminghttp.NewStreamingHTTPHandlerWithManualOIDC(ctx, streaminghttp.ManualOIDCConfig{
-		ServerURL:     srv.URL,
-		ServerName:    cfg.serverName,
-		Issuer:        cfg.issuer,
-		JwksURI:       cfg.jwksURI,
-		Authenticator: cfg.authenticator,
-		Hooks:         cfg.hooks,
-		SessionHost:   cfg.sessionsHost,
-		LogHandler:    cfg.logHandler,
-	})
+	streamingHandler, err := streaminghttp.New(
+		ctx,
+		srv.URL,
+		cfg.sessionsHost,
+		cfg.mcp,
+		cfg.authenticator,
+		streaminghttp.WithServerName(cfg.serverName),
+		streaminghttp.WithLogger(cfg.logHandler),
+		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: cfg.issuer, JwksURI: cfg.jwksURI}),
+	)
 	if err != nil {
 		srv.Close()
 		t.Fatalf("Failed to create streaming HTTP handler: %v", err)
@@ -450,7 +486,7 @@ type RouterFunc func(r *http.Request, handlerCount int) int
 //		withServerName("multi-test-server"),
 //	)
 //	defer srv.Close()
-func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, options ...serverOption) *httptest.Server {
+func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, mcpFactory func() mcpserver.ServerCapabilities, options ...serverOption) *httptest.Server {
 	if handlerCount <= 0 {
 		t.Fatalf("Handler count must be positive, got %d", handlerCount)
 	}
@@ -477,7 +513,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 		// Apply default configuration
 		cfg := &serverConfig{
 			authenticator: new(noAuth),
-			hooks:         hookstest.NewMockHooks(),
+			mcp:           mcpFactory(),
 			sessionsHost:  memoryhost.New(),
 			logHandler:    testLogHandler(t),
 			serverName:    "multi-test-server",
@@ -490,17 +526,21 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 			opt(cfg)
 		}
 
+		if cfg.mcp == nil {
+			t.Fatalf("server capabilities are required")
+		}
+
 		// Each instance gets the same configuration
-		streamingHandler, err := streaminghttp.NewStreamingHTTPHandlerWithManualOIDC(ctx, streaminghttp.ManualOIDCConfig{
-			ServerURL:     srv.URL,
-			ServerName:    cfg.serverName,
-			Issuer:        cfg.issuer,
-			JwksURI:       cfg.jwksURI,
-			Authenticator: cfg.authenticator,
-			Hooks:         cfg.hooks,
-			SessionHost:   cfg.sessionsHost,
-			LogHandler:    cfg.logHandler,
-		})
+		streamingHandler, err := streaminghttp.New(
+			ctx,
+			srv.URL,
+			cfg.sessionsHost,
+			cfg.mcp,
+			cfg.authenticator,
+			streaminghttp.WithServerName(cfg.serverName),
+			streaminghttp.WithLogger(cfg.logHandler),
+			streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: cfg.issuer, JwksURI: cfg.jwksURI}),
+		)
 		if err != nil {
 			srv.Close()
 			t.Fatalf("Failed to create streaming HTTP handler for instance %d: %v", i, err)
@@ -513,121 +553,146 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 }
 
 // ============================================================================
-// Test Client Utility
+// Minimal HTTP/SSE client helpers (no SDK)
 // ============================================================================
 
-type clientOption func(*clientConfig)
-
-type clientConfig struct {
-	name    string
-	version string
-	title   string
-	rt      http.RoundTripper
+type sseEvent struct {
+	event string
+	id    string
+	data  json.RawMessage
 }
 
-// withClientName configures the client name (defaults to "test-client").
-func withClientName(name string) clientOption {
-	return func(cfg *clientConfig) {
-		cfg.name = name
+// doPostMCP performs the HTTP POST with required headers and returns the raw response.
+func doPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, error) {
+	t.Helper()
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
 	}
-}
-
-// withClientVersion configures the client version (defaults to "1.0.0").
-func withClientVersion(version string) clientOption {
-	return func(cfg *clientConfig) {
-		cfg.version = version
+	httpReq, err := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
 	}
-}
-
-// withClientTitle configures the client title (defaults to "Test Client").
-func withClientTitle(title string) clientOption {
-	return func(cfg *clientConfig) {
-		cfg.title = title
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Content-Type", "application/json")
+	if authHeader != "" {
+		httpReq.Header.Set("Authorization", authHeader)
 	}
+	if sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", sessionID)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
-func withClientAuthToken(token string) clientOption {
-	return func(cfg *clientConfig) {
-		rt := cfg.rt
+// mustPostMCP posts and parses a single SSE event from the response body.
+func mustPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, sseEvent) {
+	t.Helper()
+	resp, err := doPostMCP(t, srv, authHeader, sessionID, req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	// Only 200 OK responses are expected to carry an SSE event.
+	if resp.StatusCode != http.StatusOK {
+		return resp, sseEvent{}
+	}
+	evt, err := readOneSSE(resp.Body)
+	if err != nil {
+		// ensure body is closed by caller even on error
+		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("sse read error: %v", err)})}
+	}
+	return resp, evt
+}
 
-		cfg.rt = &authTransport{
-			base:      rt,
-			authToken: token,
+func readOneSSE(r io.Reader) (sseEvent, error) {
+	br := bufio.NewReader(r)
+	var (
+		event   sseEvent
+		dataBuf bytes.Buffer
+	)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				return sseEvent{}, io.ErrUnexpectedEOF
+			}
+			return sseEvent{}, err
 		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" { // end of event
+			// finalize
+			if dataBuf.Len() > 0 {
+				event.data = append([]byte(nil), dataBuf.Bytes()...)
+			}
+			return event, nil
+		}
+		if strings.HasPrefix(line, "event: ") {
+			event.event = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+		if strings.HasPrefix(line, "id: ") {
+			event.id = strings.TrimPrefix(line, "id: ")
+			continue
+		}
+		if strings.HasPrefix(line, "data: ") {
+			// handler writes single-line JSON via json.Encoder
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(strings.TrimPrefix(line, "data: "))
+			continue
+		}
+		// ignore other fields
 	}
 }
 
-type authTransport struct {
-	base      http.RoundTripper
-	authToken string
+func mustUnmarshalJSON[T any](t *testing.T, data []byte, v *T) {
+	t.Helper()
+	if err := json.Unmarshal(data, v); err != nil {
+		t.Fatalf("unmarshal json: %v\ninput: %s", err, string(data))
+	}
 }
 
-func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.authToken != "" {
-		req = req.Clone(req.Context())
-		req.Header.Set("Authorization", "Bearer "+t.authToken)
-	}
-
-	return t.base.RoundTrip(req)
+func mustJSON(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
 
-// mustClient creates a test MCP client connected to the given server with intelligent defaults.
-// It panics on any error, making it suitable for use in tests where failures
-// should immediately fail the test.
-//
-// The returned client session is already initialized, validated, and ready to use.
-// The initialization process is verified to ensure the server responds correctly.
-// The caller is responsible for calling cs.Close() to clean up resources.
-//
-// Intelligent defaults are provided:
-//   - Name: "test-client"
-//   - Version: "1.0.0"
-//   - Title: "Test Client"
-//
-// Example usage:
-//
-//	// Use all defaults
-//	srv := mustServer(t)
-//	defer srv.Close()
-//	cs := mustClient(t, srv)
-//	defer cs.Close()
-//
-//	// Override specific client info
-//	cs := mustClient(t, srv,
-//		withClientName("custom-client"),
-//		withClientVersion("2.0.0"),
-//	)
-//	defer cs.Close()
-func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) (*sdk.ClientSession, error) {
-	ctx := t.Context()
-
-	// Apply default configuration
-	cfg := &clientConfig{
-		name:    "test-client",
-		version: "1.0.0",
-		title:   "Test Client",
-		rt:      http.DefaultTransport,
+// startGetStreamOneEvent starts a GET /mcp stream and returns the response plus a channel that yields one SSE event.
+func startGetStreamOneEvent(t *testing.T, srv *httptest.Server, authHeader, sessionID string) (*http.Response, <-chan sseEvent) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("new get req: %v", err)
 	}
-
-	// Apply provided options
-	for _, opt := range options {
-		opt(cfg)
+	req.Header.Set("Accept", "text/event-stream")
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
-
-	client := sdk.NewClient(&sdk.Implementation{
-		Name:    cfg.name,
-		Version: cfg.version,
-		Title:   cfg.title,
-	}, &sdk.ClientOptions{})
-
-	transport := &sdk.StreamableClientTransport{
-		Endpoint: srv.URL + "/",
-		HTTPClient: &http.Client{
-			Transport: cfg.rt,
-		},
+	req.Header.Set("mcp-session-id", sessionID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do get: %v", err)
 	}
-
-	return client.Connect(ctx, transport, &sdk.ClientSessionOptions{})
+	if resp.StatusCode != http.StatusOK {
+		// The stream writes headers implicitly on first write, but if nothing is written yet
+		// http may report StatusOK only after first write. We'll still proceed to read.
+	}
+	ch := make(chan sseEvent, 1)
+	go func() {
+		defer close(ch)
+		evt, err := readOneSSE(resp.Body)
+		if err != nil {
+			// signal error by sending an empty event with data set to error json
+			ch <- sseEvent{event: "", data: mustJSON(map[string]any{"error": err.Error()})}
+			return
+		}
+		ch <- evt
+	}()
+	return resp, ch
 }
 
 type noAuth struct {
@@ -645,3 +710,12 @@ type fakeUserInfo struct{}
 
 func (u *fakeUserInfo) UserID() string       { return "fake-user" }
 func (u *fakeUserInfo) Claims(ref any) error { return nil }
+
+// Keep optional serverOption helpers considered used to satisfy linters when not
+// consumed by specific tests. These are part of the test harness API surface.
+var (
+	_ = withSessionHost
+	_ = withLogHandler
+	_ = withIssuer
+	_ = withJwksURI
+)
