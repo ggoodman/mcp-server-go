@@ -23,31 +23,6 @@ import (
 	"github.com/ggoodman/mcp-streaming-http-go/sessions"
 )
 
-// sessionMetadata implements the sessions.SessionMetadata interface
-// to bridge between MCP client capabilities and session requirements
-type sessionMetadata struct {
-	clientInfo            sessions.ClientInfo
-	samplingCapability    sessions.SamplingCapability
-	rootsCapability       sessions.RootsCapability
-	elicitationCapability sessions.ElicitationCapability
-}
-
-func (m *sessionMetadata) ClientInfo() sessions.ClientInfo {
-	return m.clientInfo
-}
-
-func (m *sessionMetadata) GetSamplingCapability() sessions.SamplingCapability {
-	return m.samplingCapability
-}
-
-func (m *sessionMetadata) GetRootsCapability() sessions.RootsCapability {
-	return m.rootsCapability
-}
-
-func (m *sessionMetadata) GetElicitationCapability() sessions.ElicitationCapability {
-	return m.elicitationCapability
-}
-
 var (
 	_ http.Handler = (*StreamingHTTPHandler)(nil)
 )
@@ -141,9 +116,10 @@ type StreamingHTTPHandler struct {
 	prmDocumentURL *url.URL
 	serverURL      *url.URL
 
-	auth     auth.Authenticator
-	hooks    hooks.Hooks
-	sessions sessions.SessionManager
+	auth        auth.Authenticator
+	hooks       hooks.Hooks
+	sessions    sessions.SessionManager
+	sessionHost sessions.SessionHost
 }
 
 type writeFlusher interface {
@@ -259,6 +235,7 @@ func NewStreamingHTTPHandlerWithManualOIDC(ctx context.Context, config ManualOID
 		auth:         config.Authenticator,
 		hooks:        config.Hooks,
 		sessions:     sessions,
+		sessionHost:  config.SessionHost,
 		prmDocument: wellknown.ProtectedResourceMetadata{
 			Resource:                              mcpURL.String(),
 			AuthorizationServers:                  []string{config.Issuer},
@@ -379,13 +356,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 				return
 			}
 
-			// TODO: Dispatch the notification to the 'right place'.
+			// The notification was handled successfully.
 			w.WriteHeader(http.StatusAccepted)
-
-			switch req.Method {
-			case string(mcp.InitializedNotificationMethod):
-			}
-
 			return
 		}
 
@@ -396,6 +368,10 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
+		// We want to wrap the session with a little wrapper type so that we can
+		// try to write that session's messages back to the client as part of
+		// handling this request. The wrapper will fall back to writing to
+		// the session backend if writing to the client fails.
 		session = newSessionWithWriter(ctx, session, wf)
 
 		// This is a request with an ID, so we need to handle it as a request.
@@ -854,7 +830,21 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, res *jsonrpc.Response) error {
 	h.log.Debug("handleResponse", slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
-	// TODO: Actually handle the response
+	if res == nil || res.ID == nil || res.ID.IsNil() {
+		return fmt.Errorf("response missing id")
+	}
+
+	// Re-encode to bytes for delivery to the awaiting goroutine on any instance.
+	payload, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("marshal response: %w", err)
+	}
+
+	// Deliver to any registered waiter; drop if no waiter is present.
+	_, err = h.sessionHost.Fulfill(ctx, session.SessionID(), res.ID.String(), payload)
+	if err != nil {
+		return fmt.Errorf("fulfill rendezvous: %w", err)
+	}
 	return nil
 }
 

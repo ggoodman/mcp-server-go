@@ -30,6 +30,7 @@ type sessionData struct {
 	mu          sync.RWMutex
 	messages    []message
 	subscribers map[*subscription]struct{}
+	awaits      map[string]*awaitState // correlationID -> await state
 }
 
 type message struct {
@@ -185,6 +186,11 @@ func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
 	for sub := range sd.subscribers {
 		subs = append(subs, sub)
 	}
+	// cancel all awaits
+	for _, a := range sd.awaits {
+		a.cancelLocked()
+	}
+	sd.awaits = make(map[string]*awaitState)
 	sd.mu.Unlock()
 	for _, sub := range subs {
 		sub.stop()
@@ -238,7 +244,7 @@ func (h *Host) ensureSession(sessionID string) *sessionData {
 	defer h.mu.Unlock()
 	sd, ok := h.sessions[sessionID]
 	if !ok {
-		sd = &sessionData{messages: make([]message, 0), subscribers: make(map[*subscription]struct{})}
+		sd = &sessionData{messages: make([]message, 0), subscribers: make(map[*subscription]struct{}), awaits: make(map[string]*awaitState)}
 		h.sessions[sessionID] = sd
 	}
 	return sd
@@ -262,3 +268,116 @@ func scopeKey(s sessions.RevocationScope) string {
 
 // Ensure interface compliance
 var _ sessions.SessionHost = (*Host)(nil)
+
+// --- Await/Fulfill implementation ---
+
+type awaitState struct {
+	ch   chan []byte
+	done bool
+}
+
+func (a *awaitState) cancelLocked() {
+	if !a.done {
+		a.done = true
+		close(a.ch)
+	}
+}
+
+type awaiter struct {
+	h             *Host
+	sessionID     string
+	correlationID string
+}
+
+func (a *awaiter) Recv(ctx context.Context) ([]byte, error) {
+	sd := a.h.ensureSession(a.sessionID)
+	sd.mu.RLock()
+	st := sd.awaits[a.correlationID]
+	ch := st.ch
+	sd.mu.RUnlock()
+	select {
+	case <-ctx.Done():
+		// best-effort cancel
+		_ = a.Cancel(context.Background())
+		return nil, ctx.Err()
+	case data, ok := <-ch:
+		if !ok {
+			return nil, sessions.ErrAwaitCanceled
+		}
+		return data, nil
+	}
+}
+
+func (a *awaiter) Cancel(ctx context.Context) error {
+	sd := a.h.ensureSession(a.sessionID)
+	sd.mu.Lock()
+	if st, ok := sd.awaits[a.correlationID]; ok {
+		st.cancelLocked()
+		delete(sd.awaits, a.correlationID)
+	}
+	sd.mu.Unlock()
+	return nil
+}
+
+func (h *Host) BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (sessions.Awaiter, error) {
+	sd := h.ensureSession(sessionID)
+	sd.mu.Lock()
+	if _, exists := sd.awaits[correlationID]; exists {
+		sd.mu.Unlock()
+		return nil, sessions.ErrAwaitExists
+	}
+	st := &awaitState{ch: make(chan []byte, 1)}
+	sd.awaits[correlationID] = st
+	sd.mu.Unlock()
+
+	// TTL cleanup
+	if ttl > 0 {
+		timer := time.NewTimer(ttl)
+		go func() {
+			defer func() { _ = recover() }()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				sd.mu.Lock()
+				if cur, ok := sd.awaits[correlationID]; ok && cur == st {
+					st.cancelLocked()
+					delete(sd.awaits, correlationID)
+				}
+				sd.mu.Unlock()
+			}
+		}()
+	}
+
+	return &awaiter{h: h, sessionID: sessionID, correlationID: correlationID}, nil
+}
+
+func (h *Host) Fulfill(ctx context.Context, sessionID, correlationID string, data []byte) (bool, error) {
+	sd := h.ensureSession(sessionID)
+	sd.mu.Lock()
+	st, ok := sd.awaits[correlationID]
+	if !ok {
+		sd.mu.Unlock()
+		return false, nil
+	}
+	if st.done {
+		delete(sd.awaits, correlationID)
+		sd.mu.Unlock()
+		return false, nil
+	}
+	st.done = true
+	delete(sd.awaits, correlationID)
+	ch := st.ch
+	sd.mu.Unlock()
+
+	// Non-blocking send; channel has capacity 1
+	select {
+	case ch <- append([]byte(nil), data...):
+	default:
+		// If the channel is unexpectedly full, close it to wake receiver.
+		close(ch)
+		return false, nil
+	}
+	close(ch)
+	return true, nil
+}

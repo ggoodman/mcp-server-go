@@ -16,6 +16,7 @@ type testHost struct {
 	epochByUser map[string]int64
 	revoked     map[string]time.Time
 	cleaned     []string
+	awaits      map[string]chan []byte // key: sessionID+"|"+corr
 }
 
 func newTestHost() *testHost {
@@ -23,6 +24,7 @@ func newTestHost() *testHost {
 		epochByUser: make(map[string]int64),
 		revoked:     make(map[string]time.Time),
 		cleaned:     []string{},
+		awaits:      make(map[string]chan []byte),
 	}
 }
 
@@ -73,6 +75,73 @@ func (h *testHost) GetEpoch(ctx context.Context, scope RevocationScope) (int64, 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.epochByUser[scope.UserID], nil
+}
+
+func (h *testHost) BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (Awaiter, error) {
+	key := sessionID + "|" + correlationID
+	h.mu.Lock()
+	if _, exists := h.awaits[key]; exists {
+		h.mu.Unlock()
+		return nil, ErrAwaitExists
+	}
+	ch := make(chan []byte, 1)
+	h.awaits[key] = ch
+	h.mu.Unlock()
+
+	return &simpleAwaiter{host: h, key: key}, nil
+}
+
+type simpleAwaiter struct {
+	host *testHost
+	key  string
+}
+
+func (a *simpleAwaiter) Recv(ctx context.Context) ([]byte, error) {
+	a.host.mu.Lock()
+	ch := a.host.awaits[a.key]
+	a.host.mu.Unlock()
+	if ch == nil {
+		return nil, ErrAwaitCanceled
+	}
+	select {
+	case <-ctx.Done():
+		_ = a.Cancel(context.Background())
+		return nil, ctx.Err()
+	case b, ok := <-ch:
+		if !ok {
+			return nil, ErrAwaitCanceled
+		}
+		return b, nil
+	}
+}
+
+func (a *simpleAwaiter) Cancel(ctx context.Context) error {
+	a.host.mu.Lock()
+	if ch, ok := a.host.awaits[a.key]; ok {
+		delete(a.host.awaits, a.key)
+		close(ch)
+	}
+	a.host.mu.Unlock()
+	return nil
+}
+
+func (h *testHost) Fulfill(ctx context.Context, sessionID, correlationID string, data []byte) (bool, error) {
+	key := sessionID + "|" + correlationID
+	h.mu.Lock()
+	ch, ok := h.awaits[key]
+	if ok {
+		delete(h.awaits, key)
+	}
+	h.mu.Unlock()
+	if !ok {
+		return false, nil
+	}
+	select {
+	case ch <- data:
+	default:
+	}
+	close(ch)
+	return true, nil
 }
 
 func newTestJWS(t *testing.T) *MemoryJWS {

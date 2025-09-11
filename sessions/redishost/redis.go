@@ -58,6 +58,12 @@ func (h *Host) revokedKey(sessionID string) string { return h.keyPrefix + "revok
 func (h *Host) epochKey(scope sessions.RevocationScope) string {
 	return h.keyPrefix + "epoch:" + scope.UserID + "|" + scope.ClientID + "|" + scope.TenantID
 }
+func (h *Host) awaitKey(sessionID, corr string) string {
+	return h.keyPrefix + "await:" + sessionID + ":" + corr
+}
+func (h *Host) replyKey(sessionID, corr string) string {
+	return h.keyPrefix + "reply:" + sessionID + ":" + corr
+}
 
 // --- Messaging via Redis Streams ---
 
@@ -116,6 +122,12 @@ func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
 	// Best-effort delete keys related to this session
 	c := context.WithoutCancel(ctx)
 	_, _ = h.client.Del(c, h.streamKey(sessionID)).Result()
+	// Best-effort: delete any pending awaits/replies for this session
+	// Note: SCAN is used to avoid blocking; ignore errors.
+	patA := h.keyPrefix + "await:" + sessionID + ":*"
+	patR := h.keyPrefix + "reply:" + sessionID + ":*"
+	_ = h.deleteByPattern(c, patA)
+	_ = h.deleteByPattern(c, patR)
 	// Do NOT delete the per-session revocation marker here; it's required to
 	// prevent token re-use after DeleteSession. It will expire via TTL.
 	return nil
@@ -170,3 +182,99 @@ func (h *Host) GetEpoch(ctx context.Context, scope sessions.RevocationScope) (in
 
 // Interface compliance
 var _ sessions.SessionHost = (*Host)(nil)
+
+// --- Helpers ---
+
+func (h *Host) deleteByPattern(ctx context.Context, pattern string) error {
+	var cursor uint64
+	for {
+		keys, cur, err := h.client.Scan(ctx, cursor, pattern, 50).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			_, _ = h.client.Del(ctx, keys...).Result()
+		}
+		if cur == 0 {
+			return nil
+		}
+		cursor = cur
+	}
+}
+
+// --- Await/Fulfill using SETNX/BLPOP and Lua for atomicity ---
+
+type redisAwaiter struct {
+	h           *Host
+	sessionID   string
+	correlation string
+}
+
+func (a *redisAwaiter) Recv(ctx context.Context) ([]byte, error) {
+	list := a.h.replyKey(a.sessionID, a.correlation)
+	for {
+		// Use BLPop with context deadline; go-redis respects ctx.
+		res, err := a.h.client.BLPop(ctx, 5*time.Second, list).Result()
+		if err != nil {
+			if err == redis.Nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				// best-effort cancel
+				_ = a.Cancel(context.Background())
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		if len(res) == 2 {
+			// res[0] is list name; res[1] is data
+			return []byte(res[1]), nil
+		}
+	}
+}
+
+func (a *redisAwaiter) Cancel(ctx context.Context) error {
+	// Delete the await marker and reply list
+	key := a.h.awaitKey(a.sessionID, a.correlation)
+	list := a.h.replyKey(a.sessionID, a.correlation)
+	_, _ = a.h.client.Del(ctx, key, list).Result()
+	return nil
+}
+
+func (h *Host) BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (sessions.Awaiter, error) {
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	key := h.awaitKey(sessionID, correlationID)
+	// SETNX with TTL via SET key value NX EX ttl
+	ok, err := h.client.SetNX(ctx, key, "1", ttl).Result()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, sessions.ErrAwaitExists
+	}
+	return &redisAwaiter{h: h, sessionID: sessionID, correlation: correlationID}, nil
+}
+
+var fulfillScript = redis.NewScript(`
+local await = KEYS[1]
+local list = KEYS[2]
+local payload = ARGV[1]
+if redis.call('EXISTS', await) == 1 then
+  redis.call('RPUSH', list, payload)
+  redis.call('DEL', await)
+  redis.call('EXPIRE', list, 60)
+  return 1
+end
+return 0
+`)
+
+func (h *Host) Fulfill(ctx context.Context, sessionID, correlationID string, data []byte) (bool, error) {
+	keys := []string{h.awaitKey(sessionID, correlationID), h.replyKey(sessionID, correlationID)}
+	res, err := fulfillScript.Run(ctx, h.client, keys, data).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}

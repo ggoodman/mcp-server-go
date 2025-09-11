@@ -34,3 +34,4 @@ This library MUST adhere to the following specs.
 - STOP TO CHECK IN WITH ME BEFORE YOU GO BEYOND THE ORIGINAL ASK. DON'T TAKE INITIATIVE IN WRITING CODE. INSTEAD TELL ME WHAT YOU PROPOSE.
 - THE PHRASE "you're absolutely right" IS **BANNED**. DON'T PANDER ME. I'M YOUR PEER. SPEAK RESPECTFULLY WITHOUT OVER-DOING IT.
 - NEVER CREATE OR DELETE FILES / FOLDERS VIA CLI. USE TOOLS. IF NO TOOL EXISTS, ASK ME AND I'LL DO IT FOR YOU.
+- No one is using this library. It is in active development. Optimize for designing the best API. Consult me about breaking changes but please consider them in service of the "best API" ideal.
