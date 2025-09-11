@@ -64,6 +64,9 @@ func (h *Host) awaitKey(sessionID, corr string) string {
 func (h *Host) replyKey(sessionID, corr string) string {
 	return h.keyPrefix + "reply:" + sessionID + ":" + corr
 }
+func (h *Host) eventChannel(sessionID, topic string) string {
+	return h.keyPrefix + "evt:" + sessionID + ":" + topic
+}
 
 // --- Messaging via Redis Streams ---
 
@@ -202,79 +205,39 @@ func (h *Host) deleteByPattern(ctx context.Context, pattern string) error {
 	}
 }
 
-// --- Await/Fulfill using SETNX/BLPOP and Lua for atomicity ---
+// --- Server-internal event pub/sub using Redis Pub/Sub ---
 
-type redisAwaiter struct {
-	h           *Host
-	sessionID   string
-	correlation string
+func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
+	ch := h.eventChannel(sessionID, topic)
+	// PUBLISH returns number of subscribers; we ignore it for best-effort delivery
+	return h.client.Publish(ctx, ch, payload).Err()
 }
 
-func (a *redisAwaiter) Recv(ctx context.Context) ([]byte, error) {
-	list := a.h.replyKey(a.sessionID, a.correlation)
-	for {
-		// Use BLPop with context deadline; go-redis respects ctx.
-		res, err := a.h.client.BLPop(ctx, 5*time.Second, list).Result()
-		if err != nil {
-			if err == redis.Nil {
-				continue
-			}
-			if ctx.Err() != nil {
-				// best-effort cancel
-				_ = a.Cancel(context.Background())
-				return nil, ctx.Err()
-			}
-			return nil, err
-		}
-		if len(res) == 2 {
-			// res[0] is list name; res[1] is data
-			return []byte(res[1]), nil
-		}
-	}
-}
-
-func (a *redisAwaiter) Cancel(ctx context.Context) error {
-	// Delete the await marker and reply list
-	key := a.h.awaitKey(a.sessionID, a.correlation)
-	list := a.h.replyKey(a.sessionID, a.correlation)
-	_, _ = a.h.client.Del(ctx, key, list).Result()
-	return nil
-}
-
-func (h *Host) BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (sessions.Awaiter, error) {
-	if ttl <= 0 {
-		ttl = time.Minute
-	}
-	key := h.awaitKey(sessionID, correlationID)
-	// SETNX with TTL via SET key value NX EX ttl
-	ok, err := h.client.SetNX(ctx, key, "1", ttl).Result()
-	if err != nil {
+func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) (func(), error) {
+	ch := h.eventChannel(sessionID, topic)
+	sub := h.client.Subscribe(ctx, ch)
+	// Ensure subscription is active
+	if _, err := sub.Receive(ctx); err != nil {
+		_ = sub.Close()
 		return nil, err
 	}
-	if !ok {
-		return nil, sessions.ErrAwaitExists
-	}
-	return &redisAwaiter{h: h, sessionID: sessionID, correlation: correlationID}, nil
-}
-
-var fulfillScript = redis.NewScript(`
-local await = KEYS[1]
-local list = KEYS[2]
-local payload = ARGV[1]
-if redis.call('EXISTS', await) == 1 then
-  redis.call('RPUSH', list, payload)
-  redis.call('DEL', await)
-  redis.call('EXPIRE', list, 60)
-  return 1
-end
-return 0
-`)
-
-func (h *Host) Fulfill(ctx context.Context, sessionID, correlationID string, data []byte) (bool, error) {
-	keys := []string{h.awaitKey(sessionID, correlationID), h.replyKey(sessionID, correlationID)}
-	res, err := fulfillScript.Run(ctx, h.client, keys, data).Int()
-	if err != nil {
-		return false, err
-	}
-	return res == 1, nil
+	// Consume messages
+	go func() {
+		defer sub.Close()
+		ch := sub.Channel()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					return
+				}
+				// Best-effort handler; ignore errors to keep subscription alive
+				_ = handler(ctx, []byte(msg.Payload))
+			}
+		}
+	}()
+	unsubscribe := func() { _ = sub.Close() }
+	return unsubscribe, nil
 }

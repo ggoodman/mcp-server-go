@@ -3,9 +3,7 @@ package sessions
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"time"
 
 	"github.com/ggoodman/mcp-streaming-http-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-streaming-http-go/mcp"
@@ -69,8 +67,14 @@ func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Conte
 	if !r.supportsListChanged {
 		return false, nil
 	}
-
-	return false, errors.New("not implemented")
+	topic := string(mcp.RootsListChangedNotificationMethod)
+	_, err = r.sess.backend.SubscribeEvents(ctx, r.sess.id, topic, func(ctx context.Context, _ []byte) error {
+		return listener(ctx)
+	})
+	if err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 type elicitationCapabilityImpl struct {
@@ -107,17 +111,25 @@ func rpcCallToClient[T any](ctx context.Context, sess *session, method mcp.Metho
 
 	// Create correlation id and derive TTL from ctx
 	corr := uuid.NewString()
-	ttl := 30 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		if d := time.Until(deadline); d > 0 {
-			ttl = d
-		}
-	}
+	// TTL is governed by ctx deadline; no separate timer is required for pub/sub
 
-	// Register waiter before publishing the request
-	awaiter, err := sess.backend.BeginAwait(ctx, sess.id, corr, ttl)
+	// Prepare rendezvous subscription before publishing the request
+	rvTopic := "rv:" + corr
+	recvCh := make(chan []byte, 1)
+	// Use a child context to be able to unsubscribe independently on error paths
+	subCtx, cancelSub := context.WithCancel(ctx)
+	_, err := sess.backend.SubscribeEvents(subCtx, sess.id, rvTopic, func(ctx context.Context, payload []byte) error {
+		select {
+		case recvCh <- append([]byte(nil), payload...):
+		default:
+		}
+		// one-shot; cancel subscription after first delivery
+		cancelSub()
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("begin await: %w", err)
+		cancelSub()
+		return fmt.Errorf("subscribe rendezvous: %w", err)
 	}
 
 	// Build and publish the request
@@ -129,29 +141,25 @@ func rpcCallToClient[T any](ctx context.Context, sess *session, method mcp.Metho
 	}
 	reqBytes, err := json.Marshal(req)
 	if err != nil {
-		_ = awaiter.Cancel(context.Background())
+		cancelSub()
 		return fmt.Errorf("marshal request: %w", err)
 	}
 	if _, err := sess.backend.PublishSession(ctx, sess.id, reqBytes); err != nil {
-		_ = awaiter.Cancel(context.Background())
+		cancelSub()
 		return fmt.Errorf("publish request: %w", err)
 	}
 
 	// Await response bytes
-	respBytes, err := awaiter.Recv(ctx)
-	if err != nil {
-		// If the await was canceled (TTL fired) and the call had a deadline,
-		// surface a context-style timeout for clearer semantics, regardless of
-		// minor scheduling races between the timer and ctx cancellation.
-		if errors.Is(err, ErrAwaitCanceled) {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if _, ok := ctx.Deadline(); ok {
-				return context.DeadlineExceeded
-			}
+	var respBytes []byte
+	select {
+	case <-ctx.Done():
+		cancelSub()
+		if _, ok := ctx.Deadline(); ok {
+			return context.DeadlineExceeded
 		}
-		return err
+		return ctx.Err()
+	case b := <-recvCh:
+		respBytes = b
 	}
 
 	var resp jsonrpc.Response

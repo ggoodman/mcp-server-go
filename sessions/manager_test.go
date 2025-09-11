@@ -16,7 +16,8 @@ type testHost struct {
 	epochByUser map[string]int64
 	revoked     map[string]time.Time
 	cleaned     []string
-	awaits      map[string]chan []byte // key: sessionID+"|"+corr
+	awaits      map[string]chan []byte   // key: sessionID+"|"+corr
+	evSub       map[string][]chan []byte // key: sessionID+"|"+topic
 }
 
 func newTestHost() *testHost {
@@ -25,6 +26,7 @@ func newTestHost() *testHost {
 		revoked:     make(map[string]time.Time),
 		cleaned:     []string{},
 		awaits:      make(map[string]chan []byte),
+		evSub:       make(map[string][]chan []byte),
 	}
 }
 
@@ -142,6 +144,53 @@ func (h *testHost) Fulfill(ctx context.Context, sessionID, correlationID string,
 	}
 	close(ch)
 	return true, nil
+}
+
+func (h *testHost) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
+	key := sessionID + "|" + topic
+	h.mu.Lock()
+	subs := append([]chan []byte(nil), h.evSub[key]...)
+	h.mu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- append([]byte(nil), payload...):
+		default:
+		}
+	}
+	return nil
+}
+
+func (h *testHost) SubscribeEvents(ctx context.Context, sessionID, topic string, handler EventHandlerFunction) (func(), error) {
+	key := sessionID + "|" + topic
+	ch := make(chan []byte, 4)
+	h.mu.Lock()
+	h.evSub[key] = append(h.evSub[key], ch)
+	h.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case b := <-ch:
+				_ = handler(ctx, b)
+			}
+		}
+	}()
+	return func() {
+		h.mu.Lock()
+		subs := h.evSub[key]
+		for i, c := range subs {
+			if c == ch {
+				h.evSub[key] = append(subs[:i], subs[i+1:]...)
+				break
+			}
+		}
+		h.mu.Unlock()
+		close(ch)
+		<-done
+	}, nil
 }
 
 func newTestJWS(t *testing.T) *MemoryJWS {

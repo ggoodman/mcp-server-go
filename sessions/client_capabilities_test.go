@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,10 +18,13 @@ import (
 type simpleHost struct {
 	msgs    chan []byte
 	awaitCh map[string]chan []byte
+	// internal events
+	evMu  sync.Mutex
+	evSub map[string][]chan []byte // topic -> chans
 }
 
 func newSimpleHost() *simpleHost {
-	return &simpleHost{msgs: make(chan []byte, 10), awaitCh: make(map[string]chan []byte)}
+	return &simpleHost{msgs: make(chan []byte, 10), awaitCh: make(map[string]chan []byte), evSub: make(map[string][]chan []byte)}
 }
 
 func (h *simpleHost) PublishSession(ctx context.Context, sessionID string, data []byte) (string, error) {
@@ -133,6 +137,51 @@ func (h *simpleHost) Fulfill(ctx context.Context, sessionID, correlationID strin
 	}
 }
 
+func (h *simpleHost) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
+	key := sessionID + "|" + topic
+	h.evMu.Lock()
+	subs := append([]chan []byte(nil), h.evSub[key]...)
+	h.evMu.Unlock()
+	for _, ch := range subs {
+		select {
+		case ch <- append([]byte(nil), payload...):
+		default:
+		}
+	}
+	return nil
+}
+
+func (h *simpleHost) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) (func(), error) {
+	key := sessionID + "|" + topic
+	ch := make(chan []byte, 4)
+	h.evMu.Lock()
+	h.evSub[key] = append(h.evSub[key], ch)
+	h.evMu.Unlock()
+	go func() {
+		defer func() {
+			h.evMu.Lock()
+			subs := h.evSub[key]
+			for i, c := range subs {
+				if c == ch {
+					h.evSub[key] = append(subs[:i], subs[i+1:]...)
+					break
+				}
+			}
+			h.evMu.Unlock()
+			close(ch)
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case b := <-ch:
+				_ = handler(ctx, b)
+			}
+		}
+	}()
+	return func() {}, nil
+}
+
 // Test rpcCallToClient happy path: request is observed on the session stream and fulfilled via rendezvous.
 func TestRPCCallToClient_Success(t *testing.T) {
 	host := newSimpleHost()
@@ -165,7 +214,7 @@ func TestRPCCallToClient_Success(t *testing.T) {
 				return err
 			}
 			b, _ := json.Marshal(resp)
-			_, _ = host.Fulfill(ctx, sess.SessionID(), req.ID.String(), b)
+			_ = host.PublishEvent(ctx, sess.SessionID(), "rv:"+req.ID.String(), b)
 			return nil
 		})
 	}()
@@ -229,7 +278,7 @@ func TestRPCCallToClient_ErrorResponse(t *testing.T) {
 			}
 			resp := jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "bad params", nil)
 			b, _ := json.Marshal(resp)
-			_, _ = host.Fulfill(ctx, sess.SessionID(), req.ID.String(), b)
+			_ = host.PublishEvent(ctx, sess.SessionID(), "rv:"+req.ID.String(), b)
 			return nil
 		})
 	}()
@@ -271,7 +320,7 @@ func TestRoots_List_Success(t *testing.T) {
 				return err
 			}
 			b, _ := json.Marshal(resp)
-			_, _ = host.Fulfill(ctx, sess.SessionID(), req.ID.String(), b)
+			_ = host.PublishEvent(ctx, sess.SessionID(), "rv:"+req.ID.String(), b)
 			return nil
 		})
 	}()
@@ -312,7 +361,7 @@ func TestRoots_List_ErrorResponse(t *testing.T) {
 			}
 			resp := jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "bad", nil)
 			b, _ := json.Marshal(resp)
-			_, _ = host.Fulfill(ctx, sess.SessionID(), req.ID.String(), b)
+			_ = host.PublishEvent(ctx, sess.SessionID(), "rv:"+req.ID.String(), b)
 			return nil
 		})
 	}()
@@ -354,7 +403,7 @@ func TestElicit_Success(t *testing.T) {
 				return err
 			}
 			b, _ := json.Marshal(resp)
-			_, _ = host.Fulfill(ctx, sess.SessionID(), req.ID.String(), b)
+			_ = host.PublishEvent(ctx, sess.SessionID(), "rv:"+req.ID.String(), b)
 			return nil
 		})
 	}()

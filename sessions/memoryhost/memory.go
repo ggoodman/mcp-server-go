@@ -30,7 +30,9 @@ type sessionData struct {
 	mu          sync.RWMutex
 	messages    []message
 	subscribers map[*subscription]struct{}
-	awaits      map[string]*awaitState // correlationID -> await state
+	awaits      map[string]*awaitState // correlationID -> await state (legacy)
+	// server-internal events: topic -> subscribers
+	eventSubs map[string]map[*eventSub]struct{}
 }
 
 type message struct {
@@ -191,6 +193,13 @@ func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
 		a.cancelLocked()
 	}
 	sd.awaits = make(map[string]*awaitState)
+	// stop all event subscribers
+	for _, set := range sd.eventSubs {
+		for sub := range set {
+			sub.stop()
+		}
+	}
+	sd.eventSubs = make(map[string]map[*eventSub]struct{})
 	sd.mu.Unlock()
 	for _, sub := range subs {
 		sub.stop()
@@ -244,7 +253,7 @@ func (h *Host) ensureSession(sessionID string) *sessionData {
 	defer h.mu.Unlock()
 	sd, ok := h.sessions[sessionID]
 	if !ok {
-		sd = &sessionData{messages: make([]message, 0), subscribers: make(map[*subscription]struct{}), awaits: make(map[string]*awaitState)}
+		sd = &sessionData{messages: make([]message, 0), subscribers: make(map[*subscription]struct{}), awaits: make(map[string]*awaitState), eventSubs: make(map[string]map[*eventSub]struct{})}
 		h.sessions[sessionID] = sd
 	}
 	return sd
@@ -274,6 +283,78 @@ var _ sessions.SessionHost = (*Host)(nil)
 type awaitState struct {
 	ch   chan []byte
 	done bool
+}
+
+// --- Server-internal event pub/sub ---
+
+type eventSub struct {
+	ctx     context.Context
+	handler sessions.EventHandlerFunction
+	stopCh  chan struct{}
+	sd      *sessionData
+	topic   string
+}
+
+func (e *eventSub) stop() {
+	e.sd.mu.Lock()
+	if set, ok := e.sd.eventSubs[e.topic]; ok {
+		delete(set, e)
+	}
+	e.sd.mu.Unlock()
+	select {
+	case <-e.stopCh:
+	default:
+		close(e.stopCh)
+	}
+}
+
+func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
+	sd := h.ensureSession(sessionID)
+	sd.mu.RLock()
+	subs := make([]*eventSub, 0)
+	if set, ok := sd.eventSubs[topic]; ok {
+		for sub := range set {
+			subs = append(subs, sub)
+		}
+	}
+	sd.mu.RUnlock()
+
+	for _, s := range subs {
+		sub := s
+		select {
+		case <-sub.ctx.Done():
+			continue
+		case <-sub.stopCh:
+			continue
+		default:
+		}
+		// best-effort, non-blocking fan-out
+		go func() {
+			_ = sub.handler(sub.ctx, append([]byte(nil), payload...))
+		}()
+	}
+	return nil
+}
+
+func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) (func(), error) {
+	sd := h.ensureSession(sessionID)
+	sub := &eventSub{ctx: ctx, handler: handler, stopCh: make(chan struct{}), sd: sd, topic: topic}
+	sd.mu.Lock()
+	set := sd.eventSubs[topic]
+	if set == nil {
+		set = make(map[*eventSub]struct{})
+		sd.eventSubs[topic] = set
+	}
+	set[sub] = struct{}{}
+	sd.mu.Unlock()
+
+	unsubscribe := func() { sub.stop() }
+	// The subscription is active now; return.
+	go func() {
+		<-ctx.Done()
+		sub.stop()
+	}()
+	return unsubscribe, nil
 }
 
 func (a *awaitState) cancelLocked() {

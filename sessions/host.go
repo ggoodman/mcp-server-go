@@ -61,13 +61,19 @@ type SessionHost interface {
 	BumpEpoch(ctx context.Context, scope RevocationScope) (newEpoch int64, err error)
 	GetEpoch(ctx context.Context, scope RevocationScope) (epoch int64, err error)
 
-	// Rendezvous — required; single-consumer, drop-if-nobody-cares delivery.
-	// BeginAwait registers a waiter for a specific correlationID under the
-	// session, with a TTL for automatic cleanup. Exactly one waiter may exist
-	// for a given key. Must be visible to other instances before returning.
-	BeginAwait(ctx context.Context, sessionID, correlationID string, ttl time.Duration) (Awaiter, error)
-	// Fulfill delivers a response to a registered waiter, returning true if the
-	// waiter received it. If there is no waiter (expired/canceled/not created),
-	// return false without error (drop is acceptable).
-	Fulfill(ctx context.Context, sessionID, correlationID string, data []byte) (delivered bool, err error)
+	// Server-internal events — live-only best-effort fan-out within a session.
+	// These events are never delivered to clients; they are only for server
+	// coordination across horizontally scaled instances.
+	//
+	// PublishEvent delivers payload to all current subscribers of (sessionID, topic).
+	PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error
+	// SubscribeEvents registers a handler for (sessionID, topic). It returns an
+	// unsubscribe function that removes the subscription. The call returns only
+	// after the subscription is active, so callers may safely publish immediately
+	// after SubscribeEvents returns.
+	SubscribeEvents(ctx context.Context, sessionID, topic string, handler EventHandlerFunction) (unsubscribe func(), err error)
 }
+
+// EventHandlerFunction handles server-internal events for a specific topic.
+// Returning an error will terminate the subscription with that error.
+type EventHandlerFunction func(ctx context.Context, payload []byte) error

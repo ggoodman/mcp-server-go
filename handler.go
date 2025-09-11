@@ -524,7 +524,11 @@ func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.Respons
 
 func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
 	h.log.Debug("handleNotification", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
-	// TODO: Actually handle the notification
+	// Publish server-internal event for fan-out to interested listeners.
+	// Topic is the JSON-RPC method; payload is the raw params.
+	if err := h.sessionHost.PublishEvent(ctx, session.SessionID(), req.Method, req.Params); err != nil {
+		return fmt.Errorf("publish internal event: %w", err)
+	}
 	return nil
 }
 
@@ -840,10 +844,10 @@ func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessi
 		return fmt.Errorf("marshal response: %w", err)
 	}
 
-	// Deliver to any registered waiter; drop if no waiter is present.
-	_, err = h.sessionHost.Fulfill(ctx, session.SessionID(), res.ID.String(), payload)
-	if err != nil {
-		return fmt.Errorf("fulfill rendezvous: %w", err)
+	// Deliver to rendezvous topic as a server-internal event; drop if no subscriber.
+	topic := "rv:" + res.ID.String()
+	if err := h.sessionHost.PublishEvent(ctx, session.SessionID(), topic, payload); err != nil {
+		return fmt.Errorf("publish rendezvous event: %w", err)
 	}
 	return nil
 }
