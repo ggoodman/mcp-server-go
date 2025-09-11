@@ -2,8 +2,6 @@ package sessions
 
 import (
 	"context"
-
-	"github.com/ggoodman/mcp-streaming-http-go/broker"
 )
 
 var _ Session = (*session)(nil)
@@ -12,7 +10,7 @@ type session struct {
 	id     string
 	userID string
 
-	broker broker.Broker
+	backend SessionHost
 
 	sampling    SamplingCapability
 	roots       RootsCapability
@@ -28,22 +26,12 @@ func (s *session) UserID() string {
 }
 
 func (s *session) ConsumeMessages(ctx context.Context, lastEventID string, handleMsgFn MessageHandlerFunction) error {
-	namespace := s.sessionNamespace()
-	return s.broker.Subscribe(ctx, namespace, lastEventID, func(msgCtx context.Context, envelope broker.MessageEnvelope) error {
-		// Pass the envelope ID and data to the handler
-		return handleMsgFn(msgCtx, envelope.ID, envelope.Data)
-	})
+	return s.backend.SubscribeSession(ctx, s.id, lastEventID, handleMsgFn)
 }
 
 func (s *session) WriteMessage(ctx context.Context, msg []byte) error {
-	namespace := s.sessionNamespace()
-	_, err := s.broker.Publish(ctx, namespace, msg)
+	_, err := s.backend.PublishSession(ctx, s.id, msg)
 	return err
-}
-
-// sessionNamespace encodes the session id into a broker namespace with a future-proof prefix.
-func (s *session) sessionNamespace() string {
-	return "session:" + s.id
 }
 
 func (s *session) GetSamplingCapability() (SamplingCapability, bool) {

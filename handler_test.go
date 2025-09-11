@@ -14,11 +14,11 @@ import (
 
 	streaminghttp "github.com/ggoodman/mcp-streaming-http-go"
 	"github.com/ggoodman/mcp-streaming-http-go/auth"
-	"github.com/ggoodman/mcp-streaming-http-go/broker"
-	"github.com/ggoodman/mcp-streaming-http-go/broker/memorybroker"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks"
 	"github.com/ggoodman/mcp-streaming-http-go/hooks/hookstest"
 	"github.com/ggoodman/mcp-streaming-http-go/mcp"
+	"github.com/ggoodman/mcp-streaming-http-go/sessions"
+	"github.com/ggoodman/mcp-streaming-http-go/sessions/memoryhost"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/sync/errgroup"
 )
@@ -299,7 +299,7 @@ type serverOption func(*serverConfig)
 type serverConfig struct {
 	authenticator auth.Authenticator
 	hooks         hooks.Hooks
-	broker        broker.Broker
+	sessionsHost  sessions.SessionHost
 	logHandler    slog.Handler
 	serverName    string
 	issuer        string
@@ -320,10 +320,10 @@ func withHooks(hooks hooks.Hooks) serverOption {
 	}
 }
 
-// withBroker configures the server to use the provided broker.
-func withBroker(b broker.Broker) serverOption {
+// withSessionHost configures the server to use the provided session host.
+func withSessionHost(h sessions.SessionHost) serverOption {
 	return func(cfg *serverConfig) {
-		cfg.broker = b
+		cfg.sessionsHost = h
 	}
 }
 
@@ -390,7 +390,7 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 	cfg := &serverConfig{
 		authenticator: new(noAuth),
 		hooks:         hookstest.NewMockHooks(),
-		broker:        memorybroker.New(),
+		sessionsHost:  memoryhost.New(),
 		logHandler:    testLogHandler(t),
 		serverName:    "test-server",
 		issuer:        "http://127.0.0.1:0",
@@ -416,7 +416,7 @@ func mustServer(t *testing.T, options ...serverOption) *httptest.Server {
 		JwksURI:       cfg.jwksURI,
 		Authenticator: cfg.authenticator,
 		Hooks:         cfg.hooks,
-		Broker:        cfg.broker,
+		SessionHost:   cfg.sessionsHost,
 		LogHandler:    cfg.logHandler,
 	})
 	if err != nil {
@@ -478,7 +478,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 		cfg := &serverConfig{
 			authenticator: new(noAuth),
 			hooks:         hookstest.NewMockHooks(),
-			broker:        memorybroker.New(),
+			sessionsHost:  memoryhost.New(),
 			logHandler:    testLogHandler(t),
 			serverName:    "multi-test-server",
 			issuer:        "http://127.0.0.1:0",
@@ -498,7 +498,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 			JwksURI:       cfg.jwksURI,
 			Authenticator: cfg.authenticator,
 			Hooks:         cfg.hooks,
-			Broker:        cfg.broker,
+			SessionHost:   cfg.sessionsHost,
 			LogHandler:    cfg.logHandler,
 		})
 		if err != nil {
