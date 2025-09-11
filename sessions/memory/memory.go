@@ -204,19 +204,33 @@ func (s *Session) ConsumeMessages(ctx context.Context, lastEventID string, write
 	}
 }
 
-// SendMessage sends a message to all subscribers of this session
-func (s *Session) SendMessage(envelope sessions.MessageEnvelope) {
+// WriteMessage implements sessions.Session
+func (s *Session) WriteMessage(ctx context.Context, msg sessions.MessageEnvelope) error {
+	// Update last access time when writing a message
+	s.mu.Lock()
+	s.lastAccessAt = time.Now()
+	s.mu.Unlock()
+
+	// Send the message to all subscribers
+	s.sendMessage(msg)
+	return nil
+}
+
+// sendMessage sends a message to a single subscriber of this session
+func (s *Session) sendMessage(envelope sessions.MessageEnvelope) {
 	s.subMu.RLock()
 	defer s.subMu.RUnlock()
 
+	// Simple round-robin: try each subscriber until one accepts the message
 	for _, subChan := range s.subscribers {
 		select {
 		case subChan <- envelope:
+			return // Message delivered to one subscriber, we're done
 		default:
-			// Subscriber channel is full, skip this subscriber
-			// In a production system, you might want to log this
+			// Subscriber channel is full, try next subscriber
 		}
 	}
+	// If we get here, all subscribers have full channels and message is dropped
 }
 
 // GetSamplingCapability implements sessions.Session

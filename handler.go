@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -389,6 +390,11 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		// Set the content type for the SSE response
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
 		w.WriteHeader(http.StatusOK)
+
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+
+		session = newSessionWithWriter(ctx, session, wf)
 
 		// This is a request with an ID, so we need to handle it as a request.
 		res, err := h.handleRequest(ctx, session, userInfo, req)
@@ -919,5 +925,46 @@ func writeSSEEvent(wf writeFlusher, eventType string, msgID string, message any)
 	}
 
 	wf.Flush()
+	return nil
+}
+
+func newSessionWithWriter(ctx context.Context, session sessions.Session, wf writeFlusher) sessions.Session {
+	return &sessionWithWriter{
+		Session: session,
+		reqCtx:  ctx,
+		wf:      wf,
+		mu:      sync.Mutex{},
+	}
+}
+
+type sessionWithWriter struct {
+	sessions.Session
+	reqCtx context.Context
+	wf     writeFlusher
+	mu     sync.Mutex // Guards concurrent writes to wf
+}
+
+func (s *sessionWithWriter) WriteMessage(ctx context.Context, msg sessions.MessageEnvelope) error {
+	// Check the request context has been cancelled. If it has, we should not
+	// attempt to write to the response writer as it may be closed.
+	// Instead, we fall back to the original session's WriteMessage method.
+	// This can happen if the client disconnects while we're trying to write
+	// a message to the response.
+	if s.reqCtx.Err() != nil {
+		// The underlying write flusher should no longer be used so fall back to the original session
+		return s.Session.WriteMessage(ctx, msg)
+	}
+
+	s.mu.Lock()
+	err := writeSSEEvent(s.wf, string(msg.Type), msg.MessageID, json.RawMessage(msg.Message))
+	s.mu.Unlock()
+
+	if err != nil {
+		// TODO: Log error?
+
+		// We failed to write the message to the HTTP response. We'll fall back to writing to the Session.
+		return s.Session.WriteMessage(ctx, msg)
+	}
+
 	return nil
 }

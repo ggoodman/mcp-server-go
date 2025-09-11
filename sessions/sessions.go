@@ -15,6 +15,7 @@ type Session interface {
 	// cursor value. ConsumeMessages calls writeMsgFn for each message until the supplied context is
 	// cancelled or the session is destroyed.
 	ConsumeMessages(ctx context.Context, lastEventID string, writeMsgFn MessageHandlerFunction) error
+	WriteMessage(ctx context.Context, msg MessageEnvelope) error
 
 	// Client capability access - returns nil if client doesn't support the capability
 	// These are now fully typed thanks to the hooks package!
@@ -26,9 +27,18 @@ type Session interface {
 type MessageEnvelope struct {
 	MessageID string
 	Message   jsonrpc.Message
+	Type      MessageType
 }
 
 type MessageHandlerFunction func(ctx context.Context, msg MessageEnvelope) error
+
+type MessageType string
+
+const (
+	MessageTypeRequest  MessageType = "request"
+	MessageTypeResponse MessageType = "response"
+	MessageTypeEvent    MessageType = "notification"
+)
 
 type ClientInfo struct {
 	Name    string
