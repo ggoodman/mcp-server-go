@@ -1,6 +1,14 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var (
+	ErrUnauthorized      = errors.New("unauthorized")
+	ErrInsufficientScope = errors.New("insufficient scope")
+)
 
 type UserInfo interface {
 	// UserID returns the unique identifier for the user.

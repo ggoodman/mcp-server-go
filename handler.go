@@ -328,39 +328,13 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	userInfo, authResult, err := h.checkAuthentication(r)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	if authResult != nil {
-		challenge := authResult.GetAuthenticationChallenge()
-
-		if challenge == nil {
-			// Invalid implementation of the interface
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		if challenge.WWWAuthenticate != "" {
-			w.Header().Add(wwwAuthenticateHeader, challenge.WWWAuthenticate)
-		}
-		status := http.StatusUnauthorized
-		if challenge.Status != 0 {
-			status = challenge.Status
-		}
-		w.WriteHeader(status)
-		return
-	}
-
-	if userInfo == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+
+	userInfo := h.checkAuthentication(ctx, r, w)
+	if userInfo == nil {
+		return
+	}
 
 	var msg jsonrpc.AnyMessage
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
@@ -465,34 +439,11 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	userInfo, authResult, err := h.checkAuthentication(r)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
-	if authResult != nil {
-		challenge := authResult.GetAuthenticationChallenge()
-
-		if challenge == nil {
-			// Invalid implementation of the interface
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		if challenge.WWWAuthenticate != "" {
-			w.Header().Add(wwwAuthenticateHeader, challenge.WWWAuthenticate)
-		}
-		status := http.StatusUnauthorized
-		if challenge.Status != 0 {
-			status = challenge.Status
-		}
-		w.WriteHeader(status)
-		return
-	}
-
+	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -501,9 +452,6 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
 
 	wroteHeadersCh := make(chan struct{})
 
@@ -911,28 +859,41 @@ func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessi
 	return nil
 }
 
-func (h *StreamingHTTPHandler) checkAuthentication(r *http.Request) (auth.UserInfo, auth.AuthenticationResult, error) {
+func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.Request, w http.ResponseWriter) auth.UserInfo {
 	authHeader := r.Header.Get(authorizationHeader)
 
 	if authHeader == "" {
-		return nil, auth.NewAuthenticationRequired(h.prmDocumentURL.String()), nil
+		w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="invalid_token", error_description="no token provided"`, h.serverURL.String()))
+		w.WriteHeader(http.StatusUnauthorized)
+		return nil
 	}
 
 	tok, ok := strings.CutPrefix(authHeader, "Bearer ")
 	if !ok || tok == "" {
-		return nil, auth.NewInvalidAuthorizationHeader(h.serverURL.String()), nil
+		w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="invalid_request", error_description="invalid or absent authorization header"`, h.serverURL.String()))
+		w.WriteHeader(http.StatusBadRequest)
+		return nil
 	}
-
-	// TODO: Make timeout configurable
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
 
 	userInfo, err := h.auth.CheckAuthentication(ctx, tok)
 	if err != nil {
-		return nil, nil, fmt.Errorf("authentication check failed: %w", err)
+		if errors.Is(err, auth.ErrUnauthorized) {
+			w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="invalid_token", error_description="%s"`, h.serverURL.String(), err.Error()))
+			w.WriteHeader(http.StatusUnauthorized)
+			return nil
+		}
+
+		if errors.Is(err, auth.ErrInsufficientScope) {
+			w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="insufficient_scope", error_description="%s"`, h.serverURL.String(), err.Error()))
+			w.WriteHeader(http.StatusForbidden)
+			return nil
+		}
+
+		w.WriteHeader(http.StatusInternalServerError)
+		return nil
 	}
 
-	return userInfo, nil, nil
+	return userInfo
 }
 
 // writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.

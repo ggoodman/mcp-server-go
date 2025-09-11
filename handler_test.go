@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,7 +34,10 @@ func TestSingleInstance(t *testing.T) {
 		)
 		defer srv.Close()
 
-		cs := mustClient(t, srv, withClientAuthToken("test-token"))
+		cs, err := mustClient(t, srv, withClientAuthToken("test-token"))
+		if err != nil {
+			t.Fatalf("Failed to create client: %v", err)
+		}
 		defer cs.Close()
 
 		// Verify we can list tools (should be empty due to empty tools capability)
@@ -57,6 +61,30 @@ func TestSingleInstance(t *testing.T) {
 
 		if want, got := `calling "tools/call": tool not found: non-existent-tool`, err.Error(); want != got {
 			t.Errorf("Unexpected error message: want %q, got %q", want, got)
+		}
+	})
+
+	t.Run("Basic auth with invalid token", func(t *testing.T) {
+		auth := &noAuth{
+			wantToken: "want-token",
+		}
+
+		srv := mustServer(t,
+			withHooks(hookstest.NewMockHooks(hookstest.WithEmptyToolsCapability())),
+			withAuth(auth),
+		)
+		defer srv.Close()
+
+		cs, err := mustClient(t, srv, withClientAuthToken("bad-token"))
+		if err == nil {
+			t.Fatal("Expected error creating client with bad token, got nil")
+		}
+		if cs != nil {
+			defer cs.Close()
+			t.Fatal("Expected nil client session on error")
+		}
+		if !strings.Contains(err.Error(), "401 Unauthorized") {
+			t.Errorf("Unexpected error message: want 401 Unauthorized, got %q", err.Error())
 		}
 	})
 }
@@ -111,6 +139,7 @@ func TestMultiInstance(t *testing.T) {
 
 				return 0
 			},
+			withAuth(&noAuth{}),
 			withLogHandler(testLogHandler(t)),
 			withHooks(
 				hookstest.NewMockHooks(
@@ -138,7 +167,10 @@ func TestMultiInstance(t *testing.T) {
 		)
 		defer srv.Close()
 
-		cs := mustClient(t, srv, withClientAuthToken("test-token"))
+		cs, err := mustClient(t, srv, withClientAuthToken("test-token"))
+		if err != nil {
+			t.Fatalf("Failed to create client: %v", err)
+		}
 		defer cs.Close()
 
 		g, ctx := errgroup.WithContext(ctx)
@@ -172,8 +204,7 @@ func TestMultiInstance(t *testing.T) {
 			return nil
 		})
 
-		err := g.Wait()
-		if err != nil {
+		if err := g.Wait(); err != nil {
 			t.Fatalf("Tool call goroutines failed: %v", err)
 		}
 
@@ -567,8 +598,8 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 //		withClientVersion("2.0.0"),
 //	)
 //	defer cs.Close()
-func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) *sdk.ClientSession {
-	ctx := context.Background()
+func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) (*sdk.ClientSession, error) {
+	ctx := t.Context()
 
 	// Apply default configuration
 	cfg := &clientConfig{
@@ -596,39 +627,21 @@ func mustClient(t *testing.T, srv *httptest.Server, options ...clientOption) *sd
 		},
 	}
 
-	cs, err := client.Connect(ctx, transport, &sdk.ClientSessionOptions{})
-	if err != nil {
-		t.Fatalf("Failed to connect client: %v", err)
-	}
-
-	// Verify initialization completed successfully
-	initResult := cs.InitializeResult()
-	if initResult == nil {
-		t.Fatalf("Client session not initialized")
-	}
-
-	// Verify server info is present
-	if initResult.ServerInfo.Name == "" {
-		t.Fatalf("Server info missing or invalid")
-	}
-
-	// Log the server info for debugging
-	t.Logf("Connected to server: %s (protocol version: %s)",
-		initResult.ServerInfo.Name,
-		initResult.ProtocolVersion)
-
-	return cs
+	return client.Connect(ctx, transport, &sdk.ClientSessionOptions{})
 }
 
-type noAuth struct{}
+type noAuth struct {
+	wantToken string
+}
 
 func (a *noAuth) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
-	return fakeUser, nil
+	if a.wantToken != "" && tok != a.wantToken {
+		return nil, auth.ErrUnauthorized
+	}
+	return &fakeUserInfo{}, nil
 }
 
 type fakeUserInfo struct{}
 
 func (u *fakeUserInfo) UserID() string       { return "fake-user" }
 func (u *fakeUserInfo) Claims(ref any) error { return nil }
-
-var fakeUser = &fakeUserInfo{}
