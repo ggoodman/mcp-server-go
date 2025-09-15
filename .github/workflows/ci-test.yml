@@ -1,0 +1,45 @@
+name: CI - Test
+
+on:
+  push:
+    branches: [main, "**"]
+  pull_request:
+    branches: [main, "**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Verify module graph
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          go test ./... -count=1 -race -coverprofile=coverage.out -covermode=atomic
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
