@@ -1,48 +1,49 @@
-run:
-  timeout: 5m
-
+version: "2"
 linters:
   enable:
-    - govet
-    - staticcheck
+    - gocritic
     - gosec
-    - errcheck
-    - gosimple
-    - ineffassign
-    - unused
-    - typecheck
     - misspell
     - revive
-    - gocritic
   disable:
-    - gocyclo
     - depguard
     - dupl
     - funlen
+    - gocyclo
     - lll
-
-linters-settings:
-  misspell:
-    locale: US
-  revive:
-    severity: warning
+  settings:
+    gosec:
+      excludes:
+        - G115
+      severity: medium
+    misspell:
+      locale: US
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+          severity: warning
+        - name: receiver-naming
+        - name: import-shadowing
+        - name: var-naming
+  exclusions:
+    generated: lax
     rules:
-      - name: exported
-        severity: warning
-      - name: receiver-naming
-      - name: import-shadowing
-      - name: var-naming
-  gosec:
-    severity: medium
-    excludes:
-      - G115 # integer overflow false positives
-
+      - linters:
+          - funlen
+          - gocyclo
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - funlen
-        - gocyclo
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
