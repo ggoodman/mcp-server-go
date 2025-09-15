@@ -719,3 +719,134 @@ var (
 	_ = withIssuer
 	_ = withJwksURI
 )
+
+// ----------------------------------------------------------------------------
+// Well-known endpoints
+// ----------------------------------------------------------------------------
+
+func TestAuthorizationServerMetadataMirror_ManualMode(t *testing.T) {
+	server := mcpserver.NewServer(
+		mcpserver.WithToolsOptions(
+			mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+		),
+	)
+	// Use explicit values so we can assert
+	issuer := "http://127.0.0.1:0"
+	jwks := "http://127.0.0.1/.well-known/jwks.json"
+	srv := mustServer(t, server, withIssuer(issuer), withJwksURI(jwks))
+	defer srv.Close()
+
+	// Request the mirror endpoint on the RS origin
+	resp, err := http.Get(srv.URL + "/.well-known/oauth-authorization-server")
+	if err != nil {
+		t.Fatalf("GET metadata: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	var meta struct {
+		Issuer                 string   `json:"issuer"`
+		ResponseTypesSupported []string `json:"response_types_supported"`
+		JwksURI                string   `json:"jwks_uri"`
+		ScopesSupported        []string `json:"scopes_supported"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if meta.Issuer != issuer {
+		t.Fatalf("issuer mismatch: want %q got %q", issuer, meta.Issuer)
+	}
+	if meta.JwksURI != jwks {
+		t.Fatalf("jwks mismatch: want %q got %q", jwks, meta.JwksURI)
+	}
+	// We synthesize ["code"] in manual mode
+	if len(meta.ResponseTypesSupported) == 0 || meta.ResponseTypesSupported[0] != "code" {
+		t.Fatalf("unexpected response_types_supported: %#v", meta.ResponseTypesSupported)
+	}
+}
+
+func TestAuthorizationServerMetadataMirror_CORS(t *testing.T) {
+	server := mcpserver.NewServer(
+		mcpserver.WithToolsOptions(
+			mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+		),
+	)
+	srv := mustServer(t, server)
+	defer srv.Close()
+
+	// Preflight
+	req, _ := http.NewRequest(http.MethodOptions, srv.URL+"/.well-known/oauth-authorization-server", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("unexpected OPTIONS status: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("missing or wrong ACAO on OPTIONS: %q", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Methods"); got == "" {
+		t.Fatalf("missing ACAM on OPTIONS")
+	}
+	resp.Body.Close()
+
+	// GET with Origin
+	getReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/.well-known/oauth-authorization-server", nil)
+	getReq.Header.Set("Origin", "https://example.com")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET request failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected GET status: %d", getResp.StatusCode)
+	}
+	if got := getResp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("missing or wrong ACAO on GET: %q", got)
+	}
+	getResp.Body.Close()
+}
+
+func TestProtectedResourceMetadata_CORS(t *testing.T) {
+	server := mcpserver.NewServer(
+		mcpserver.WithToolsOptions(
+			mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+		),
+	)
+	srv := mustServer(t, server)
+	defer srv.Close()
+
+	// Preflight for PRM endpoint
+	req, _ := http.NewRequest(http.MethodOptions, srv.URL+"/.well-known/oauth-protected-resource/", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight PRM failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("unexpected OPTIONS status: %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("missing ACAO on PRM OPTIONS")
+	}
+	resp.Body.Close()
+
+	// GET PRM
+	getReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/.well-known/oauth-protected-resource/", nil)
+	getReq.Header.Set("Origin", "https://example.com")
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET PRM failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected GET status: %d", getResp.StatusCode)
+	}
+	if getResp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("missing ACAO on PRM GET")
+	}
+	getResp.Body.Close()
+}

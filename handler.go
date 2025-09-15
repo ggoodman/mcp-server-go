@@ -110,6 +110,11 @@ type StreamingHTTPHandler struct {
 	prmDocument    wellknown.ProtectedResourceMetadata
 	prmDocumentURL *url.URL
 	serverURL      *url.URL
+	// Mirror of RFC 8414 Authorization Server Metadata for discovery convenience.
+	// In discovery mode this mirrors the real AS document; in manual mode it's
+	// synthesized from ManualOIDC fields.
+	authServerMetadata    wellknown.AuthServerMetadata
+	authServerMetadataURL *url.URL
 
 	auth        auth.Authenticator
 	mcp         mcpserver.ServerCapabilities
@@ -245,6 +250,18 @@ func New(
 			TlsClientCertificateBoundAccessTokens: false,
 			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
 		}
+		// Synthesize a minimal, standards-conformant Authorization Server Metadata doc.
+		h.authServerMetadata = wellknown.AuthServerMetadata{
+			Issuer:                            manual.Issuer,
+			ResponseTypesSupported:            []string{"code"},
+			JwksUri:                           manual.JwksURI,
+			ScopesSupported:                   manual.ScopesSupported,
+			TokenEndpointAuthMethodsSupported: manual.TokenEndpointAuthMethodsSupported,
+			TokenEndpointAuthSigningAlgValuesSupported: manual.TokenEndpointAuthSigningAlgValuesSupported,
+			ServiceDocumentation:                       manual.ServiceDocumentation,
+			OpPolicyUri:                                manual.OpPolicyURI,
+			OpTosUri:                                   manual.OpTosURI,
+		}
 		h.oidcProvider = nil
 
 	case cfg.discoveryURL != "":
@@ -272,6 +289,8 @@ func New(
 			TlsClientCertificateBoundAccessTokens: false,
 			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
 		}
+		// Mirror the discovered AS metadata directly.
+		h.authServerMetadata = *asm
 		h.oidcProvider = provider
 	}
 
@@ -282,11 +301,34 @@ func New(
 		Path:   fmt.Sprintf("/.well-known/oauth-protected-resource%s", mcpURL.Path),
 	}
 
+	// Construct Authorization Server Metadata mirror URL
+	h.authServerMetadataURL = &url.URL{
+		Scheme: mcpURL.Scheme,
+		Host:   mcpURL.Host,
+		Path:   "/.well-known/oauth-authorization-server",
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc(fmt.Sprintf("POST %s", pathOnly(mcpURL)), h.handlePostMCP)
 	mux.HandleFunc(fmt.Sprintf("GET %s", pathOnly(mcpURL)), h.handleGetMCP)
 	mux.HandleFunc(fmt.Sprintf("DELETE %s", pathOnly(mcpURL)), h.handleDeleteMCP)
-	mux.HandleFunc(fmt.Sprintf("GET %s", pathOnly(h.prmDocumentURL)), h.handleGetProtectedResourceMetadata)
+
+	prmPath := pathOnly(h.prmDocumentURL)
+	mux.HandleFunc(fmt.Sprintf("GET %s", prmPath), h.handleGetProtectedResourceMetadata)
+	mux.HandleFunc(fmt.Sprintf("OPTIONS %s", prmPath), h.handleOptionsProtectedResourceMetadata)
+	if !strings.HasSuffix(prmPath, "/") {
+		mux.HandleFunc(fmt.Sprintf("GET %s/", prmPath), h.handleGetProtectedResourceMetadata)
+		mux.HandleFunc(fmt.Sprintf("OPTIONS %s/", prmPath), h.handleOptionsProtectedResourceMetadata)
+	}
+
+	// Expose a mirror of Authorization Server Metadata for discovery convenience.
+	asPath := pathOnly(h.authServerMetadataURL)
+	mux.HandleFunc(fmt.Sprintf("GET %s", asPath), h.handleGetAuthorizationServerMetadata)
+	mux.HandleFunc(fmt.Sprintf("OPTIONS %s", asPath), h.handleOptionsAuthorizationServerMetadata)
+	if !strings.HasSuffix(asPath, "/") {
+		mux.HandleFunc(fmt.Sprintf("GET %s/", asPath), h.handleGetAuthorizationServerMetadata)
+		mux.HandleFunc(fmt.Sprintf("OPTIONS %s/", asPath), h.handleOptionsAuthorizationServerMetadata)
+	}
 	h.mux = mux
 
 	return h, nil
@@ -668,12 +710,56 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 // document crafted when the StreamingHTTPHandler initialized.
 func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("handleGetProtectedResourceMetadata", slog.String("method", r.Method), slog.String("url", r.URL.String()))
+	// CORS: allow cross-origin browser fetches of the well-known metadata
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Vary", "Origin")
 	w.Header().Set("Content-Type", "application/json")
 
 	if err := json.NewEncoder(w).Encode(h.prmDocument); err != nil {
 		http.Error(w, fmt.Sprintf("failed to encode protected resource metadata: %v", err), http.StatusInternalServerError)
 		return
 	}
+}
+
+// handleOptionsProtectedResourceMetadata responds to CORS preflight requests
+// for the protected resource metadata endpoint.
+func (h *StreamingHTTPHandler) handleOptionsProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+	w.Header().Set("Access-Control-Max-Age", "600")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleGetAuthorizationServerMetadata serves a mirror or synthesized
+// Authorization Server Metadata (RFC 8414). This endpoint is provided as a
+// convenience to clients and tooling for discovery purposes. It does not
+// imply this process acts as an authorization server.
+func (h *StreamingHTTPHandler) handleGetAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handleGetAuthorizationServerMetadata", slog.String("method", r.Method), slog.String("url", r.URL.String()))
+	// CORS: allow cross-origin browser fetches of the well-known metadata
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(h.authServerMetadata); err != nil {
+		http.Error(w, fmt.Sprintf("failed to encode authorization server metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
+}
+
+// handleOptionsAuthorizationServerMetadata responds to CORS preflight requests
+// for the authorization server metadata endpoint.
+func (h *StreamingHTTPHandler) handleOptionsAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	// Allow any origin; this is a public metadata document.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// Allow only GET (and OPTIONS). Browsers will send Access-Control-Request-Method: GET
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	// Allow typical headers used by fetch; keep permissive as it's a read-only endpoint.
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+	// Cache preflight for a reasonable period.
+	w.Header().Set("Access-Control-Max-Age", "600")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
