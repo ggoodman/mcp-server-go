@@ -220,8 +220,8 @@ func (st *StaticTools) Replace(_ context.Context, defs ...StaticTool) {
 			st.handlers[d.Descriptor.Name] = d.Handler
 		}
 	}
-	// notify listeners of change
-	go st.notifier.Notify(context.Background())
+	// notify listeners of change (best-effort; errors only indicate closed notifier)
+	go func() { _ = st.notifier.Notify(context.Background()) }()
 }
 
 // Add registers a new tool if it doesn't duplicate an existing name.
@@ -247,7 +247,7 @@ func (st *StaticTools) Add(_ context.Context, def StaticTool) bool {
 		st.handlers[name] = def.Handler
 	}
 	// notify listeners of change
-	go st.notifier.Notify(context.Background())
+	go func() { _ = st.notifier.Notify(context.Background()) }()
 	return true
 }
 
@@ -269,7 +269,7 @@ func (st *StaticTools) Remove(_ context.Context, name string) bool {
 		st.tools = st.tools[:n]
 		delete(st.handlers, name)
 		// notify listeners of change
-		go st.notifier.Notify(context.Background())
+		go func() { _ = st.notifier.Notify(context.Background()) }()
 	}
 	return removed
 }

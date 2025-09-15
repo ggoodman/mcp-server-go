@@ -15,7 +15,7 @@ type (
 	CallToolFunc  func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error)
 )
 
-// Functional options for configuring the tools capability.
+// ToolsOption is a functional option for configuring the tools capability.
 type ToolsOption func(*toolsCapability)
 
 type toolsCapability struct {

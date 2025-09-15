@@ -40,6 +40,26 @@ linters:
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
+  exclude-rules:
+    # Ignore unchecked Close()/ListenAndServe in examples and tests (they are illustrative / best-effort)
+    - linters: [errcheck]
+      path: ^examples/|^tests/|_test\.go$
+      text: (Close|ListenAndServe)
+    # Ignore gosec file permission / variable path warnings in examples & tests; they are demo code
+    - linters: [gosec]
+      path: ^examples/|_test\.go$|^tests/
+      text: (G301|G304|G306)
+    # Stylistic gocritic suggestions in examples
+    - linters: [gocritic]
+      path: ^examples/
+      text: (ifElseChain|singleCaseSwitch)
+    # Allow underscore package names in examples
+    - linters: [revive]
+      path: ^examples/
+      text: var-naming
+    # Allow British spelling 'cancelled' in code/comments (misspell)
+    - linters: [misspell]
+      text: cancelled
 formatters:
   exclusions:
     generated: lax

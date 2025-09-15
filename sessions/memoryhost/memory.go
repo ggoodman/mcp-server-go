@@ -12,6 +12,8 @@ import (
 )
 
 // Host is an in-memory implementation of sessions.SessionHost.
+// It is intended for tests and single-process servers. All data is ephemeral
+// and lost on process exit. Safe for concurrent use.
 type Host struct {
 	mu       sync.RWMutex
 	sessions map[string]*sessionData
@@ -238,7 +240,8 @@ func (h *Host) BumpEpoch(ctx context.Context, scope sessions.RevocationScope) (i
 	key := scopeKey(scope)
 	h.epochMu.Lock()
 	defer h.epochMu.Unlock()
-	h.epochs[key] = h.epochs[key] + 1
+	// Increment epoch atomically under lock.
+	h.epochs[key]++
 	return h.epochs[key], nil
 }
 

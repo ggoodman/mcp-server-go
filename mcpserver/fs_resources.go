@@ -22,6 +22,10 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/ggoodman/mcp-server-go/mcp"
+
+	// SubscriberForURI returns a channel that receives a signal each time the
+	// given resource URI is updated. If the URI is unknown, it returns a closed
+	// channel. This is primarily intended for internal coordination.
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
@@ -312,7 +316,10 @@ func (r *FSResources) runFsnotify(ctx context.Context) {
 		slog.Debug("fsnotify unavailable", slog.String("err", err.Error()))
 		return
 	}
-	defer w.Close()
+	defer func() {
+		// Best-effort watcher close; no actionable error handling path.
+		_ = w.Close()
+	}()
 
 	// Recursively add all directories under the root.
 	addDirs := func() error {
@@ -627,7 +634,10 @@ func (r *FSResources) uriExists(ctx context.Context, uri string) bool {
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() {
+		// Best-effort file close; writes already flushed or will surface earlier.
+		_ = f.Close()
+	}()
 	if info, err := fs.Stat(r.fsys, rel); err == nil && info.Mode().IsRegular() {
 		return true
 	}

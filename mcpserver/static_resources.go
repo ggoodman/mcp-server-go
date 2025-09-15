@@ -28,6 +28,9 @@ type StaticResources struct {
 	notifier ChangeNotifier
 }
 
+// NewStaticResources constructs a StaticResources container with initial
+// resources, templates and contents. Slices and maps are copied so callers may
+// retain ownership of their inputs.
 func NewStaticResources(resources []mcp.Resource, templates []mcp.ResourceTemplate, contents map[string][]mcp.ResourceContents) *StaticResources {
 	sr := &StaticResources{
 		contents:      make(map[string][]mcp.ResourceContents),
