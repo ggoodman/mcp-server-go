@@ -45,6 +45,7 @@ type subscription struct {
 	startIdx int
 	stopCh   chan struct{}
 	errCh    chan error
+	msgCh    chan message
 	sd       *sessionData
 }
 
@@ -85,14 +86,11 @@ func (h *Host) PublishSession(ctx context.Context, sessionID string, data []byte
 			continue
 		default:
 		}
-		go func() {
-			if err := s.handler(s.ctx, msg.id, msg.data); err != nil {
-				select {
-				case s.errCh <- err:
-				default:
-				}
-			}
-		}()
+		select {
+		case s.msgCh <- msg:
+		default:
+			// drop if subscriber is busy
+		}
 	}
 
 	return evID, nil
@@ -121,7 +119,7 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 	}
 	sd.mu.RUnlock()
 
-	sub := &subscription{ctx: ctx, handler: handler, startIdx: startIdx, stopCh: make(chan struct{}), errCh: make(chan error, 1), sd: sd}
+	sub := &subscription{ctx: ctx, handler: handler, startIdx: startIdx, stopCh: make(chan struct{}), errCh: make(chan error, 1), msgCh: make(chan message, 64), sd: sd}
 
 	// register
 	sd.mu.Lock()
@@ -164,9 +162,11 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 		case err := <-sub.errCh:
 			sub.stop()
 			return err
-		default:
-			// Idle wait to avoid busy spin
-			time.Sleep(10 * time.Millisecond)
+		case m := <-sub.msgCh:
+			if err := handler(ctx, m.id, m.data); err != nil {
+				sub.stop()
+				return err
+			}
 		}
 	}
 }
