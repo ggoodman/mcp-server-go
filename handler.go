@@ -136,9 +136,38 @@ type StreamingHTTPHandler struct {
 	sessCancel  map[string]context.CancelFunc
 }
 
-type writeFlusher interface {
+// lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
+// It serializes concurrent writes/flushes and avoids writing after ctx is canceled.
+type lockedWriteFlusher struct {
 	io.Writer
 	http.Flusher
+	mu  sync.Mutex
+	ctx context.Context
+}
+
+func (l *lockedWriteFlusher) Write(p []byte) (int, error) {
+	if l.ctx != nil && l.ctx.Err() != nil {
+		return 0, l.ctx.Err()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Re-check after acquiring the lock to minimize races with cancellation
+	if l.ctx != nil && l.ctx.Err() != nil {
+		return 0, l.ctx.Err()
+	}
+	return l.Writer.Write(p)
+}
+
+func (l *lockedWriteFlusher) Flush() {
+	if l.ctx != nil && l.ctx.Err() != nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ctx != nil && l.ctx.Err() != nil {
+		return
+	}
+	l.Flusher.Flush()
 }
 
 // bootstrapSession is a minimal sessions.Session used during initialize before a real
@@ -428,7 +457,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	wf, ok := w.(writeFlusher)
+	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -436,6 +465,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	// Tie processing to the request context (no artificial timeouts here).
 	ctx := r.Context()
+	// Serialize concurrent writes and avoid writing after cancellation.
+	wf := &lockedWriteFlusher{Writer: w, Flusher: f, ctx: ctx}
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
@@ -557,7 +588,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	wf, ok := w.(writeFlusher)
+	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -565,6 +596,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	// Tie SSE stream to the request context; client disconnect cancels ctx.
 	ctx := r.Context()
+	// Ensure SSE writes are serialized and skip writing after cancellation.
+	wf := &lockedWriteFlusher{Writer: w, Flusher: f, ctx: ctx}
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
@@ -774,7 +807,7 @@ func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session s
 
 // handleSessionInitialization handles the initialization of a new MCP session
 // when no mcp-session-id header is present in the request.
-func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, wf writeFlusher, w http.ResponseWriter, userInfo auth.UserInfo, msg jsonrpc.AnyMessage) error {
+func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, wf *lockedWriteFlusher, w http.ResponseWriter, userInfo auth.UserInfo, msg jsonrpc.AnyMessage) error {
 	req := msg.AsRequest()
 	if req == nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1318,7 +1351,7 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 // writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.
 // The message will be JSON encoded and written as the data field of the SSE event.
 // It automatically flushes the response after writing.
-func writeSSEEvent(wf writeFlusher, eventType string, msgID string, message any) error {
+func writeSSEEvent(wf *lockedWriteFlusher, eventType string, msgID string, message any) error {
 	if msgID != "" {
 		if _, err := fmt.Fprintf(wf, "id: %s\n", msgID); err != nil {
 			return fmt.Errorf("failed to write SSE event ID: %w", err)
@@ -1343,7 +1376,7 @@ func writeSSEEvent(wf writeFlusher, eventType string, msgID string, message any)
 
 var _ sessions.Session = (*sessionWithWriter)(nil)
 
-func newSessionWithWriter(ctx context.Context, session sessions.Session, wf writeFlusher, fallback func(context.Context, []byte) error) sessions.Session {
+func newSessionWithWriter(ctx context.Context, session sessions.Session, wf *lockedWriteFlusher, fallback func(context.Context, []byte) error) sessions.Session {
 	return &sessionWithWriter{
 		Session:  session,
 		reqCtx:   ctx,
@@ -1356,7 +1389,7 @@ func newSessionWithWriter(ctx context.Context, session sessions.Session, wf writ
 type sessionWithWriter struct {
 	sessions.Session
 	reqCtx   context.Context
-	wf       writeFlusher
+	wf       *lockedWriteFlusher
 	mu       sync.Mutex // Guards concurrent writes to wf
 	fallback func(context.Context, []byte) error
 }
