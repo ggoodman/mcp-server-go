@@ -15,21 +15,21 @@ import (
 	"testing"
 	"time"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
 func TestSingleInstance(t *testing.T) {
 	t.Run("Initialize returns session and capabilities", func(t *testing.T) {
 		// Explicit minimal server with empty static tools
-		server := mcpserver.NewServer(
-			mcpserver.WithToolsOptions(
-				mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+		server := mcpservice.NewServer(
+			mcpservice.WithToolsOptions(
+				mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
 			),
 		)
 		srv := mustServer(t, server)
@@ -82,9 +82,9 @@ func TestSingleInstance(t *testing.T) {
 	})
 
 	t.Run("Tools list over POST is empty", func(t *testing.T) {
-		server := mcpserver.NewServer(
-			mcpserver.WithToolsOptions(
-				mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+		server := mcpservice.NewServer(
+			mcpservice.WithToolsOptions(
+				mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
 			),
 		)
 		srv := mustServer(t, server)
@@ -128,9 +128,9 @@ func TestSingleInstance(t *testing.T) {
 
 	t.Run("Basic auth with invalid token", func(t *testing.T) {
 		auth := &noAuth{wantToken: "want-token"}
-		server := mcpserver.NewServer(
-			mcpserver.WithToolsOptions(
-				mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+		server := mcpservice.NewServer(
+			mcpservice.WithToolsOptions(
+				mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
 			),
 		)
 		srv := mustServer(t, server, withAuth(auth))
@@ -163,7 +163,7 @@ func TestMultiInstance(t *testing.T) {
 			func(r *http.Request, handlerCount int) int {
 				return 5 // Out of bounds
 			},
-			func() mcpserver.ServerCapabilities { return mcpserver.NewServer() },
+			func() mcpservice.ServerCapabilities { return mcpservice.NewServer() },
 			withServerName("invalid-router-test"),
 		)
 		defer srv.Close()
@@ -186,11 +186,11 @@ func TestMultiInstance(t *testing.T) {
 		sharedHost := memoryhost.New()
 
 		// Distinct server instances per handler: each gets its own static resources container
-		mcpFactory := func() mcpserver.ServerCapabilities {
-			sr := mcpserver.NewStaticResources(nil, nil, nil)
-			return mcpserver.NewServer(
-				mcpserver.WithResourcesOptions(
-					mcpserver.WithStaticResourceContainer(sr),
+		mcpFactory := func() mcpservice.ServerCapabilities {
+			sr := mcpservice.NewStaticResources(nil, nil, nil)
+			return mcpservice.NewServer(
+				mcpservice.WithResourcesOptions(
+					mcpservice.WithStaticResourceContainer(sr),
 				),
 			)
 		}
@@ -337,7 +337,7 @@ type serverOption func(*serverConfig)
 
 type serverConfig struct {
 	authenticator auth.Authenticator
-	mcp           mcpserver.ServerCapabilities
+	mcp           mcpservice.ServerCapabilities
 	sessionsHost  sessions.SessionHost
 	logHandler    slog.Handler
 	serverName    string
@@ -415,7 +415,7 @@ func withJwksURI(uri string) serverOption {
 //		withSessions(customStore),
 //	)
 //	defer srv.Close()
-func mustServer(t *testing.T, mcp mcpserver.ServerCapabilities, options ...serverOption) *httptest.Server {
+func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serverOption) *httptest.Server {
 	ctx := context.Background()
 
 	// Apply default configuration
@@ -486,7 +486,7 @@ type RouterFunc func(r *http.Request, handlerCount int) int
 //		withServerName("multi-test-server"),
 //	)
 //	defer srv.Close()
-func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, mcpFactory func() mcpserver.ServerCapabilities, options ...serverOption) *httptest.Server {
+func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, mcpFactory func() mcpservice.ServerCapabilities, options ...serverOption) *httptest.Server {
 	if handlerCount <= 0 {
 		t.Fatalf("Handler count must be positive, got %d", handlerCount)
 	}
@@ -726,9 +726,9 @@ var (
 // ----------------------------------------------------------------------------
 
 func TestAuthorizationServerMetadataMirror_ManualMode(t *testing.T) {
-	server := mcpserver.NewServer(
-		mcpserver.WithToolsOptions(
-			mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsOptions(
+			mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
 		),
 	)
 	// Use explicit values so we can assert
@@ -768,9 +768,9 @@ func TestAuthorizationServerMetadataMirror_ManualMode(t *testing.T) {
 }
 
 func TestAuthorizationServerMetadataMirror_CORS(t *testing.T) {
-	server := mcpserver.NewServer(
-		mcpserver.WithToolsOptions(
-			mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsOptions(
+			mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
 		),
 	)
 	srv := mustServer(t, server)
@@ -812,9 +812,9 @@ func TestAuthorizationServerMetadataMirror_CORS(t *testing.T) {
 }
 
 func TestProtectedResourceMetadata_CORS(t *testing.T) {
-	server := mcpserver.NewServer(
-		mcpserver.WithToolsOptions(
-			mcpserver.WithStaticToolsContainer(mcpserver.NewStaticTools()),
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsOptions(
+			mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
 		),
 	)
 	srv := mustServer(t, server)

@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
 type noAuthDel struct{}
@@ -29,7 +29,7 @@ func TestDeleteSession_ClosesStreamsAndRevokes(t *testing.T) {
 
 	mh := memoryhost.New()
 	// Minimal server capabilities
-	srvCaps := mcpserver.NewServer()
+	srvCaps := mcpservice.NewServer()
 
 	var handler http.Handler
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))

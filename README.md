@@ -24,12 +24,12 @@ import (
 	"os"
 	"time"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/redishost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
 func envOr(key, def string) string {
@@ -65,20 +65,20 @@ func main() {
 	defer host.Close()
 
 	// 2) Tools (auto-derived JSON Schema; strict by default)
-	translate := mcpserver.NewTool[TranslateArgs](
+	translate := mcpservice.NewTool[TranslateArgs](
 		"translate",
 		func(ctx context.Context, _ sessions.Session, args TranslateArgs) (*mcp.CallToolResult, error) {
-			return mcpserver.TextResult("Translated to " + args.To + ": " + args.Text), nil
+			return mcpservice.TextResult("Translated to " + args.To + ": " + args.Text), nil
 		},
-		mcpserver.WithToolDescription("Translate text to a target language."),
+		mcpservice.WithToolDescription("Translate text to a target language."),
 		// mcpserver.WithToolAllowAdditionalProperties(true), // opt-in to unknown fields
 	)
-	tools := mcpserver.NewStaticTools(translate)
+	tools := mcpservice.NewStaticTools(translate)
 
 	// 3) Server capabilities
-	server := mcpserver.NewServer(
-		mcpserver.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
-		mcpserver.WithToolsOptions(mcpserver.WithStaticToolsContainer(tools)),
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
+		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
 	)
 
 	// 4) Drop-in OAuth2/OIDC JWT access token auth (RFC 9068): discovery + JWKS

@@ -21,7 +21,7 @@
 //   - Pagination uses the Page[T] type in this package; a nil cursor requests
 //     the first page. Implementations SHOULD populate NextCursor when more data
 //     is available.
-package mcpserver
+package mcpservice
 
 import (
 	"context"

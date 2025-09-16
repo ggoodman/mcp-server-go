@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
@@ -23,14 +23,14 @@ import (
 // Security: access is confined to the provided root directory. All tool paths
 // are validated to remain within the root (symlinks are resolved for reads via
 // FSResources; tool writes also enforce containment).
-func New(root string) mcpserver.ServerCapabilities {
+func New(root string) mcpservice.ServerCapabilities {
 	const baseURI = "fs://workspace"
 
 	// Resources backed by the OS directory
-	fsCap := mcpserver.NewFSResources(
-		mcpserver.WithOSDir(root),
-		mcpserver.WithBaseURI(baseURI),
-		mcpserver.WithFSPageSize(200),
+	fsCap := mcpservice.NewFSResources(
+		mcpservice.WithOSDir(root),
+		mcpservice.WithBaseURI(baseURI),
+		mcpservice.WithFSPageSize(200),
 		// fsnotify will power listChanged/updated when possible
 	)
 
@@ -101,32 +101,32 @@ func New(root string) mcpserver.ServerCapabilities {
 		URI  string `json:"uri,omitempty"`
 		Path string `json:"path,omitempty"`
 	}
-	readTool := mcpserver.NewTool("fs.read", func(ctx context.Context, _ sessions.Session, a ReadArgs) (*mcp.CallToolResult, error) {
+	readTool := mcpservice.NewTool("fs.read", func(ctx context.Context, _ sessions.Session, a ReadArgs) (*mcp.CallToolResult, error) {
 		var rel string
 		switch {
 		case a.URI != "":
 			r, ok := uriToRel(a.URI)
 			if !ok {
-				return mcpserver.Errorf("invalid uri: %s", a.URI), nil
+				return mcpservice.Errorf("invalid uri: %s", a.URI), nil
 			}
 			rel = r
 		case a.Path != "":
 			rel = path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 			if rel == "." || strings.HasPrefix(rel, "../") {
-				return mcpserver.Errorf("invalid path: %s", a.Path), nil
+				return mcpservice.Errorf("invalid path: %s", a.Path), nil
 			}
 		default:
-			return mcpserver.Errorf("must provide either uri or path"), nil
+			return mcpservice.Errorf("must provide either uri or path"), nil
 		}
 
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpserver.Errorf("access denied: %v", err), nil
+			return mcpservice.Errorf("access denied: %v", err), nil
 		}
 		data, err := os.ReadFile(abs)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				return mcpserver.Errorf("not found: %s", rel), nil
+				return mcpservice.Errorf("not found: %s", rel), nil
 			}
 			return nil, err
 		}
@@ -136,7 +136,7 @@ func New(root string) mcpserver.ServerCapabilities {
 			embeddedText(uri, mime, string(data)),
 		}}, nil
 	},
-		mcpserver.WithToolDescription("Read a file by URI or path and return its contents as an embedded resource."),
+		mcpservice.WithToolDescription("Read a file by URI or path and return its contents as an embedded resource."),
 	)
 
 	// Tool: fs.write — create/overwrite a file at path with content
@@ -146,17 +146,17 @@ func New(root string) mcpserver.ServerCapabilities {
 		CreateDirs bool   `json:"createDirs,omitempty"`
 		Overwrite  bool   `json:"overwrite,omitempty"`
 	}
-	writeTool := mcpserver.NewTool("fs.write", func(ctx context.Context, _ sessions.Session, a WriteArgs) (*mcp.CallToolResult, error) {
+	writeTool := mcpservice.NewTool("fs.write", func(ctx context.Context, _ sessions.Session, a WriteArgs) (*mcp.CallToolResult, error) {
 		if a.Path == "" {
-			return mcpserver.Errorf("path is required"), nil
+			return mcpservice.Errorf("path is required"), nil
 		}
 		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 		if rel == "." || strings.HasPrefix(rel, "../") {
-			return mcpserver.Errorf("invalid path: %s", a.Path), nil
+			return mcpservice.Errorf("invalid path: %s", a.Path), nil
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpserver.Errorf("access denied: %v", err), nil
+			return mcpservice.Errorf("access denied: %v", err), nil
 		}
 		if a.CreateDirs {
 			if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
@@ -165,7 +165,7 @@ func New(root string) mcpserver.ServerCapabilities {
 		}
 		if !a.Overwrite {
 			if _, err := os.Stat(abs); err == nil {
-				return mcpserver.Errorf("file exists: %s", rel), nil
+				return mcpservice.Errorf("file exists: %s", rel), nil
 			}
 		}
 		if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
@@ -178,7 +178,7 @@ func New(root string) mcpserver.ServerCapabilities {
 			embeddedText(uri, mime, a.Content),
 		}}, nil
 	},
-		mcpserver.WithToolDescription("Write text to a file at the given path (relative to the workspace root). Returns a resource link and the embedded contents."),
+		mcpservice.WithToolDescription("Write text to a file at the given path (relative to the workspace root). Returns a resource link and the embedded contents."),
 	)
 
 	// Tool: fs.append — append content to a file
@@ -186,17 +186,17 @@ func New(root string) mcpserver.ServerCapabilities {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
-	appendTool := mcpserver.NewTool("fs.append", func(ctx context.Context, _ sessions.Session, a AppendArgs) (*mcp.CallToolResult, error) {
+	appendTool := mcpservice.NewTool("fs.append", func(ctx context.Context, _ sessions.Session, a AppendArgs) (*mcp.CallToolResult, error) {
 		if a.Path == "" {
-			return mcpserver.Errorf("path is required"), nil
+			return mcpservice.Errorf("path is required"), nil
 		}
 		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 		if rel == "." || strings.HasPrefix(rel, "../") {
-			return mcpserver.Errorf("invalid path: %s", a.Path), nil
+			return mcpservice.Errorf("invalid path: %s", a.Path), nil
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpserver.Errorf("access denied: %v", err), nil
+			return mcpservice.Errorf("access denied: %v", err), nil
 		}
 		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
 			return nil, err
@@ -217,7 +217,7 @@ func New(root string) mcpserver.ServerCapabilities {
 			embeddedText(uri, mime, string(data)),
 		}}, nil
 	},
-		mcpserver.WithToolDescription("Append text to a file. Returns a resource link and the full embedded contents after append."),
+		mcpservice.WithToolDescription("Append text to a file. Returns a resource link and the full embedded contents after append."),
 	)
 
 	// Tool: fs.move — move/rename a file
@@ -225,22 +225,22 @@ func New(root string) mcpserver.ServerCapabilities {
 		From string `json:"from"`
 		To   string `json:"to"`
 	}
-	moveTool := mcpserver.NewTool("fs.move", func(ctx context.Context, _ sessions.Session, a MoveArgs) (*mcp.CallToolResult, error) {
+	moveTool := mcpservice.NewTool("fs.move", func(ctx context.Context, _ sessions.Session, a MoveArgs) (*mcp.CallToolResult, error) {
 		if a.From == "" || a.To == "" {
-			return mcpserver.Errorf("from and to are required"), nil
+			return mcpservice.Errorf("from and to are required"), nil
 		}
 		fromRel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.From), "/"))
 		toRel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.To), "/"))
 		if fromRel == "." || strings.HasPrefix(fromRel, "../") || toRel == "." || strings.HasPrefix(toRel, "../") {
-			return mcpserver.Errorf("invalid path"), nil
+			return mcpservice.Errorf("invalid path"), nil
 		}
 		fromAbs := filepath.Join(root, filepath.FromSlash(fromRel))
 		toAbs := filepath.Join(root, filepath.FromSlash(toRel))
 		if err := ensureInsideRoot(fromAbs); err != nil {
-			return mcpserver.Errorf("access denied: %v", err), nil
+			return mcpservice.Errorf("access denied: %v", err), nil
 		}
 		if err := ensureInsideRoot(toAbs); err != nil {
-			return mcpserver.Errorf("access denied: %v", err), nil
+			return mcpservice.Errorf("access denied: %v", err), nil
 		}
 		if err := os.MkdirAll(filepath.Dir(toAbs), 0o750); err != nil {
 			return nil, err
@@ -251,39 +251,39 @@ func New(root string) mcpserver.ServerCapabilities {
 		uri := relToURI(toRel)
 		return &mcp.CallToolResult{Content: []mcp.ContentBlock{resourceLink(uri, path.Base(toRel), mimeByExt(toAbs))}}, nil
 	},
-		mcpserver.WithToolDescription("Move or rename a file within the workspace."),
+		mcpservice.WithToolDescription("Move or rename a file within the workspace."),
 	)
 
 	// Tool: fs.delete — delete a file
 	type DeleteArgs struct {
 		Path string `json:"path"`
 	}
-	deleteTool := mcpserver.NewTool("fs.delete", func(ctx context.Context, _ sessions.Session, a DeleteArgs) (*mcp.CallToolResult, error) {
+	deleteTool := mcpservice.NewTool("fs.delete", func(ctx context.Context, _ sessions.Session, a DeleteArgs) (*mcp.CallToolResult, error) {
 		if a.Path == "" {
-			return mcpserver.Errorf("path is required"), nil
+			return mcpservice.Errorf("path is required"), nil
 		}
 		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 		if rel == "." || strings.HasPrefix(rel, "../") {
-			return mcpserver.Errorf("invalid path: %s", a.Path), nil
+			return mcpservice.Errorf("invalid path: %s", a.Path), nil
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpserver.Errorf("access denied: %v", err), nil
+			return mcpservice.Errorf("access denied: %v", err), nil
 		}
 		if err := os.Remove(abs); err != nil {
 			return nil, err
 		}
-		return mcpserver.TextResult(fmt.Sprintf("deleted %s", rel)), nil
+		return mcpservice.TextResult(fmt.Sprintf("deleted %s", rel)), nil
 	},
-		mcpserver.WithToolDescription("Delete a file within the workspace."),
+		mcpservice.WithToolDescription("Delete a file within the workspace."),
 	)
 
-	tools := mcpserver.NewStaticTools(readTool, writeTool, appendTool, moveTool, deleteTool)
+	tools := mcpservice.NewStaticTools(readTool, writeTool, appendTool, moveTool, deleteTool)
 
-	return mcpserver.NewServer(
-		mcpserver.WithServerInfo(mcp.ImplementationInfo{Name: "examples-workspace-fs", Version: "0.1.0", Title: "Workspace FS"}),
-		mcpserver.WithResourcesCapability(fsCap),
-		mcpserver.WithToolsOptions(mcpserver.WithStaticToolsContainer(tools)),
+	return mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-workspace-fs", Version: "0.1.0", Title: "Workspace FS"}),
+		mcpservice.WithResourcesCapability(fsCap),
+		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
 	)
 }
 

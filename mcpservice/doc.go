@@ -58,4 +58,4 @@
 //	)
 //
 // See server.go and capability files for full API details.
-package mcpserver
+package mcpservice

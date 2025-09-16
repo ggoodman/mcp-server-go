@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
 type noAuthLC struct{}
@@ -33,14 +33,14 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	// emits list-changed notifications on mutations (add/remove/replace), and
 	// the resources capability advertises listChanged support when a static
 	// container is used—no explicit ChangeNotifier wiring required.
-	static := mcpserver.NewStaticResources(
+	static := mcpservice.NewStaticResources(
 		[]mcp.Resource{{URI: "res://a", Name: "a"}},
 		nil,
 		map[string][]mcp.ResourceContents{"res://a": {{URI: "res://a", Text: "A"}}},
 	)
-	srvCaps := mcpserver.NewServer(
-		mcpserver.WithResourcesOptions(
-			mcpserver.WithStaticResourceContainer(static),
+	srvCaps := mcpservice.NewServer(
+		mcpservice.WithResourcesOptions(
+			mcpservice.WithStaticResourceContainer(static),
 		),
 	)
 
