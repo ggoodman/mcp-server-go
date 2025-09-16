@@ -64,6 +64,14 @@ type ServerCapabilities interface {
 	// Implementations may return a session-scoped value. The returned value
 	// MUST be safe for concurrent use.
 	GetToolsCapability(ctx context.Context, session sessions.Session) (cap ToolsCapability, ok bool, err error)
+
+	// GetPromptsCapability returns the prompts capability if supported by the server
+	// for the given session. If ok is false, the handler will not advertise prompt
+	// support in the server capabilities.
+	//
+	// Implementations may return a session-scoped value. The returned value
+	// MUST be safe for concurrent use.
+	GetPromptsCapability(ctx context.Context, session sessions.Session) (cap PromptsCapability, ok bool, err error)
 }
 
 // ResourcesCapability defines the basic resource operations supported by the server.
@@ -174,4 +182,36 @@ type NotifyToolsListChangedFunc func(ctx context.Context, session sessions.Sessi
 // cancellation to stop delivering callbacks.
 type ToolListChangedCapability interface {
 	Register(ctx context.Context, session sessions.Session, fn NotifyToolsListChangedFunc) (ok bool, err error)
+}
+
+// PromptsCapability defines the server's prompts surface area.
+// Implementations may be static or dynamic per session. All methods MUST be
+// safe for concurrent use.
+type PromptsCapability interface {
+	// ListPrompts returns a (possibly paginated) list of prompts available to the session.
+	// A nil cursor requests the first page. When more results are available,
+	// Page.NextCursor SHOULD be set.
+	ListPrompts(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error)
+
+	// GetPrompt returns the prompt definition/messages for the given name and arguments.
+	GetPrompt(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error)
+
+	// GetListChangedCapability returns an optional capability that, when present,
+	// allows the handler to register a callback to be invoked when the prompt list
+	// changes. If ok is false, list-changed notifications are not supported.
+	// The server will use the return value to decide if it advertises the
+	// "listChanged" capability for prompts.
+	GetListChangedCapability(ctx context.Context, session sessions.Session) (cap PromptListChangedCapability, ok bool, err error)
+}
+
+// NotifyPromptsListChangedFunc is invoked when the server's prompt list changes for
+// the session (additions, removals, or metadata changes). Implementations MAY
+// coalesce rapid changes and deliver fewer callbacks.
+type NotifyPromptsListChangedFunc func(ctx context.Context, session sessions.Session)
+
+// PromptListChangedCapability provides prompts list-changed notifications support.
+// Register should be idempotent for the same (session, fn) pair and respect ctx
+// cancellation to stop delivering callbacks.
+type PromptListChangedCapability interface {
+	Register(ctx context.Context, session sessions.Session, fn NotifyPromptsListChangedFunc) (ok bool, err error)
 }
