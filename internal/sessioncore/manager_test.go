@@ -69,7 +69,8 @@ func (h *testHost) BumpEpoch(ctx context.Context, scope sessions.RevocationScope
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.epochByUser[scope.UserID] = h.epochByUser[scope.UserID] + 1
+	// Increment epoch for user.
+	h.epochByUser[scope.UserID]++
 	return h.epochByUser[scope.UserID], nil
 }
 func (h *testHost) GetEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {

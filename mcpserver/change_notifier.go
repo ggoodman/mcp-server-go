@@ -5,6 +5,9 @@ import (
 	"sync"
 )
 
+// ChangeNotifier provides a simple in-process pub-sub for change events. It is
+// used by static containers and capabilities to signal that a list has changed
+// so that listChanged notifications can be sent to clients.
 type ChangeNotifier struct {
 	subscribers   []chan struct{}
 	subscribersMu sync.RWMutex
@@ -12,7 +15,9 @@ type ChangeNotifier struct {
 }
 
 // Notify triggers a notification to all registered listeners that a set of resources
-// has been invalidated or has changed.
+// has been invalidated or has changed. It returns nil always; the error return
+// exists only for future expansion (e.g. context-based cancellation semantics).
+// Callers may safely ignore the returned error.
 func (cn *ChangeNotifier) Notify(ctx context.Context) error {
 	cn.subscribersMu.RLock()
 	defer cn.subscribersMu.RUnlock()
@@ -56,6 +61,8 @@ type ChangeSubscriber interface {
 	Subscriber() <-chan struct{}
 }
 
+// Subscriber returns a channel that receives a signal whenever Notify is called.
+// The returned channel is buffered with capacity 1 to avoid blocking callers.
 func (cn *ChangeNotifier) Subscriber() <-chan struct{} {
 	cn.subscribersMu.Lock()
 	defer cn.subscribersMu.Unlock()

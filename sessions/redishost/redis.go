@@ -11,6 +11,7 @@ import (
 )
 
 // Config for Redis-backed SessionHost. Defaults can be loaded via envdecode.
+// See struct tags for environment variable names and defaults.
 type Config struct {
 	// RedisAddr like "localhost:6379". ENV: REDIS_ADDR
 	RedisAddr string `env:"REDIS_ADDR,default=localhost:6379"`
@@ -18,11 +19,14 @@ type Config struct {
 	KeyPrefix string `env:"SESSIONS_KEY_PREFIX,default=mcp:sessions:"`
 }
 
+// Host is a Redis-backed implementation of sessions.SessionHost using
+// Redis Streams for ordered messaging and Pub/Sub for events.
 type Host struct {
 	client    *redis.Client
 	keyPrefix string
 }
 
+// New constructs a Host from the provided Config and verifies connectivity.
 func New(cfg Config) (*Host, error) {
 	addr := cfg.RedisAddr
 	if addr == "" {
@@ -48,7 +52,7 @@ func NewFromEnv() (*Host, error) {
 	return New(cfg)
 }
 
-// Close closes the Redis client.
+// Close closes the underlying Redis client.
 func (h *Host) Close() error { return h.client.Close() }
 
 // --- Key helpers ---
@@ -57,12 +61,6 @@ func (h *Host) streamKey(sessionID string) string  { return h.keyPrefix + "strea
 func (h *Host) revokedKey(sessionID string) string { return h.keyPrefix + "revoked:" + sessionID }
 func (h *Host) epochKey(scope sessions.RevocationScope) string {
 	return h.keyPrefix + "epoch:" + scope.UserID + "|" + scope.ClientID + "|" + scope.TenantID
-}
-func (h *Host) awaitKey(sessionID, corr string) string {
-	return h.keyPrefix + "await:" + sessionID + ":" + corr
-}
-func (h *Host) replyKey(sessionID, corr string) string {
-	return h.keyPrefix + "reply:" + sessionID + ":" + corr
 }
 func (h *Host) eventChannel(sessionID, topic string) string {
 	return h.keyPrefix + "evt:" + sessionID + ":" + topic
@@ -223,7 +221,9 @@ func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, han
 	}
 	// Consume messages
 	go func() {
-		defer sub.Close()
+		defer func() {
+			_ = sub.Close()
+		}()
 		ch := sub.Channel()
 		for {
 			select {

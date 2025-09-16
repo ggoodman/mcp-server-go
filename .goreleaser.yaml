@@ -1,0 +1,14 @@
+project_name: mcp-server-go
+
+# Library-only configuration: no builds or artifacts.
+# Use Release Drafter for notes; GoReleaser only publishes the release on tag.
+
+changelog:
+  skip: true
+
+release:
+  draft: false
+  prerelease: auto
+  # Preserve Release Drafter's body and publish its draft on tag.
+  mode: keep-existing
+  use_existing_draft: true

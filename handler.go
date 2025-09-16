@@ -42,7 +42,7 @@ var (
 const (
 	// Use canonical header names for clarity; Go matches headers case-insensitively.
 	lastEventIDHeader        = "Last-Event-ID"
-	mcpSessionIdHeader       = "MCP-Session-ID"
+	mcpSessionIDHeader       = "MCP-Session-ID"
 	mcpProtocolVersionHeader = "MCP-Protocol-Version"
 	authorizationHeader      = "Authorization"
 	wwwAuthenticateHeader    = "WWW-Authenticate"
@@ -276,20 +276,20 @@ func New(
 			ResourceDocumentation:                 manual.ServiceDocumentation,
 			ResourcePolicyURI:                     manual.OpPolicyURI,
 			ResourceTosURI:                        manual.OpTosURI,
-			TlsClientCertificateBoundAccessTokens: false,
+			TLSClientCertificateBoundAccessTokens: false,
 			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
 		}
 		// Synthesize a minimal, standards-conformant Authorization Server Metadata doc.
 		h.authServerMetadata = wellknown.AuthServerMetadata{
 			Issuer:                            manual.Issuer,
 			ResponseTypesSupported:            []string{"code"},
-			JwksUri:                           manual.JwksURI,
+			JwksURI:                           manual.JwksURI,
 			ScopesSupported:                   manual.ScopesSupported,
 			TokenEndpointAuthMethodsSupported: manual.TokenEndpointAuthMethodsSupported,
 			TokenEndpointAuthSigningAlgValuesSupported: manual.TokenEndpointAuthSigningAlgValuesSupported,
 			ServiceDocumentation:                       manual.ServiceDocumentation,
-			OpPolicyUri:                                manual.OpPolicyURI,
-			OpTosUri:                                   manual.OpTosURI,
+			OpPolicyURI:                                manual.OpPolicyURI,
+			OpTosURI:                                   manual.OpTosURI,
 		}
 		h.oidcProvider = nil
 
@@ -302,20 +302,20 @@ func New(
 		if err := provider.Claims(&asm); err != nil {
 			return nil, fmt.Errorf("unexpected or invalid authorization server metadata: %w", err)
 		}
-		if asm.JwksUri == "" {
+		if asm.JwksURI == "" {
 			return nil, fmt.Errorf("the supplied authorization server does not declare support for a JWKS URI in its metadata")
 		}
 		h.prmDocument = wellknown.ProtectedResourceMetadata{
 			Resource:                              mcpURL.String(),
 			AuthorizationServers:                  []string{asm.Issuer},
-			JwksURI:                               asm.JwksUri,
+			JwksURI:                               asm.JwksURI,
 			ScopesSupported:                       asm.ScopesSupported,
 			BearerMethodsSupported:                []string{"authorization_header"},
 			ResourceName:                          cfg.serverName,
 			ResourceDocumentation:                 asm.ServiceDocumentation,
-			ResourcePolicyURI:                     asm.OpPolicyUri,
-			ResourceTosURI:                        asm.OpTosUri,
-			TlsClientCertificateBoundAccessTokens: false,
+			ResourcePolicyURI:                     asm.OpPolicyURI,
+			ResourceTosURI:                        asm.OpTosURI,
+			TLSClientCertificateBoundAccessTokens: false,
 			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
 		}
 		// Mirror the discovered AS metadata directly.
@@ -395,7 +395,7 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	sessID := r.Header.Get(mcpSessionIdHeader)
+	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -479,7 +479,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	sessID := r.Header.Get(mcpSessionIdHeader)
+	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
 		// If the session header is missing, the client MUST be establishing a new session
 		// via an initialize MCP request.
@@ -604,7 +604,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	sessionHeader := r.Header.Get(mcpSessionIdHeader)
+	sessionHeader := r.Header.Get(mcpSessionIDHeader)
 	if sessionHeader == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -927,7 +927,7 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		return fmt.Errorf("failed to create initialize response: %w", err)
 	}
 
-	w.Header().Set(mcpSessionIdHeader, session.SessionID())
+	w.Header().Set(mcpSessionIDHeader, session.SessionID())
 	// Advertise the negotiated protocol version on the response
 	if negotiatedVersion != "" {
 		w.Header().Set(mcpProtocolVersionHeader, negotiatedVersion)
@@ -944,10 +944,8 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 
 // mapHooksErrorToJSONRPCError maps specific hooks errors to appropriate JSON-RPC error responses
 func mapHooksErrorToJSONRPCError(requestID *jsonrpc.RequestID, err error) *jsonrpc.Response {
-	switch err.(type) {
-	default:
-		return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
-	}
+	// Future: inspect error types to map to specific JSON-RPC codes.
+	return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
 }
 
 func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {

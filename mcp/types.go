@@ -1,6 +1,7 @@
 package mcp
 
 // Basic types
+// Role indicates the role of a message author.
 type Role string
 
 const (
@@ -10,7 +11,9 @@ const (
 
 type LoggingLevel string
 
+// LoggingLevel represents structured log severity.
 const (
+	// Logging level constants.
 	LoggingLevelDebug     LoggingLevel = "debug"
 	LoggingLevelInfo      LoggingLevel = "info"
 	LoggingLevelNotice    LoggingLevel = "notice"
@@ -22,6 +25,7 @@ const (
 )
 
 // Capabilities
+// ClientCapabilities advertises client features.
 type ClientCapabilities struct {
 	Roots *struct {
 		ListChanged bool `json:"listChanged"`
@@ -30,6 +34,7 @@ type ClientCapabilities struct {
 	Elicitation *struct{} `json:"elicitation,omitempty"`
 }
 
+// ServerCapabilities advertises server features.
 type ServerCapabilities struct {
 	Logging *struct{} `json:"logging,omitempty"`
 	Prompts *struct {
@@ -44,6 +49,7 @@ type ServerCapabilities struct {
 	} `json:"tools,omitempty"`
 }
 
+// ImplementationInfo describes the implementation name and version.
 type ImplementationInfo struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
@@ -51,6 +57,7 @@ type ImplementationInfo struct {
 }
 
 // Content types
+// ContentBlock is a typed content part of a message.
 type ContentBlock struct {
 	Type string `json:"type"`
 	// For TextContent
@@ -67,18 +74,21 @@ type ContentBlock struct {
 }
 
 // Annotations
+// Annotations provide optional routing/prioritization hints.
 type Annotations struct {
 	Audience []Role  `json:"audience,omitempty"`
 	Priority float64 `json:"priority,omitzero"`
 }
 
 // Tools
+// Tool describes a callable tool and its input schema.
 type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema ToolInputSchema `json:"inputSchema"`
 }
 
+// ToolInputSchema is a JSON-schema-like description of tool input.
 type ToolInputSchema struct {
 	Type                 string                    `json:"type"`
 	Properties           map[string]SchemaProperty `json:"properties,omitempty"`
@@ -86,6 +96,7 @@ type ToolInputSchema struct {
 	AdditionalProperties bool                      `json:"additionalProperties,omitzero"`
 }
 
+// SchemaProperty is a simplified schema node used in tool/elicitation schemas.
 type SchemaProperty struct {
 	Type        string                    `json:"type,omitempty"`
 	Description string                    `json:"description,omitzero"`
@@ -94,11 +105,13 @@ type SchemaProperty struct {
 	Enum        []any                     `json:"enum,omitempty"`
 }
 
+// ToolAnnotations constrain the intended audience for a tool.
 type ToolAnnotations struct {
 	Audience []Role `json:"audience,omitempty"`
 }
 
 // Resources
+// Resource represents an addressable resource.
 type Resource struct {
 	URI         string `json:"uri"`
 	Name        string `json:"name"`
@@ -106,13 +119,15 @@ type Resource struct {
 	MimeType    string `json:"mimeType,omitzero"`
 }
 
+// ResourceTemplate describes a template for resource URIs.
 type ResourceTemplate struct {
-	UriTemplate string `json:"uriTemplate"`
+	URITemplate string `json:"uriTemplate"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitzero"`
 	MimeType    string `json:"mimeType,omitzero"`
 }
 
+// ResourceContents is the value of a resource read.
 type ResourceContents struct {
 	URI      string `json:"uri"`
 	MimeType string `json:"mimeType,omitzero"`
@@ -122,6 +137,7 @@ type ResourceContents struct {
 	Blob string `json:"blob,omitzero"`
 }
 
+// ResourceLink references another resource.
 type ResourceLink struct {
 	URI         string `json:"uri"`
 	Name        string `json:"name"`
@@ -130,29 +146,34 @@ type ResourceLink struct {
 }
 
 // Prompts
+// Prompt describes a named prompt the server can provide.
 type Prompt struct {
 	Name        string           `json:"name"`
 	Description string           `json:"description,omitzero"`
 	Arguments   []PromptArgument `json:"arguments,omitempty"`
 }
 
+// PromptArgument describes a single prompt argument.
 type PromptArgument struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitzero"`
 	Required    bool   `json:"required,omitzero"`
 }
 
+// PromptMessage is a message used in a prompt.
 type PromptMessage struct {
 	Role    Role           `json:"role"`
 	Content []ContentBlock `json:"content"`
 }
 
 // Sampling
+// SamplingMessage is a message used as input to model sampling.
 type SamplingMessage struct {
 	Role    Role           `json:"role"`
 	Content []ContentBlock `json:"content"`
 }
 
+// ModelPreferences encode model selection tradeoffs.
 type ModelPreferences struct {
 	Hints                []ModelHint `json:"hints,omitempty"`
 	CostPriority         float64     `json:"costPriority,omitzero"`
@@ -160,27 +181,32 @@ type ModelPreferences struct {
 	IntelligencePriority float64     `json:"intelligencePriority,omitzero"`
 }
 
+// ModelHint supplies model-specific guidance.
 type ModelHint struct {
 	Name string `json:"name,omitzero"`
 }
 
 // Roots
+// Root identifies a workspace root.
 type Root struct {
 	URI  string `json:"uri"`
 	Name string `json:"name,omitzero"`
 }
 
 // Completion
+// ResourceReference identifies the target of completion.
 type ResourceReference struct {
 	Type string `json:"type"`
 	URI  string `json:"uri"`
 }
 
+// CompleteArgument is the item to complete for a resource reference.
 type CompleteArgument struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
 
+// Completion contains completion results for a reference.
 type Completion struct {
 	Values  []string `json:"values"`
 	Total   int      `json:"total,omitzero"`
@@ -188,12 +214,14 @@ type Completion struct {
 }
 
 // Elicitation
+// ElicitationSchema is a simplified schema for elicitation prompts.
 type ElicitationSchema struct {
 	Type       string                               `json:"type"`
 	Properties map[string]PrimitiveSchemaDefinition `json:"properties"`
 	Required   []string                             `json:"required,omitempty"`
 }
 
+// PrimitiveSchemaDefinition is a leaf schema node for elicitation.
 type PrimitiveSchemaDefinition struct {
 	Type        string `json:"type"`
 	Description string `json:"description,omitzero"`

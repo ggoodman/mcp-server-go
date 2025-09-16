@@ -16,7 +16,7 @@ type (
 	ReadResourceFunc          func(ctx context.Context, session sessions.Session, uri string) ([]mcp.ResourceContents, error)
 )
 
-// Functional options for configuring the resources capability.
+// ResourcesOption is a functional option for configuring the resources capability.
 type ResourcesOption func(*resourcesCapability)
 
 type resourcesCapability struct {

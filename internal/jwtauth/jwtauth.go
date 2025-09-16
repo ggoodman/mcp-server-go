@@ -14,6 +14,8 @@ import (
 )
 
 // Config controls validation behavior for access tokens.
+// It is used by discovery-based authenticators to enforce issuer, audience,
+// scope, algorithm, and clock-skew policies.
 type Config struct {
 	Issuer           string
 	ExpectedAudience string
@@ -23,6 +25,7 @@ type Config struct {
 	Leeway           time.Duration
 }
 
+// DefaultConfig returns a Config with safe defaults for algorithm and leeway.
 func DefaultConfig() *Config {
 	return &Config{
 		AllowedAlgs: []string{"RS256"},
@@ -52,7 +55,9 @@ func (u *userInfo) Claims(ref any) error {
 	return json.Unmarshal(b, ref)
 }
 
-// Authenticator validates tokens and returns a minimal UserInfo.
+// Authenticator validates access tokens and returns a minimal UserInfo
+// that exposes the subject and access to raw claims. Implementations
+// MUST perform signature, issuer, audience and time validations.
 type Authenticator interface {
 	CheckAuthentication(ctx context.Context, tok string) (UserInfo, error)
 }
@@ -65,14 +70,18 @@ type discoveryAuthenticator struct {
 	iss string
 }
 
-// Sentinel errors for stable classification by outer layers.
-var (
-	ErrUnauthorized      = errors.New("jwtauth: unauthorized")
-	ErrInsufficientScope = errors.New("jwtauth: insufficient_scope")
-)
+// ErrUnauthorized indicates that the access token failed validation (e.g.,
+// signature, issuer, audience, exp/nbf) and the request should be treated as
+// unauthenticated.
+var ErrUnauthorized = errors.New("jwtauth: unauthorized")
+
+// ErrInsufficientScope indicates the token was valid but did not satisfy the
+// required scopes policy; callers should respond with HTTP 403 where relevant.
+var ErrInsufficientScope = errors.New("jwtauth: insufficient_scope")
 
 // NewFromDiscovery performs OIDC discovery to obtain jwks_uri and issuer, and
-// constructs an authenticator that validates RFC 9068 access tokens.
+// constructs an Authenticator that validates RFC 9068 access tokens using the
+// configured policies in Config. JWKS keys are auto-refreshed.
 func NewFromDiscovery(ctx context.Context, cfg *Config) (*discoveryAuthenticator, error) {
 	if cfg == nil {
 		return nil, errors.New("config is required")

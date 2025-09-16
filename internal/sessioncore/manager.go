@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -14,14 +15,11 @@ import (
 // --- Per-request rendezvous (distributed await/fulfill) ---
 
 // Awaiter provides a one-shot receive for a specific (sessionID, correlationID)
-// tuple that represents the outcome of a single in-flight request. Only one
-// awaiter may be registered per key at a time.
-//
-// Semantics:
-//   - Recv blocks until the request is fulfilled, canceled, or the context ends.
-//   - Cancel makes any current or future Recv return ErrAwaitCanceled.
-//   - Implementations MUST ensure BeginAwait happens-before a corresponding send
-//     of the outbound request, so that a later Fulfill cannot race ahead.
+// tuple representing the outcome of a single in-flight request. At most one
+// awaiter may exist per key. It is concurrency-safe.
+//   - Recv blocks until fulfilled, canceled, or context done.
+//   - Cancel causes current/future Recv to return ErrAwaitCanceled.
+//   - Implementations must ensure BeginAwait happens-before outbound send.
 type Awaiter interface {
 	Recv(ctx context.Context) ([]byte, error)
 	Cancel(ctx context.Context) error
@@ -35,11 +33,14 @@ var (
 	ErrAwaitCanceled = errors.New("await canceled")
 )
 
+// SessionManager creates, loads, and deletes MCP sessions, optionally issuing
+// signed session IDs and tracking revocation epochs.
 type SessionManager struct {
 	backend       sessions.SessionHost
 	jws           JWSSignerVerifier // optional; if nil, fall back to opaque UUID session IDs
 	revocationTTL time.Duration     // TTL for precise per-session revocation entries
 	issuer        string            // optional issuer binding for signed session IDs
+	logger        *slog.Logger
 }
 
 // ManagerOption configures optional behavior of the session manager.
@@ -60,10 +61,12 @@ func WithIssuer(issuer string) ManagerOption {
 	return func(sm *SessionManager) { sm.issuer = issuer }
 }
 
+// NewManager constructs a SessionManager with sensible defaults.
 func NewManager(backend sessions.SessionHost, opts ...ManagerOption) *SessionManager {
 	sm := &SessionManager{
 		backend:       backend,
 		revocationTTL: 24 * time.Hour,
+		logger:        slog.Default(),
 	}
 	for _, o := range opts {
 		o(sm)
@@ -74,20 +77,24 @@ func NewManager(backend sessions.SessionHost, opts ...ManagerOption) *SessionMan
 // SessionOption is a functional option for configuring a session created
 // by the SessionManager. These options can be used to enable or disable
 // specific capabilities for the session.
+// SessionOption mutates a SessionHandle during creation.
 type SessionOption func(*SessionHandle)
 
+// WithSamplingCapability enables sampling capability on the session.
 func WithSamplingCapability() SessionOption {
 	return func(s *SessionHandle) {
 		s.sampling = &samplingCapabilityImpl{sess: s}
 	}
 }
 
+// WithRootsCapability enables roots capability; optionally supports listChanged notifications.
 func WithRootsCapability(supportsListChanged bool) SessionOption {
 	return func(s *SessionHandle) {
 		s.roots = &rootsCapabilityImpl{sess: s, supportsListChanged: supportsListChanged}
 	}
 }
 
+// WithElicitationCapability enables the elicitation capability.
 func WithElicitationCapability() SessionOption {
 	return func(s *SessionHandle) {
 		s.elicitation = &elicitationCapabilityImpl{sess: s}
@@ -95,12 +102,14 @@ func WithElicitationCapability() SessionOption {
 }
 
 // WithProtocolVersion stores the negotiated protocol version on the session handle.
+// WithProtocolVersion stores the negotiated protocol version on the session handle.
 func WithProtocolVersion(version string) SessionOption {
 	return func(s *SessionHandle) {
 		s.protocolVersion = version
 	}
 }
 
+// CreateSession allocates a new session for the given user.
 func (sm *SessionManager) CreateSession(ctx context.Context, userID string, opts ...SessionOption) (*SessionHandle, error) {
 	// Snapshot current epoch if available for embed
 	var epoch int64
@@ -121,6 +130,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID string, opts
 	return session, nil
 }
 
+// LoadSession validates and parses a supplied session ID, returning a handle.
 func (sm *SessionManager) LoadSession(ctx context.Context, sessID string, userID string) (*SessionHandle, error) {
 	// If the caller canceled the context, treat this as a failure immediately.
 	if err := ctx.Err(); err != nil {
@@ -186,6 +196,12 @@ func (sm *SessionManager) DeleteSession(ctx context.Context, sessID string) erro
 	// Optional: bump user epoch if the token is signed and reveals the user.
 	if tok, isSigned, err := sm.parseSessionID(sessID); err == nil && isSigned && sm.backend != nil {
 		if _, err := sm.backend.BumpEpoch(ctx, sessions.RevocationScope{UserID: tok.UserID}); err != nil && err != sessions.ErrRevocationUnsupported {
+			sm.logger.Warn("failed to bump epoch during session delete",
+				slog.String("session_id", sessID),
+				slog.String("user_id", tok.UserID),
+				slog.String("error", err.Error()),
+			)
+			// Log and continue; this is non-fatal
 			// Non-fatal; continue cleanup even if epoch bump fails
 		}
 	}

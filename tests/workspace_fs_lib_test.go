@@ -17,7 +17,7 @@ func TestLib_WorkspaceFS_ListAndTools(t *testing.T) {
 	dir := t.TempDir()
 
 	// Seed a file
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 

@@ -5,10 +5,13 @@ import (
 	"fmt"
 )
 
+// ProtocolVersion is the supported JSON-RPC protocol version.
 const ProtocolVersion = "2.0"
 
+// Message is the raw JSON representation of a JSON-RPC message.
 type Message []byte
 
+// AnyMessage is a generic JSON-RPC message (request, notification, or response).
 type AnyMessage struct {
 	JSONRPCVersion string          `json:"jsonrpc"`
 	Method         string          `json:"method,omitempty"`
@@ -18,6 +21,7 @@ type AnyMessage struct {
 	ID             *RequestID      `json:"id,omitempty"`
 }
 
+// Request represents a JSON-RPC request (with an ID) or notification (without ID).
 type Request struct {
 	JSONRPCVersion string          `json:"jsonrpc"`
 	Method         string          `json:"method"`
@@ -25,6 +29,7 @@ type Request struct {
 	ID             *RequestID      `json:"id,omitempty"`
 }
 
+// Response represents a JSON-RPC response.
 type Response struct {
 	JSONRPCVersion string          `json:"jsonrpc"`
 	Result         json.RawMessage `json:"result,omitempty"`
@@ -32,6 +37,7 @@ type Response struct {
 	ID             *RequestID      `json:"id,omitempty"`
 }
 
+// NewResultResponse builds a successful JSON-RPC response object.
 func NewResultResponse(id *RequestID, result any) (*Response, error) {
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
@@ -45,6 +51,7 @@ func NewResultResponse(id *RequestID, result any) (*Response, error) {
 	}, nil
 }
 
+// NewErrorResponse builds an error JSON-RPC response with the given code.
 func NewErrorResponse(id *RequestID, code ErrorCode, message string, data any) *Response {
 	return &Response{
 		JSONRPCVersion: ProtocolVersion,
@@ -57,6 +64,7 @@ func NewErrorResponse(id *RequestID, code ErrorCode, message string, data any) *
 	}
 }
 
+// Error is a JSON-RPC error object.
 type Error struct {
 	Code    ErrorCode `json:"code"`
 	Message string    `json:"message"`

@@ -1,0 +1,16 @@
+version: "2"
+linters:
+  default: "standard"
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - funlen
+          - gocyclo
+          - errcheck
+        path: _test\.go
+      - linters:
+          - funlen
+          - gocyclo
+          - errcheck
+        path: examples\/

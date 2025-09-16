@@ -159,7 +159,7 @@ func New(root string) mcpserver.ServerCapabilities {
 			return mcpserver.Errorf("access denied: %v", err), nil
 		}
 		if a.CreateDirs {
-			if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
 				return nil, err
 			}
 		}
@@ -198,7 +198,7 @@ func New(root string) mcpserver.ServerCapabilities {
 		if err := ensureInsideRoot(abs); err != nil {
 			return mcpserver.Errorf("access denied: %v", err), nil
 		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
 			return nil, err
 		}
 		f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -242,7 +242,7 @@ func New(root string) mcpserver.ServerCapabilities {
 		if err := ensureInsideRoot(toAbs); err != nil {
 			return mcpserver.Errorf("access denied: %v", err), nil
 		}
-		if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(toAbs), 0o750); err != nil {
 			return nil, err
 		}
 		if err := os.Rename(fromAbs, toAbs); err != nil {

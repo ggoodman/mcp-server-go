@@ -30,7 +30,9 @@ type server struct {
 	toolsProvider  func(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error)
 }
 
-// NewServer builds a ServerCapabilities using functional options.
+// NewServer builds a ServerCapabilities using functional options. Options allow
+// configuring static fields or per-session providers for info, protocol
+// preference, instructions, resources and tools.
 func NewServer(opts ...ServerOption) ServerCapabilities {
 	s := &server{}
 	for _, opt := range opts {

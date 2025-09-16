@@ -26,10 +26,10 @@ func (s fakeSession) GetElicitationCapability() (cap sessions.ElicitationCapabil
 func writeFile(t *testing.T, dir, rel, content string) string {
 	t.Helper()
 	p := filepath.Join(dir, rel)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	return p
@@ -107,7 +107,7 @@ func TestFSResources_SubscribeAndDebouncedUpdate(t *testing.T) {
 
 	// Trigger several quick updates within one debounce window
 	for i := 0; i < 3; i++ {
-		if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("v2"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("v2"), 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		// small sleep to ensure modtime changes but within debounce interval

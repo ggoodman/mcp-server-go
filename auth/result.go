@@ -5,11 +5,14 @@ import (
 	"net/http"
 )
 
+// AuthenticationResult represents the outcome of an authentication attempt.
+// Success implementations return non-nil user info; failure variants expose a challenge.
 type AuthenticationResult interface {
 	UserInfo() (UserInfo, error)
 	GetAuthenticationChallenge() *AuthenticationChallenge
 }
 
+// AuthenticationChallenge describes an HTTP challenge (status + WWW-Authenticate header).
 type AuthenticationChallenge struct {
 	Status          int
 	WWWAuthenticate string
@@ -24,6 +27,7 @@ type authenticationFailure struct {
 	err       error
 }
 
+// NewAuthenticationRequired builds a challenge indicating credentials are required.
 func NewAuthenticationRequired(resourceMetadataURL string) *authenticationFailure {
 	return &authenticationFailure{
 		challenge: &AuthenticationChallenge{
@@ -34,6 +38,7 @@ func NewAuthenticationRequired(resourceMetadataURL string) *authenticationFailur
 	}
 }
 
+// NewInvalidAuthorizationHeader builds a challenge for a malformed Authorization header.
 func NewInvalidAuthorizationHeader(realm string) *authenticationFailure {
 	return &authenticationFailure{
 		challenge: &AuthenticationChallenge{
@@ -43,6 +48,7 @@ func NewInvalidAuthorizationHeader(realm string) *authenticationFailure {
 	}
 }
 
+// NewInvalidTokenResult builds a challenge indicating the token is invalid.
 func NewInvalidTokenResult(realm string, description string) *authenticationFailure {
 	return &authenticationFailure{
 		challenge: &AuthenticationChallenge{
@@ -52,6 +58,7 @@ func NewInvalidTokenResult(realm string, description string) *authenticationFail
 	}
 }
 
+// NewInsufficientScopeResult builds a challenge indicating missing required scope.
 func NewInsufficientScopeResult(realm string, scope string) *authenticationFailure {
 	return &authenticationFailure{
 		challenge: &AuthenticationChallenge{
