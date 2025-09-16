@@ -29,7 +29,7 @@ type ClientInfo struct {
 	Version string
 }
 
-// SamplingCapability, when present on a session, enables the sampling surface area.
+// SamplingCapability when present on a session, enables the sampling surface area.
 type SamplingCapability interface {
 	CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error)
 }
@@ -37,14 +37,14 @@ type SamplingCapability interface {
 // RootsListChangedListener is invoked when the set of workspace roots changes.
 type RootsListChangedListener func(ctx context.Context) error
 
-// RootsCapability, when present, exposes workspace roots and change notifications.
+// RootsCapability when present, exposes workspace roots and change notifications.
 type RootsCapability interface {
 	ListRoots(ctx context.Context) (*mcp.ListRootsResult, error)
 
 	RegisterRootsListChangedListener(ctx context.Context, listener RootsListChangedListener) (supported bool, err error)
 }
 
-// ElicitationCapability, when present, exposes the elicitation API for gathering
+// ElicitationCapability when present, exposes the elicitation API for gathering
 // structured inputs from the client.
 type ElicitationCapability interface {
 	Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error)

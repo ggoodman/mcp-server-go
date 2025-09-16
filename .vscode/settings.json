@@ -1,3 +1,4 @@
 {
-  "editor.tabSize": 4
+  "editor.tabSize": 4,
+  "go.lintTool": "golangci-lint-v2"
 }

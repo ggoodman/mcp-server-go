@@ -19,7 +19,6 @@ type mockOIDC struct {
 	srv       *httptest.Server
 	issuer    string
 	jwksPath  string
-	keysJSON  []byte
 	metaExtra map[string]any
 }
 

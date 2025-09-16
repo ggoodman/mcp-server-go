@@ -221,7 +221,9 @@ func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, han
 	}
 	// Consume messages
 	go func() {
-		defer sub.Close()
+		defer func() {
+			_ = sub.Close()
+		}()
 		ch := sub.Channel()
 		for {
 			select {

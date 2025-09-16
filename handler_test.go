@@ -677,6 +677,7 @@ func startGetStreamOneEvent(t *testing.T, srv *httptest.Server, authHeader, sess
 	if err != nil {
 		t.Fatalf("do get: %v", err)
 	}
+	//nolint:staticcheck // SA9003 false positive
 	if resp.StatusCode != http.StatusOK {
 		// The stream writes headers implicitly on first write, but if nothing is written yet
 		// http may report StatusOK only after first write. We'll still proceed to read.

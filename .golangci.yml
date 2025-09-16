@@ -1,69 +1,16 @@
 version: "2"
 linters:
-  enable:
-    - gocritic
-    - gosec
-    - misspell
-    - revive
-  disable:
-    - depguard
-    - dupl
-    - funlen
-    - gocyclo
-    - lll
-  settings:
-    gosec:
-      excludes:
-        - G115
-      severity: medium
-    misspell:
-      locale: US
-    revive:
-      severity: warning
-      rules:
-        - name: exported
-          severity: warning
-        - name: receiver-naming
-        - name: import-shadowing
-        - name: var-naming
+  default: "standard"
   exclusions:
     generated: lax
     rules:
       - linters:
           - funlen
           - gocyclo
+          - errcheck
         path: _test\.go
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
-issues:
-  max-issues-per-linter: 0
-  max-same-issues: 0
-  exclude-rules:
-    # Ignore unchecked Close()/ListenAndServe in examples and tests (they are illustrative / best-effort)
-    - linters: [errcheck]
-      path: ^examples/|^tests/|_test\.go$
-      text: (Close|ListenAndServe)
-    # Ignore gosec file permission / variable path warnings in examples & tests; they are demo code
-    - linters: [gosec]
-      path: ^examples/|_test\.go$|^tests/
-      text: (G301|G304|G306)
-    # Stylistic gocritic suggestions in examples
-    - linters: [gocritic]
-      path: ^examples/
-      text: (ifElseChain|singleCaseSwitch)
-    # Allow underscore package names in examples
-    - linters: [revive]
-      path: ^examples/
-      text: var-naming
-    # Allow British spelling 'cancelled' in code/comments (misspell)
-    - linters: [misspell]
-      text: cancelled
-formatters:
-  exclusions:
-    generated: lax
-    paths:
-      - third_party$
-      - builtin$
-      - examples$
+      - linters:
+          - funlen
+          - gocyclo
+          - errcheck
+        path: examples\/

@@ -26,7 +26,7 @@ func TestExamples_WorkspaceFS_E2E(t *testing.T) {
 	ctx := t.Context()
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 

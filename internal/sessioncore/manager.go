@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -39,6 +40,7 @@ type SessionManager struct {
 	jws           JWSSignerVerifier // optional; if nil, fall back to opaque UUID session IDs
 	revocationTTL time.Duration     // TTL for precise per-session revocation entries
 	issuer        string            // optional issuer binding for signed session IDs
+	logger        *slog.Logger
 }
 
 // ManagerOption configures optional behavior of the session manager.
@@ -64,6 +66,7 @@ func NewManager(backend sessions.SessionHost, opts ...ManagerOption) *SessionMan
 	sm := &SessionManager{
 		backend:       backend,
 		revocationTTL: 24 * time.Hour,
+		logger:        slog.Default(),
 	}
 	for _, o := range opts {
 		o(sm)
@@ -193,6 +196,12 @@ func (sm *SessionManager) DeleteSession(ctx context.Context, sessID string) erro
 	// Optional: bump user epoch if the token is signed and reveals the user.
 	if tok, isSigned, err := sm.parseSessionID(sessID); err == nil && isSigned && sm.backend != nil {
 		if _, err := sm.backend.BumpEpoch(ctx, sessions.RevocationScope{UserID: tok.UserID}); err != nil && err != sessions.ErrRevocationUnsupported {
+			sm.logger.Warn("failed to bump epoch during session delete",
+				slog.String("session_id", sessID),
+				slog.String("user_id", tok.UserID),
+				slog.String("error", err.Error()),
+			)
+			// Log and continue; this is non-fatal
 			// Non-fatal; continue cleanup even if epoch bump fails
 		}
 	}
