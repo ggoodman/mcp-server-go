@@ -49,6 +49,8 @@ type subscription struct {
 	errCh    chan error
 	msgCh    chan message
 	sd       *sessionData
+	// ensure stop is executed only once
+	stopOnce sync.Once
 }
 
 func New() *Host {
@@ -265,14 +267,12 @@ func (h *Host) ensureSession(sessionID string) *sessionData {
 }
 
 func (s *subscription) stop() {
-	s.sd.mu.Lock()
-	delete(s.sd.subscribers, s)
-	s.sd.mu.Unlock()
-	select {
-	case <-s.stopCh:
-	default:
+	s.stopOnce.Do(func() {
+		s.sd.mu.Lock()
+		delete(s.sd.subscribers, s)
+		s.sd.mu.Unlock()
 		close(s.stopCh)
-	}
+	})
 }
 
 func scopeKey(s sessions.RevocationScope) string {
@@ -288,19 +288,19 @@ type eventSub struct {
 	stopCh  chan struct{}
 	sd      *sessionData
 	topic   string
+	// ensure stop is executed only once
+	stopOnce sync.Once
 }
 
 func (e *eventSub) stop() {
-	e.sd.mu.Lock()
-	if set, ok := e.sd.eventSubs[e.topic]; ok {
-		delete(set, e)
-	}
-	e.sd.mu.Unlock()
-	select {
-	case <-e.stopCh:
-	default:
+	e.stopOnce.Do(func() {
+		e.sd.mu.Lock()
+		if set, ok := e.sd.eventSubs[e.topic]; ok {
+			delete(set, e)
+		}
+		e.sd.mu.Unlock()
 		close(e.stopCh)
-	}
+	})
 }
 
 func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
