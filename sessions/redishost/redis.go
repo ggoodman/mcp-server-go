@@ -6,18 +6,8 @@ import (
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/sessions"
-	"github.com/joeshaw/envdecode"
 	"github.com/redis/go-redis/v9"
 )
-
-// Config for Redis-backed SessionHost. Defaults can be loaded via envdecode.
-// See struct tags for environment variable names and defaults.
-type Config struct {
-	// RedisAddr like "localhost:6379". ENV: REDIS_ADDR
-	RedisAddr string `env:"REDIS_ADDR,default=localhost:6379"`
-	// KeyPrefix for all keys. ENV: SESSIONS_KEY_PREFIX
-	KeyPrefix string `env:"SESSIONS_KEY_PREFIX,default=mcp:sessions:"`
-}
 
 // Host is a Redis-backed implementation of sessions.SessionHost using
 // Redis Streams for ordered messaging and Pub/Sub for events.
@@ -26,30 +16,33 @@ type Host struct {
 	keyPrefix string
 }
 
-// New constructs a Host from the provided Config and verifies connectivity.
-func New(cfg Config) (*Host, error) {
-	addr := cfg.RedisAddr
-	if addr == "" {
-		// Allow default via envdecode-style tag fallback for external consumers
-		addr = "localhost:6379"
+// Option configures the Redis-backed host.
+type Option func(*Host)
+
+// WithKeyPrefix sets the key prefix for all Redis keys used by the host.
+func WithKeyPrefix(prefix string) Option {
+	return func(h *Host) {
+		if prefix != "" {
+			h.keyPrefix = prefix
+		}
 	}
-	cl := redis.NewClient(&redis.Options{Addr: addr})
+}
+
+// New constructs a Host connecting to the provided Redis address (e.g. "localhost:6379").
+// Options can configure behavior such as key prefix. The connection is verified via PING.
+func New(redisAddr string, opts ...Option) (*Host, error) {
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	cl := redis.NewClient(&redis.Options{Addr: redisAddr})
 	if err := cl.Ping(context.Background()).Err(); err != nil {
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
-	prefix := cfg.KeyPrefix
-	if prefix == "" {
-		prefix = "mcp:sessions:"
+	h := &Host{client: cl, keyPrefix: "mcp:sessions:"}
+	for _, opt := range opts {
+		opt(h)
 	}
-	return &Host{client: cl, keyPrefix: prefix}, nil
-}
-
-// NewFromEnv builds a Host using envdecode to populate Config.
-func NewFromEnv() (*Host, error) {
-	var cfg Config
-	// Use envdecode; defaults are provided via struct tags.
-	_ = envdecode.Decode(&cfg)
-	return New(cfg)
+	return h, nil
 }
 
 // Close closes the underlying Redis client.
