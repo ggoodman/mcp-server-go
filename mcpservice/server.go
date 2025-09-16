@@ -28,6 +28,10 @@ type server struct {
 	// tools capability
 	staticToolsCap ToolsCapability
 	toolsProvider  func(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error)
+
+	// prompts capability
+	staticPromptsCap PromptsCapability
+	promptsProvider  func(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error)
 }
 
 // NewServer builds a ServerCapabilities using functional options. Options allow
@@ -101,6 +105,21 @@ func WithToolsProvider(fn func(ctx context.Context, session sessions.Session) (T
 	return func(s *server) { s.toolsProvider = fn }
 }
 
+// WithPromptsCapability wires a static PromptsCapability (used for all sessions).
+func WithPromptsCapability(cap PromptsCapability) ServerOption {
+	return func(s *server) { s.staticPromptsCap = cap }
+}
+
+// WithPromptsOptions constructs a static PromptsCapability using NewPromptsCapability.
+func WithPromptsOptions(opts ...PromptsOption) ServerOption {
+	return func(s *server) { s.staticPromptsCap = NewPromptsCapability(opts...) }
+}
+
+// WithPromptsProvider wires a per-session prompts capability provider.
+func WithPromptsProvider(fn func(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error)) ServerOption {
+	return func(s *server) { s.promptsProvider = fn }
+}
+
 // GetServerInfo implements ServerCapabilities.
 func (s *server) GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error) {
 	if s.infoProvider != nil {
@@ -153,6 +172,17 @@ func (s *server) GetToolsCapability(ctx context.Context, session sessions.Sessio
 	}
 	if s.staticToolsCap != nil {
 		return s.staticToolsCap, true, nil
+	}
+	return nil, false, nil
+}
+
+// GetPromptsCapability implements ServerCapabilities.
+func (s *server) GetPromptsCapability(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error) {
+	if s.promptsProvider != nil {
+		return s.promptsProvider(ctx, session)
+	}
+	if s.staticPromptsCap != nil {
+		return s.staticPromptsCap, true, nil
 	}
 	return nil, false, nil
 }

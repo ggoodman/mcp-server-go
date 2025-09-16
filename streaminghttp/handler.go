@@ -675,6 +675,26 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 	defer unsubUpdated()
 
+	// Also subscribe for prompts list_changed to forward to the client
+	const promptsListChangedTopic = string(mcp.PromptsListChangedNotificationMethod)
+	unsubPrompts, subPromptsErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+		n := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.PromptsListChangedNotificationMethod),
+			Params:         nil,
+		}
+		b, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		return sh.WriteMessage(evtCtx, b)
+	})
+	if subPromptsErr != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer unsubPrompts()
+
 	// Discover resources capability and (optionally) listChanged capability
 	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, sh.Session()); err == nil && ok {
 		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {
@@ -682,6 +702,15 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 			_, _ = lc.Register(ctx, sh.Session(), func(cbCtx context.Context, sess sessions.Session, _ string) {
 				// best-effort publish to internal topic; no payload required
 				_ = h.sessionHost.PublishEvent(cbCtx, sess.SessionID(), resourcesListChangedTopic, nil)
+			})
+		}
+	}
+
+	// Bridge prompts/list_changed notifications via the internal bus as well.
+	if promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, sh.Session()); err == nil && ok {
+		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {
+			_, _ = lc.Register(ctx, sh.Session(), func(cbCtx context.Context, sess sessions.Session) {
+				_ = h.sessionHost.PublishEvent(cbCtx, sess.SessionID(), promptsListChangedTopic, nil)
 			})
 		}
 	}
@@ -918,6 +947,24 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 			ListChanged bool "json:\"listChanged\""
 		}{
 			ListChanged: hasToolsListChanged,
+		}
+	}
+
+	// Discover prompts capability and (optionally) listChanged capability
+	if promptsCap, hasPromptsCap, err := h.mcp.GetPromptsCapability(ctx, session.Session()); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get prompts capability: %w", err)
+	} else if hasPromptsCap {
+		_, hasPromptsListChanged, err := promptsCap.GetListChangedCapability(ctx, session.Session())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return fmt.Errorf("failed to get prompts listChanged capability: %w", err)
+		}
+
+		initializeRes.Capabilities.Prompts = &struct {
+			ListChanged bool "json:\"listChanged\""
+		}{
+			ListChanged: hasPromptsListChanged,
 		}
 	}
 
@@ -1197,47 +1244,62 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-		// case string(mcp.PromptsListMethod):
-		// 	promptsCap := h.hooks.GetPromptsCapability()
+	case string(mcp.PromptsListMethod):
+		promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || promptsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+		}
 
-		// 	if promptsCap == nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
-		// 	}
+		var listPromptsReq mcp.ListPromptsRequest
+		if err := json.Unmarshal(req.Params, &listPromptsReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
 
-		// 	var listPromptsReq mcp.ListPromptsRequest
-		// 	if err := json.Unmarshal(req.Params, &listPromptsReq); err != nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		// 	}
+		page, err := promptsCap.ListPrompts(ctx, session, func() *string {
+			if listPromptsReq.Cursor == "" {
+				return nil
+			}
+			s := listPromptsReq.Cursor
+			return &s
+		}())
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
 
-		// 	prompts, nextCursor, err := promptsCap.ListPrompts(ctx, session, listPromptsReq.Cursor)
-		// 	if err != nil {
-		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		// 	}
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
+			Prompts: page.Items,
+			PaginatedResult: mcp.PaginatedResult{
+				NextCursor: func() string {
+					if page.NextCursor == nil {
+						return ""
+					}
+					return *page.NextCursor
+				}(),
+			},
+		})
+	case string(mcp.PromptsGetMethod):
+		promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || promptsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+		}
 
-		// 	return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
-		// 		Prompts: prompts,
-		// 		PaginatedResult: mcp.PaginatedResult{
-		// 			NextCursor: nextCursor,
-		// 		},
-		// 	})
-		// case string(mcp.PromptsGetMethod):
-		// 	promptsCap := h.hooks.GetPromptsCapability()
+		var getPromptReq mcp.GetPromptRequestReceived
+		if err := json.Unmarshal(req.Params, &getPromptReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
 
-		// 	if promptsCap == nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
-		// 	}
+		result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
 
-		// 	var getPromptReq mcp.GetPromptRequestReceived
-		// 	if err := json.Unmarshal(req.Params, &getPromptReq); err != nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		// 	}
-
-		// 	result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
-		// 	if err != nil {
-		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		// 	}
-
-		// 	return jsonrpc.NewResultResponse(req.ID, result)
+		return jsonrpc.NewResultResponse(req.ID, result)
 		// case string(mcp.LoggingSetLevelMethod):
 		// 	loggingCap := h.hooks.GetLoggingCapability()
 
