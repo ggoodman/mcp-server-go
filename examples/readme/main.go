@@ -41,7 +41,7 @@ func main() {
 	ctx := context.Background()
 
 	// 1) Session host for horizontal scale (Redis)
-	host, err := redishost.NewFromEnv()
+	host, err := redishost.New(envOr("REDIS_ADDR", "127.0.0.1:6379"))
 	if err != nil {
 		panic(err)
 	}

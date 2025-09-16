@@ -1,256 +1,245 @@
 # MCP Streaming HTTP for Go
 
-A drop-in `http.Handler` that implements the Model Context Protocol (MCP) streaming HTTP transport. Mount it in front of your server to get an HTTP/SSE interface that works in single-instance and horizontally scaled deployments.
+Drop-in `http.Handler` for the Model Context Protocol (MCP) Streaming HTTP transport — production-minded, horizontally scalable, and designed for both simple and complex servers.
+
+- Implements the MCP streaming HTTP transport with Server-Sent Events (SSE)
+- First-class authorization and session lifecycle handling
+- Horizontal scale via a pluggable session host (memory or Redis)
+- Static and dynamic capabilities for tools and resources
+
+## Why this library
+
+1. Horizontal scalability
+
+- Multiple instances can serve the same MCP endpoint and coordinate safely.
+- Per-session ordered messaging with resume using `Last-Event-ID`.
+- Pluggable cross-instance coordination via `sessions.SessionHost`.
+  - In-memory host for single-process or tests: `sessions/memoryhost`.
+  - Redis-backed host for multi-instance deployments: `sessions/redishost`.
+
+2. Authorization and session management
+
+- Treats auth and sessions as first-class production concerns.
+- Out-of-the-box JWT access-token validation (RFC 9068) via OIDC discovery.
+- Protected Resource Metadata and Authorization Server Metadata endpoints are served for discovery. See `/.well-known/oauth-protected-resource/` and `/.well-known/oauth-authorization-server`.
+- Clean, minimal `auth.Authenticator` interface if you need custom logic.
+
+3. Dynamic capabilities
+
+- Don’t assume your resources or tools are static. Implement dynamic listings and behaviors that pull from databases, APIs, or filesystems.
+- Prefer static containers when that’s simpler — you still get listChanged notifications and strict input schemas.
+- Swap static for dynamic later without rewriting your server.
+
+4. Easy adoption, long-term power
+
+- Layered API: start with the drop-in handler, grow into custom capabilities.
+- Pragmatic defaults; minimal opinions. Security and isolation are non-negotiable.
+- Designed around the hard cases first so simple cases stay simple.
 
 ## Install
 
-Go modules:
-
-```
+```bash
 go get github.com/ggoodman/mcp-server-go
 ```
 
-## Quick start
+## Quick start (prod-friendly with OIDC)
 
-Build a server with typed tools and Redis-backed sessions, using OIDC discovery and JWT access token auth:
+This minimal server exposes a typed tool, validates bearer tokens discovered from your issuer, and is horizontally scalable with Redis.
 
 ```go
 package main
 
 import (
-	"context"
-	"log/slog"
-	"net/http"
-	"os"
-	"time"
+    "context"
+    "log/slog"
+    "net/http"
+    "os"
+    "time"
 
-	"github.com/ggoodman/mcp-server-go/auth"
-	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpservice"
-	"github.com/ggoodman/mcp-server-go/sessions"
-	"github.com/ggoodman/mcp-server-go/sessions/redishost"
-	"github.com/ggoodman/mcp-server-go/streaminghttp"
-)
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-var (
-	// MCP_PUBLIC_ENDPOINT should be the externally visible base URL of your server
-	// (used as the expected audience for access tokens). Example: https://mcp.example.com
-	publicEndpoint = envOr("MCP_PUBLIC_ENDPOINT", "http://127.0.0.1:8080/mcp")
-
-	// OIDC_ISSUER should be your OAuth2/OIDC issuer URL. For local/dev, point this
-	// to a local IdP or mock OIDC provider if you have one running.
-	issuer = envOr("OIDC_ISSUER", "http://127.0.0.1:8081/")
+    "github.com/ggoodman/mcp-server-go/auth"
+    "github.com/ggoodman/mcp-server-go/mcp"
+    "github.com/ggoodman/mcp-server-go/mcpservice"
+    "github.com/ggoodman/mcp-server-go/sessions"
+    "github.com/ggoodman/mcp-server-go/sessions/redishost"
+    "github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
 type TranslateArgs struct {
-	Text string `json:"text" jsonschema:"minLength=1,description=Text to translate"`
-	To   string `json:"to"   jsonschema:"enum=en,enum=fr,enum=es,description=Target language (ISO 639-1)"`
+    Text string `json:"text" jsonschema:"minLength=1,description=Text to translate"`
+    To   string `json:"to"   jsonschema:"enum=en,enum=fr,enum=es,description=Target language (ISO 639-1)"`
 }
 
 func main() {
-	ctx := context.Background()
+    ctx := context.Background()
 
-	// 1) Session host for horizontal scale (Redis)
-	host, err := redishost.NewFromEnv()
-	if err != nil {
-		panic(err)
-	}
-	defer host.Close()
+    publicEndpoint := os.Getenv("MCP_PUBLIC_ENDPOINT") // e.g. https://mcp.example.com/mcp
+    issuer := os.Getenv("OIDC_ISSUER")                  // your OAuth/OIDC issuer URL
 
-	// 2) Tools (auto-derived JSON Schema; strict by default)
-	translate := mcpservice.NewTool[TranslateArgs](
-		"translate",
-		func(ctx context.Context, _ sessions.Session, args TranslateArgs) (*mcp.CallToolResult, error) {
-			return mcpservice.TextResult("Translated to " + args.To + ": " + args.Text), nil
-		},
-		mcpservice.WithToolDescription("Translate text to a target language."),
-		// mcpserver.WithToolAllowAdditionalProperties(true), // opt-in to unknown fields
-	)
-	tools := mcpservice.NewStaticTools(translate)
+    // 1) Session host for horizontal scale (Redis)
+    host, err := redishost.New(os.Getenv("REDIS_ADDR"))
+    if err != nil { panic(err) }
+    defer host.Close()
 
-	// 3) Server capabilities
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
-		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
-	)
+    // 2) Typed tool with strict input schema by default
+    translate := mcpservice.NewTool[TranslateArgs](
+        "translate",
+        func(ctx context.Context, _ sessions.Session, a TranslateArgs) (*mcp.CallToolResult, error) {
+            return mcpservice.TextResult("Translated to "+a.To+": "+a.Text), nil
+        },
+        mcpservice.WithToolDescription("Translate text to a target language."),
+    )
+    tools := mcpservice.NewStaticTools(translate)
 
-	// 4) Drop-in OAuth2/OIDC JWT access token auth (RFC 9068): discovery + JWKS
-	authenticator, err := auth.NewFromDiscovery(
-		ctx,
-		issuer,
-		auth.WithExpectedAudience(publicEndpoint),
-		auth.WithLeeway(2*time.Minute),
-		// auth.WithRequiredScopes("mcp:read","mcp:write"), // optional
-		// auth.WithAllowedAlgs("RS256","ES256"),          // optional
-	)
-	if err != nil {
-		panic(err)
-	}
+    // 3) Server capabilities
+    server := mcpservice.NewServer(
+        mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
+        mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
+    )
 
-	// 5) Build handler
-	h, err := streaminghttp.New(
-		ctx,
-		publicEndpoint, // externally visible URL
-		host,
-		server,
-		authenticator,
-		streaminghttp.WithServerName("My MCP Server"),
-		streaminghttp.WithLogger(slog.NewTextHandler(os.Stdout, nil)),
-		streaminghttp.WithAuthorizationServerDiscovery(issuer),
-	)
-	if err != nil {
-		panic(err)
-	}
+    // 4) OAuth2/OIDC JWT access token validation (RFC 9068)
+    authenticator, err := auth.NewFromDiscovery(
+        ctx,
+        issuer,
+        auth.WithExpectedAudience(publicEndpoint), // audience check (use your public MCP endpoint)
+        auth.WithLeeway(2*time.Minute),
+    )
+    if err != nil { panic(err) }
 
-	// 6) Serve
-	http.ListenAndServe("127.0.0.1:8080", h)
+    // 5) Drop-in handler
+    h, err := streaminghttp.New(
+        ctx,
+        publicEndpoint,
+        host,
+        server,
+        authenticator,
+        streaminghttp.WithServerName("My MCP Server"),
+        streaminghttp.WithLogger(slog.NewTextHandler(os.Stdout, nil)),
+        streaminghttp.WithAuthorizationServerDiscovery(issuer),
+    )
+    if err != nil { panic(err) }
+
+    // 6) Serve
+    http.ListenAndServe("127.0.0.1:8080", h)
 }
 ```
 
-### Typed tools in a nutshell
+See a runnable variant in `examples/readme/main.go`.
 
-- Define an args struct with `json` tags (and optional `jsonschema` tags for docs/enums).
-- Use `mcpserver.NewTool[T]` to create a tool descriptor and handler.
-- The library derives an MCP `inputSchema` from your struct and rejects unknown fields by default. Opt into leniency with `WithToolAllowAdditionalProperties(true)`.
+## Quick start (local dev, no IdP)
 
-## Manual authorization server configuration
-
-If discovery isn’t available, pass a single `ManualOIDC` struct:
+For quick experiments you can plug a minimal authenticator that accepts a fixed token. Do not use this in production.
 
 ```go
-h, err := streaminghttp.New(
-  ctx,
-  "https://api.example.com/mcp",
-  host,
-  server,
-  authenticator,
-  streaminghttp.WithServerName("Demo MCP"),
-  streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{
-    Issuer:  "https://issuer.example.com",
-    JwksURI: "https://issuer.example.com/.well-known/jwks.json",
-    ScopesSupported: []string{"mcp:read", "mcp:write"},
-    // Bearer tokens are presented via the Authorization header.
-    // PRM is constructed automatically; you usually don't need to tweak it.
-    ServiceDocumentation: "https://docs.example.com/mcp",
-    OpPolicyURI:          "https://example.com/policy",
-    OpTosURI:             "https://example.com/tos",
-  }),
-)
-```
+type staticTokenAuth struct{ token string }
 
-Note: `WithAuthorizationServerDiscovery(issuer)` consumes OAuth 2.0 Authorization Server Metadata (RFC 8414). Supplying an OIDC issuer URL works because the OIDC discovery document contains the same fields used here (e.g., `jwks_uri`, `scopes_supported`).
+type devUser struct{}
+func (devUser) UserID() string       { return "dev" }
+func (devUser) Claims(ref any) error { return nil }
 
-## Static resources with listChanged
-
-```go
-sr := mcpserver.NewStaticResources(nil, nil, nil)
-server := mcpserver.NewServer(
-  mcpserver.WithResourcesOptions(mcpserver.WithStaticResourceContainer(sr)),
-)
-// Mutations on sr trigger list_changed; the handler fans out via internal events.
-```
-
-## API shape
-
-```go
-// Typed tools
-func NewTool[A any](
-  name string,
-  fn func(ctx context.Context, session sessions.Session, args A) (*mcp.CallToolResult, error),
-  opts ...ToolOption,
-) mcpserver.StaticTool
-
-type ToolOption func(*toolConfig)
-func WithToolDescription(desc string) ToolOption
-func WithToolAllowAdditionalProperties(allow bool) ToolOption
-
-// Legacy helper retained for compatibility
-func TypedTool[A any](desc mcp.Tool, fn func(ctx context.Context, session sessions.Session, args A) (*mcp.CallToolResult, error)) mcpserver.StaticTool
-
-func New(
-  ctx context.Context,
-  publicEndpoint string,
-  host sessions.SessionHost,
-  server mcpserver.ServerCapabilities,
-  authenticator auth.Authenticator,
-  opts ...Option,
-) (*StreamingHTTPHandler, error)
-
-// Options
-func WithServerName(name string) Option
-func WithLogger(h slog.Handler) Option
-func WithAuthorizationServerDiscovery(authorizationServerURL string) Option
-func WithManualOIDC(cfg ManualOIDC) Option
-
-// ManualOIDC
-type ManualOIDC struct {
-  Issuer, JwksURI string
-  ScopesSupported []string
-  TokenEndpointAuthMethodsSupported []string
-  TokenEndpointAuthSigningAlgValuesSupported []string
-  ServiceDocumentation string
-  OpPolicyURI string
-  OpTosURI string
+func (a staticTokenAuth) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
+    if tok == "Bearer "+a.token || tok == a.token { // accept raw or header value
+        return devUser{}, nil
+    }
+    return nil, auth.ErrUnauthorized
 }
+
+// ... pass staticTokenAuth{token: "dev-token"} to streaminghttp.New(...)
+// Then call your server with Authorization: Bearer dev-token
 ```
 
-## Session isolation and lifecycle
+## Horizontal scale in one line (Redis)
 
-- Session binding: `MCP-Session-ID` is bound to the authenticated principal. All GET/POST/DELETE requests validate that the session belongs to the current user; mismatches return 404 without revealing existence. When JWS-signed session IDs are enabled, the token encodes user, issuer, epoch, and negotiated protocol version.
-- Initialization: Creating a session via `initialize` returns the session ID in the `MCP-Session-ID` response header, along with an SSE `response` event.
-- Protocol version: After initialization, requests must include `MCP-Protocol-Version` matching the negotiated version, otherwise the server returns 428 (missing) or 412 (mismatch).
-- Stream consumption: GET requires `MCP-Session-ID` and optionally `Last-Event-ID` to resume. If omitted, delivery starts from the next message.
-- Teardown and GC: DELETE revokes the session (precise revocation with a bounded TTL; default 24h), bumps per-user epoch when supported by the host, deletes host-side delivery artifacts, and tears down process-local forwarders. Sessions do not auto-expire by default.
+```go
+host, _ := redishost.New("127.0.0.1:6379", redishost.WithKeyPrefix("mcp:sessions:"))
+defer host.Close()
+```
 
-## Operational limits and tuning
+- Ordered per-session message delivery with resume from `Last-Event-ID`.
+- Cross-instance server-internal events for coordination when needed.
+- Epoch-based invalidation helpers and revocation markers.
 
-- Request and response formats:
-  - POST requires `Content-Type: application/json` and `Accept: text/event-stream`. Only single JSON-RPC messages are supported (no batching).
-  - GET streams events as SSE. Each event is flushed after write.
-- Sizes and backpressure:
-  - No library-enforced request body cap; enforce limits at your proxy (e.g., NGINX) or wrap with `http.MaxBytesReader` in your app.
-  - SSE uses flush-per-event. Slow clients will apply TCP backpressure; there’s no extra application buffer beyond the session host queue.
-- Persistence:
-  - Session message streams are retained until DELETE. If you do not DELETE, host-side streams may accumulate.
-- Timeouts and heartbeats:
-  - The handler doesn’t set custom read/write timeouts or heartbeats; rely on your server/proxy configuration. Consider enabling keep-alives and appropriate idle timeouts for SSE stability.
-- Recommendations:
-  - Always DELETE sessions when done to free resources.
-  - Track and send `Last-Event-ID` on reconnects to avoid gaps.
-  - Keep messages small and chunk large results.
+For single-process dev and tests, use the in-memory host:
 
-## Notes
+```go
+host := memoryhost.New()
+```
 
-- The handler registers path-first routes using `http.ServeMux` based on your `publicEndpoint` path. When mounting behind a proxy, ensure Host is preserved if you enable host matching.
-- PRM is served at `/.well-known/oauth-protected-resource{path}` under the same host.
-- For horizontal scale, use the Redis host in `sessions/redishost`.
-- Typed tools use `github.com/invopop/jsonschema` under the hood to derive schemas, and then down-convert to MCP's simplified `ToolInputSchema`.
+## Authorization and discovery
 
-## HTTP contract
+When you enable discovery with `WithAuthorizationServerDiscovery(issuer)`, the handler:
 
-- POST {publicPath}
+- Validates tokens using JWKS from your issuer (via `auth.NewFromDiscovery`).
+- Serves Protected Resource Metadata at `/.well-known/oauth-protected-resource/`.
+- Mirrors Authorization Server Metadata at `/.well-known/oauth-authorization-server`.
+- Responds to unauthorized requests with a standards-compliant `WWW-Authenticate` header that points at the resource metadata.
 
-  - Headers: `Authorization: Bearer <token>`, `Content-Type: application/json`, `Accept: text/event-stream`
-  - Body: single JSON-RPC message (no batching)
-  - If no `MCP-Session-ID` header, the message MUST be `initialize`; response is an SSE `response` event with `InitializeResult`.
-  - For requests with an ID, the response is an SSE `response` event.
+See the spec documents under `docs/` for details.
 
-- GET {publicPath}
+## Dynamic capabilities (and static containers)
 
-  - Headers: `Authorization: Bearer <token>`, `Accept: text/event-stream`, `MCP-Session-ID: <id>`, optional `Last-Event-ID`
-  - Stream: SSE events of type `request`, `notification`, and `response`.
+Prefer dynamic? Implement per-session providers and callbacks:
 
-- DELETE {publicPath}
+```go
+server := mcpservice.NewServer(
+    // Dynamic tools
+    mcpservice.WithToolsOptions(
+        mcpservice.WithListTools(func(ctx context.Context, s sessions.Session, cur *string) (mcpservice.Page[mcp.Tool], error) {
+            // e.g., query DB
+            return mcpservice.NewPage([]mcp.Tool{{Name: "dbTool", InputSchema: mcp.ToolInputSchema{Type: "object"}}}), nil
+        }),
+        mcpservice.WithCallTool(func(ctx context.Context, s sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+            // route to your backend services
+            return mcpservice.TextResult("ok"), nil
+        }),
+    ),
+    // Dynamic resources
+    mcpservice.WithResourcesOptions(
+        mcpservice.WithListResources(func(ctx context.Context, s sessions.Session, cur *string) (mcpservice.Page[mcp.Resource], error) {
+            return mcpservice.NewPage([]mcp.Resource{{URI: "res://1", Name: "R1"}}), nil
+        }),
+        mcpservice.WithReadResource(func(ctx context.Context, s sessions.Session, uri string) ([]mcp.ResourceContents, error) {
+            return []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "hello"}}, nil
+        }),
+    ),
+)
+```
 
-  - Headers: `Authorization: Bearer <token>`, `MCP-Session-ID: <id>`
-  - Result: 204 on success; cleans server- and process-local session resources.
+Prefer static? Use the containers and still get listChanged and subscriptions:
 
-- Protocol version
-  - Clients include `MCP-Protocol-Version: <version>` after `initialize` per spec; the server may enforce version matching.
+```go
+sr := mcpservice.NewStaticResources(nil, nil, nil)
+rc := mcpservice.NewResourcesCapability(
+    mcpservice.WithStaticResourceContainer(sr),
+)
+st := mcpservice.NewStaticTools(
+    mcpservice.NewTool[struct{ Name string `json:"name"` }]("hello", func(ctx context.Context, _ sessions.Session, a struct{ Name string }) (*mcp.CallToolResult, error) {
+        return mcpservice.TextResult("hi, "+a.Name), nil
+    }),
+)
+server := mcpservice.NewServer(
+    mcpservice.WithResourcesCapability(rc),
+    mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)),
+)
+```
+
+## Examples and tests
+
+- `examples/readme/` — end-to-end server that matches the Quick Start.
+- `examples/echo/` — a simple echo tool server.
+- `examples/resources_*` — static and filesystem-backed resources.
+- See `tests/` for protocol-level and e2e tests that exercise sessions, listChanged, and multi-instance delivery.
+
+## Compatibility
+
+- MCP spec revision targeted: see `docs/mcp.md` (streaming HTTP transport; JSON-RPC batching is intentionally not used).
+- Go version: see `go.mod` (currently `go 1.24`).
+
+## Security notes
+
+- Bearer token validation follows RFC 9068 with OIDC discovery (JWKS).
+- Unauthorized requests receive standards-compliant `WWW-Authenticate` with pointers for discovery.
+- The library is designed to avoid cross-user contamination across sessions and instances.
+
+## License
+
+MIT — see `LICENSE`.

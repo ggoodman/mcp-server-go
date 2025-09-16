@@ -4,10 +4,10 @@ The goal of this project is to provide a drop-in `http.Handler` for developers t
 
 This library MUST adhere to the following specs.
 
-- MCP Spec: `./docs/mcp.md`
+- MCP Spec: `./specs/mcp.md`
   - We are targeting the streaming http transport.
-- MCP Schema: `./docs/mcp-schema.ts`
-- JSON-RPC Spec: `./docs/json-rpc.html`
+- MCP Schema: `./specs/mcp-schema.ts`
+- JSON-RPC Spec: `./specs/json-rpc.html`
   - We do NOT leverage json-rpc batching. It is forbidden in the streaming http transport.
 
 ## Code style
