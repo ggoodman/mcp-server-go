@@ -6,10 +6,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/examples/echo"
 	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

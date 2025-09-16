@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/examples/workspace_fs"
 	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 

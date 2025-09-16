@@ -19,7 +19,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
 	"github.com/ggoodman/mcp-server-go/internal/wellknown"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
@@ -117,7 +117,7 @@ type StreamingHTTPHandler struct {
 	authServerMetadataURL *url.URL
 
 	auth        auth.Authenticator
-	mcp         mcpserver.ServerCapabilities
+	mcp         mcpservice.ServerCapabilities
 	sessions    *sessioncore.SessionManager
 	sessionHost sessions.SessionHost
 
@@ -202,7 +202,7 @@ func New(
 	ctx context.Context,
 	publicEndpoint string,
 	host sessions.SessionHost,
-	server mcpserver.ServerCapabilities,
+	server mcpservice.ServerCapabilities,
 	authenticator auth.Authenticator,
 	opts ...Option,
 ) (*StreamingHTTPHandler, error) {

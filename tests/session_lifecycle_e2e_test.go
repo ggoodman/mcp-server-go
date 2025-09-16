@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	streaminghttp "github.com/ggoodman/mcp-server-go"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcpserver"
+	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/memoryhost"
+	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
 type noAuthSL struct{}
@@ -33,7 +33,7 @@ func TestSessionLifecycle_GetStreamBoundToRequest(t *testing.T) {
 	mh := memoryhost.New()
 
 	// Minimal server with no special capabilities required for lifecycle check
-	srvCaps := mcpserver.NewServer()
+	srvCaps := mcpservice.NewServer()
 
 	var handler http.Handler
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
@@ -125,11 +125,11 @@ func TestSessionLifecycle_PostBoundToRequest_WriteFallback(t *testing.T) {
 	ctx := t.Context()
 
 	mh := memoryhost.New()
-	srvCaps := mcpserver.NewServer(
+	srvCaps := mcpservice.NewServer(
 		// Provide a trivial resources capability so we can make a small request
-		mcpserver.WithResourcesOptions(
-			mcpserver.WithListResources(func(ctx context.Context, s sessions.Session, c *string) (mcpserver.Page[mcp.Resource], error) {
-				return mcpserver.NewPage([]mcp.Resource{}), nil
+		mcpservice.WithResourcesOptions(
+			mcpservice.WithListResources(func(ctx context.Context, s sessions.Session, c *string) (mcpservice.Page[mcp.Resource], error) {
+				return mcpservice.NewPage([]mcp.Resource{}), nil
 			}),
 		),
 	)

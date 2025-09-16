@@ -1,4 +1,4 @@
-package mcpserver
+package mcpservice
 
 // Page represents a single page of results with an optional cursor for fetching
 // the next page. It is a generic helper intended for server capability methods
