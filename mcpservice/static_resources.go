@@ -26,6 +26,11 @@ type StaticResources struct {
 
 	// notifier emits a signal when the resource list (or templates) changes.
 	notifier ChangeNotifier
+
+	// updatedNotifiers contains per-URI notifiers that tick when contents for a
+	// URI are updated. This is used for bridging notifications/resources/updated
+	// in transports that support subscriptions.
+	updatedNotifiers map[string]*ChangeNotifier
 }
 
 // NewStaticResources constructs a StaticResources container with initial
@@ -33,10 +38,11 @@ type StaticResources struct {
 // retain ownership of their inputs.
 func NewStaticResources(resources []mcp.Resource, templates []mcp.ResourceTemplate, contents map[string][]mcp.ResourceContents) *StaticResources {
 	sr := &StaticResources{
-		contents:      make(map[string][]mcp.ResourceContents),
-		uriSet:        make(map[string]struct{}),
-		subsByURI:     make(map[string]map[string]struct{}),
-		subsBySession: make(map[string]map[string]struct{}),
+		contents:         make(map[string][]mcp.ResourceContents),
+		uriSet:           make(map[string]struct{}),
+		subsByURI:        make(map[string]map[string]struct{}),
+		subsBySession:    make(map[string]map[string]struct{}),
+		updatedNotifiers: make(map[string]*ChangeNotifier),
 	}
 	sr.ReplaceResources(context.Background(), resources)
 	sr.ReplaceTemplates(context.Background(), templates)
@@ -129,9 +135,12 @@ func (sr *StaticResources) ReplaceTemplates(_ context.Context, templates []mcp.R
 // ReplaceAllContents atomically replaces contents.
 func (sr *StaticResources) ReplaceAllContents(_ context.Context, contents map[string][]mcp.ResourceContents) {
 	sr.mu.Lock()
-	defer sr.mu.Unlock()
+	// Track which URIs were updated so we can signal after releasing the lock.
+	var updatedURIs []string
 	if contents == nil {
 		sr.contents = make(map[string][]mcp.ResourceContents)
+		// Nothing to signal
+		sr.mu.Unlock()
 		return
 	}
 	sr.contents = make(map[string][]mcp.ResourceContents, len(contents))
@@ -139,6 +148,12 @@ func (sr *StaticResources) ReplaceAllContents(_ context.Context, contents map[st
 		vv := make([]mcp.ResourceContents, len(v))
 		copy(vv, v)
 		sr.contents[k] = vv
+		updatedURIs = append(updatedURIs, k)
+	}
+	sr.mu.Unlock()
+	// Best-effort: notify per-URI updated after contents replaced.
+	for _, uri := range updatedURIs {
+		sr.markUpdated(uri)
 	}
 }
 
@@ -260,6 +275,44 @@ func (sr *StaticResources) ListSessionsForURI(_ context.Context, uri string) []s
 // receives a signal whenever the resource list or templates change.
 func (sr *StaticResources) Subscriber() <-chan struct{} {
 	return sr.notifier.Subscriber()
+}
+
+// SubscriberForURI returns a channel that receives a tick each time the
+// specific URI's contents are updated via ReplaceAllContents (or other future
+// content mutation paths). The channel is closed when the notifier is GC'd.
+func (sr *StaticResources) SubscriberForURI(uri string) <-chan struct{} {
+	sr.mu.Lock()
+	if sr.updatedNotifiers == nil {
+		sr.updatedNotifiers = make(map[string]*ChangeNotifier)
+	}
+	n := sr.updatedNotifiers[uri]
+	if n == nil {
+		n = &ChangeNotifier{}
+		sr.updatedNotifiers[uri] = n
+	}
+	sr.mu.Unlock()
+	return n.Subscriber()
+}
+
+// markUpdated triggers a best-effort tick on the per-URI notifier, if any.
+func (sr *StaticResources) markUpdated(uri string) {
+	sr.mu.RLock()
+	n := sr.updatedNotifiers[uri]
+	sr.mu.RUnlock()
+	if n == nil {
+		// Lazily create to ensure future subscribers see notifications.
+		sr.mu.Lock()
+		if sr.updatedNotifiers == nil {
+			sr.updatedNotifiers = make(map[string]*ChangeNotifier)
+		}
+		if sr.updatedNotifiers[uri] == nil {
+			sr.updatedNotifiers[uri] = &ChangeNotifier{}
+		}
+		n = sr.updatedNotifiers[uri]
+		sr.mu.Unlock()
+	}
+	// Best-effort notify without holding locks.
+	_ = n.Notify(context.Background())
 }
 
 func (sr *StaticResources) listURIsForSessionLocked(sessionID string) []string {

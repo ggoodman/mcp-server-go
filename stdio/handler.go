@@ -34,6 +34,13 @@ type Handler struct {
 	l *slog.Logger
 
 	userProvider UserProvider
+
+	// Per-session, per-URI forwarders for resources/updated notifications
+	subMu      sync.Mutex
+	subCancels map[string]map[string]context.CancelFunc // sessionID -> uri -> cancel
+
+	// writeMux for the current Serve invocation (single use per handler)
+	wm *writeMux
 }
 
 // NewHandler constructs a stdio Handler with defaults and applies options.
@@ -44,6 +51,7 @@ func NewHandler(srv mcpservice.ServerCapabilities, opts ...Option) *Handler {
 		w:            os.Stdout,
 		l:            slog.Default(),
 		userProvider: OSUserProvider{},
+		subCancels:   make(map[string]map[string]context.CancelFunc),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -62,10 +70,14 @@ func NewHandler(srv mcpservice.ServerCapabilities, opts ...Option) *Handler {
 // specs; this function focuses on API shape. Implementation will be added in a
 // follow-up.
 func (h *Handler) Serve(ctx context.Context) error {
+	// Ensure forwarders are cleaned up on exit
+	defer h.cancelAllSubscriptions()
 	// IO setup
 	reader := bufio.NewReader(h.r)
 	bw := bufio.NewWriter(h.w)
 	wm := &writeMux{w: bw}
+	h.wm = wm
+	defer func() { h.wm = nil }()
 	// Outbound dispatcher for server-initiated RPCs
 	disp := newOutboundDispatcher(wm)
 
@@ -247,7 +259,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 					if lcap, ok, err := resCap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
 						_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session, _ string) {
 							n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
-							_ = wm.writeJSONRPC(n)
+							_ = h.writeJSONRPC(n)
 						})
 					}
 				}
@@ -255,7 +267,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 					if lcap, ok, err := tcap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
 						_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session) {
 							n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListChangedNotificationMethod)}
-							_ = wm.writeJSONRPC(n)
+							_ = h.writeJSONRPC(n)
 						})
 					}
 				}
@@ -263,7 +275,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 					if lcap, ok, err := pcap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
 						_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session) {
 							n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListChangedNotificationMethod)}
-							_ = wm.writeJSONRPC(n)
+							_ = h.writeJSONRPC(n)
 						})
 					}
 				}
@@ -430,6 +442,43 @@ func (h *Handler) handleRequest(ctx context.Context, session sessions.Session, r
 		if err := subCap.Subscribe(ctx, session, in.URI); err != nil {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
 		}
+
+		// If the resources capability exposes a per-URI subscriber channel, start a forwarder
+		// that emits notifications/resources/updated for this session+URI.
+		type uriSubscriber interface {
+			SubscriberForURI(uri string) <-chan struct{}
+		}
+		if us, uok := any(resCap).(uriSubscriber); uok {
+			if ch := us.SubscriberForURI(in.URI); ch != nil {
+				sid := session.SessionID()
+				h.subMu.Lock()
+				if _, ok := h.subCancels[sid]; !ok {
+					h.subCancels[sid] = make(map[string]context.CancelFunc)
+				}
+				if _, exists := h.subCancels[sid][in.URI]; !exists {
+					// Derive from background so the forwarder outlives this request;
+					// it's cancelled explicitly on unsubscribe or Serve teardown.
+					fctx, cancel := context.WithCancel(context.Background())
+					h.subCancels[sid][in.URI] = cancel
+					go func(uri string, ch <-chan struct{}) {
+						for {
+							select {
+							case <-fctx.Done():
+								return
+							case _, ok := <-ch:
+								if !ok {
+									return
+								}
+								// Emit notifications/resources/updated { uri }
+								n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod), Params: mustJSON(&mcp.ResourceUpdatedNotification{URI: uri})}
+								_ = h.writeJSONRPC(n)
+							}
+						}
+					}(in.URI, ch)
+				}
+				h.subMu.Unlock()
+			}
+		}
 		return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
 
 	case string(mcp.ResourcesUnsubscribeMethod):
@@ -453,6 +502,21 @@ func (h *Handler) handleRequest(ctx context.Context, session sessions.Session, r
 		}
 		if err := subCap.Unsubscribe(ctx, session, in.URI); err != nil {
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		// Tear down forwarder if present
+		{
+			sid := session.SessionID()
+			h.subMu.Lock()
+			if m, ok := h.subCancels[sid]; ok {
+				if cancel, ok := m[in.URI]; ok {
+					cancel()
+					delete(m, in.URI)
+					if len(m) == 0 {
+						delete(h.subCancels, sid)
+					}
+				}
+			}
+			h.subMu.Unlock()
 		}
 		return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
 
@@ -578,4 +642,24 @@ func deref(p *string) string {
 		return ""
 	}
 	return *p
+}
+
+// writeJSONRPC writes using the handler's writeMux if available.
+func (h *Handler) writeJSONRPC(v any) error {
+	if h.wm == nil {
+		return fmt.Errorf("writer not initialized")
+	}
+	return h.wm.writeJSONRPC(v)
+}
+
+// cancelAllSubscriptions stops all active per-URI forwarders.
+func (h *Handler) cancelAllSubscriptions() {
+	h.subMu.Lock()
+	defer h.subMu.Unlock()
+	for sid, m := range h.subCancels {
+		for _, cancel := range m {
+			cancel()
+		}
+		delete(h.subCancels, sid)
+	}
 }

@@ -704,6 +704,76 @@ func TestPromptsListChangedNotification(t *testing.T) {
 	}
 }
 
+func TestResourcesUpdatedNotificationOnStdio(t *testing.T) {
+	t.Parallel()
+
+	// StaticResources with one file and subscribe support
+	sr := mcpservice.NewStaticResources(
+		[]mcp.Resource{{URI: "res://a.txt", Name: "a.txt"}},
+		nil,
+		map[string][]mcp.ResourceContents{
+			"res://a.txt": {{URI: "res://a.txt", Text: "A"}},
+		},
+	)
+	resources := mcpservice.NewResourcesCapability(mcpservice.WithStaticResourceContainer(sr))
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-updated", Version: "0.1.0"}),
+		mcpservice.WithResourcesCapability(resources),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize and mark notifications/initialized
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+	// Sync to ensure list_changed registrations are active
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	waitForLines(t, &linesMu, &lines, 2)
+
+	// Subscribe to the resource
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ResourcesSubscribeMethod), "params": map[string]any{"uri": "res://a.txt"}})
+
+	// Trigger an update by replacing contents (best-effort signal should tick)
+	sr.ReplaceAllContents(context.Background(), map[string][]mcp.ResourceContents{
+		"res://a.txt": {{URI: "res://a.txt", Text: "B"}},
+	})
+
+	// Wait for notifications/resources/updated
+	waitForNotification(t, &linesMu, &lines, string(mcp.ResourcesUpdatedNotificationMethod))
+
+	// Cleanup
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+}
+
 // helpers
 func mustWriteJSONL(t *testing.T, buf *bytes.Buffer, v any) {
 	t.Helper()

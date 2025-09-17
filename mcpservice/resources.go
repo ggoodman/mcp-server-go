@@ -181,6 +181,16 @@ func (rc *resourcesCapability) GetSubscriptionCapability(ctx context.Context, se
 	return resourceSubscriptionFromContainer{sr: rc.staticContainer}, true, nil
 }
 
+// SubscriberForURI exposes a per-URI change subscriber if backed by a static
+// resource container. This allows transports to forward notifications/resources/updated
+// for static resources when contents change.
+func (rc *resourcesCapability) SubscriberForURI(uri string) <-chan struct{} {
+	if rc.staticContainer == nil {
+		return nil
+	}
+	return rc.staticContainer.SubscriberForURI(uri)
+}
+
 // GetListChangedCapability advertises list-changed support when a change subscriber is configured.
 func (rc *resourcesCapability) GetListChangedCapability(ctx context.Context, session sessions.Session) (ResourceListChangedCapability, bool, error) {
 	if rc.changeSub == nil {
