@@ -990,3 +990,91 @@ func TestAcceptProgressAndCancelledNotifications(t *testing.T) {
 		t.Fatalf("expected at least 2 responses, got %d; lines=%v", respCount, lines)
 	}
 }
+
+func TestStdioClientRootsListChangedForwarding(t *testing.T) {
+	t.Parallel()
+
+	// Channel to observe server-side roots list_changed listener invocations
+	fired := make(chan struct{}, 1)
+
+	// Tools capability that registers a roots list_changed listener on first list
+	tools := mcpservice.NewToolsCapability(
+		mcpservice.WithListTools(func(ctx context.Context, sess sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
+			if rootsCap, ok := sess.GetRootsCapability(); ok {
+				_, _ = rootsCap.RegisterRootsListChangedListener(ctx, func(ctx context.Context) error {
+					select {
+					case fired <- struct{}{}:
+					default:
+					}
+					return nil
+				})
+			}
+			return mcpservice.NewPage[mcp.Tool](nil), nil
+		}),
+	)
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-roots-forward", Version: "0.1.0"}),
+		mcpservice.WithToolsCapability(tools),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize with client capabilities advertising roots listChanged support
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{"roots": map[string]any{"listChanged": true}},
+			"clientInfo":      map[string]any{"name": "t", "version": "0"},
+		},
+	})
+
+	// Mark notifications/initialized and ping to flush handler registrations
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	waitForLines(t, &linesMu, &lines, 2)
+
+	// Trigger the tools/list request to cause the server to register a roots listener
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ToolsListMethod), "params": map[string]any{"cursor": ""}})
+	// Wait for the tools/list response to ensure registration has occurred
+	waitForLines(t, &linesMu, &lines, 3)
+
+	// Now send a client-originated roots list_changed notification
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.RootsListChangedNotificationMethod)})
+
+	// Expect the listener to be invoked
+	select {
+	case <-fired:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for server roots list_changed listener to fire")
+	}
+
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+}
