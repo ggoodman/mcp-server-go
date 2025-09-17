@@ -81,6 +81,56 @@ func TestSingleInstance(t *testing.T) {
 		}
 	})
 
+	t.Run("Resources templates list over POST", func(t *testing.T) {
+		server := mcpservice.NewServer(
+			mcpservice.WithResourcesOptions(
+				mcpservice.WithListResourceTemplates(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+					return mcpservice.NewPage([]mcp.ResourceTemplate{{URITemplate: "file://{path}", Name: "file"}}), nil
+				}),
+			),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize to get a session
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID(1),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		sessID := resp.Header.Get("mcp-session-id")
+		resp.Body.Close()
+
+		// List resource templates
+		listReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ResourcesTemplatesListMethod),
+			Params:         mustJSON(mcp.ListResourceTemplatesRequest{}),
+			ID:             jsonrpc.NewRequestID(2),
+		}
+		resp2, evt := mustPostMCP(t, srv, "Bearer test-token", sessID, listReq)
+		defer resp2.Body.Close()
+
+		if want, got := http.StatusOK, resp2.StatusCode; want != got {
+			t.Fatalf("unexpected status: want %d got %d", want, got)
+		}
+		var rpcRes jsonrpc.Response
+		mustUnmarshalJSON(t, evt.data, &rpcRes)
+		if rpcRes.Error != nil {
+			t.Fatalf("resources/templates/list error: %+v", rpcRes.Error)
+		}
+		var listRes mcp.ListResourceTemplatesResult
+		mustUnmarshalJSON(t, rpcRes.Result, &listRes)
+		if want, got := 1, len(listRes.ResourceTemplates); want != got {
+			t.Fatalf("unexpected templates length: want %d got %d", want, got)
+		}
+		if listRes.ResourceTemplates[0].URITemplate == "" {
+			t.Fatalf("expected non-empty URITemplate")
+		}
+	})
+
 	t.Run("Tools list over POST is empty", func(t *testing.T) {
 		server := mcpservice.NewServer(
 			mcpservice.WithToolsOptions(

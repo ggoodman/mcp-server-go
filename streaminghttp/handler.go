@@ -1153,6 +1153,42 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ReadResourceResult{
 			Contents: contents,
 		})
+	case string(mcp.ResourcesTemplatesListMethod):
+		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+
+		var listTemplatesReq mcp.ListResourceTemplatesRequest
+		if err := json.Unmarshal(req.Params, &listTemplatesReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		page, err := resourcesCap.ListResourceTemplates(ctx, session, func() *string {
+			if listTemplatesReq.Cursor == "" {
+				return nil
+			}
+			s := listTemplatesReq.Cursor
+			return &s
+		}())
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourceTemplatesResult{
+			ResourceTemplates: page.Items,
+			PaginatedResult: mcp.PaginatedResult{
+				NextCursor: func() string {
+					if page.NextCursor == nil {
+						return ""
+					}
+					return *page.NextCursor
+				}(),
+			},
+		})
 	case string(mcp.ResourcesSubscribeMethod):
 		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
 		if err != nil {

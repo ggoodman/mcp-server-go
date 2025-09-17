@@ -249,6 +249,69 @@ func TestResourcesListAndRead(t *testing.T) {
 	}
 }
 
+func TestResourcesTemplatesList(t *testing.T) {
+	t.Parallel()
+
+	tmpl := mcp.ResourceTemplate{URITemplate: "file://{path}", Name: "file"}
+	resources := mcpservice.NewResourcesCapability(
+		mcpservice.WithListResourceTemplates(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+			return mcpservice.NewPage([]mcp.ResourceTemplate{tmpl}), nil
+		}),
+	)
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-res-templates", Version: "0.1.0"}),
+		mcpservice.WithResourcesCapability(resources),
+	)
+
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  string(mcp.InitializeMethod),
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
+		},
+	}
+	listReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  string(mcp.ResourcesTemplatesListMethod),
+		"params":  map[string]any{"cursor": ""},
+	}
+
+	var in bytes.Buffer
+	mustWriteJSONL(t, &in, initReq)
+	mustWriteJSONL(t, &in, listReq)
+	var out bytes.Buffer
+
+	h := NewHandler(server, WithIO(&in, &out))
+	if err := h.Serve(context.Background()); err != nil {
+		t.Fatalf("Serve returned error: %v", err)
+	}
+
+	lines := splitNonEmptyLines(out.String())
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 responses, got %d: %q", len(lines), out.String())
+	}
+
+	var rpcRes jsonrpc.Response
+	if err := json.Unmarshal([]byte(lines[1]), &rpcRes); err != nil {
+		t.Fatalf("unmarshal templates response: %v", err)
+	}
+	if rpcRes.Error != nil {
+		t.Fatalf("templates list error: %+v", rpcRes.Error)
+	}
+	var payload mcp.ListResourceTemplatesResult
+	if err := json.Unmarshal(rpcRes.Result, &payload); err != nil {
+		t.Fatalf("unmarshal templates payload: %v", err)
+	}
+	if len(payload.ResourceTemplates) != 1 || payload.ResourceTemplates[0].URITemplate != tmpl.URITemplate {
+		t.Fatalf("unexpected templates payload: %+v", payload)
+	}
+}
+
 func TestPromptsListAndGet(t *testing.T) {
 	t.Parallel()
 

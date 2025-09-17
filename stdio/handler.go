@@ -369,6 +369,27 @@ func (h *Handler) handleRequest(ctx context.Context, session sessions.Session, r
 			PaginatedResult: mcp.PaginatedResult{NextCursor: deref(page.NextCursor)},
 		})
 
+	case string(mcp.ResourcesTemplatesListMethod):
+		resCap, ok, err := h.srv.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || resCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+		var in mcp.ListResourceTemplatesRequest
+		if err := json.Unmarshal(req.Params, &in); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+		page, err := resCap.ListResourceTemplates(ctx, session, cursorPtr(in.Cursor))
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourceTemplatesResult{
+			ResourceTemplates: page.Items,
+			PaginatedResult:   mcp.PaginatedResult{NextCursor: deref(page.NextCursor)},
+		})
+
 	case string(mcp.ResourcesReadMethod):
 		resCap, ok, err := h.srv.GetResourcesCapability(ctx, session)
 		if err != nil {
