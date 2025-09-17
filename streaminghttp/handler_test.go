@@ -252,6 +252,136 @@ func TestMultiInstance(t *testing.T) {
 		}
 	})
 
+	t.Run("Tools list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
+		// Shared in-memory session host to simulate distributed coordination
+		sharedHost := memoryhost.New()
+
+		// Distinct server instances per handler: each gets its own static tools container
+		mcpFactory := func() mcpservice.ServerCapabilities {
+			st := mcpservice.NewStaticTools()
+			return mcpservice.NewServer(
+				mcpservice.WithToolsOptions(
+					mcpservice.WithStaticToolsContainer(st),
+				),
+			)
+		}
+
+		// Route GET to handler 0 and POST to handler 1
+		router := func(r *http.Request, handlerCount int) int {
+			if r.Method == http.MethodGet {
+				return 0
+			}
+			if r.Method == http.MethodPost {
+				return 1
+			}
+			return 0
+		}
+
+		srv := mustMultiInstanceServer(t, 2, router,
+			mcpFactory,
+			withServerName("multi-tools-list-changed"),
+			withSessionHost(sharedHost),
+		)
+		defer srv.Close()
+
+		// Step 1: Initialize via POST (instance 1)
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID("init"),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		sessID := resp.Header.Get("mcp-session-id")
+		resp.Body.Close()
+		if sessID == "" {
+			t.Fatalf("missing session id")
+		}
+
+		// Step 2: Start GET stream on instance 0 and read next SSE event asynchronously
+		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
+		defer respGet.Body.Close()
+
+		// Step 3: Publish tools list_changed event on the session bus
+		ctx := t.Context()
+		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.ToolsListChangedNotificationMethod), nil)
+
+		// Step 4: Wait for notification
+		select {
+		case evt := <-eventsCh:
+			if evt.event != "notification" {
+				t.Fatalf("expected notification event, got %q", evt.event)
+			}
+			var msg jsonrpc.AnyMessage
+			mustUnmarshalJSON(t, evt.data, &msg)
+			if msg.Method != string(mcp.ToolsListChangedNotificationMethod) {
+				t.Fatalf("unexpected method: want %q got %q", mcp.ToolsListChangedNotificationMethod, msg.Method)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for tools list_changed notification")
+		}
+	})
+
+	t.Run("Prompts list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
+		sharedHost := memoryhost.New()
+		mcpFactory := func() mcpservice.ServerCapabilities {
+			sp := mcpservice.NewStaticPrompts()
+			return mcpservice.NewServer(
+				mcpservice.WithPromptsOptions(
+					mcpservice.WithStaticPromptsContainer(sp),
+				),
+			)
+		}
+		router := func(r *http.Request, handlerCount int) int {
+			if r.Method == http.MethodGet {
+				return 0
+			}
+			if r.Method == http.MethodPost {
+				return 1
+			}
+			return 0
+		}
+		srv := mustMultiInstanceServer(t, 2, router,
+			mcpFactory,
+			withServerName("multi-prompts-list-changed"),
+			withSessionHost(sharedHost),
+		)
+		defer srv.Close()
+
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID("init"),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		sessID := resp.Header.Get("mcp-session-id")
+		resp.Body.Close()
+		if sessID == "" {
+			t.Fatalf("missing session id")
+		}
+
+		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
+		defer respGet.Body.Close()
+
+		ctx := t.Context()
+		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.PromptsListChangedNotificationMethod), nil)
+
+		select {
+		case evt := <-eventsCh:
+			if evt.event != "notification" {
+				t.Fatalf("expected notification event, got %q", evt.event)
+			}
+			var msg jsonrpc.AnyMessage
+			mustUnmarshalJSON(t, evt.data, &msg)
+			if msg.Method != string(mcp.PromptsListChangedNotificationMethod) {
+				t.Fatalf("unexpected method: want %q got %q", mcp.PromptsListChangedNotificationMethod, msg.Method)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for prompts list_changed notification")
+		}
+	})
+
 }
 
 // ============================================================================
