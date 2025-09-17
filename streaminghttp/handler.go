@@ -16,6 +16,7 @@ import (
 	"github.com/elnormous/contenttype"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/outbound"
 	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
 	"github.com/ggoodman/mcp-server-go/internal/wellknown"
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -134,6 +135,11 @@ type StreamingHTTPHandler struct {
 	sessMu      sync.Mutex
 	sessParents map[string]context.Context
 	sessCancel  map[string]context.CancelFunc
+
+	// Per-session outbound dispatchers and their cancel/unsub handlers for
+	// long-lived subscriptions (e.g., notifications/cancelled).
+	dispMu      sync.Mutex
+	dispatchers map[string]*outboundDispatcherHolder
 }
 
 // lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
@@ -675,6 +681,26 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 	defer unsubUpdated()
 
+	// Also subscribe for tools list_changed to forward to the client
+	const toolsListChangedTopic = string(mcp.ToolsListChangedNotificationMethod)
+	unsubTools, subToolsErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), toolsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+		n := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ToolsListChangedNotificationMethod),
+			Params:         nil,
+		}
+		b, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		return sh.WriteMessage(evtCtx, b)
+	})
+	if subToolsErr != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer unsubTools()
+
 	// Also subscribe for prompts list_changed to forward to the client
 	const promptsListChangedTopic = string(mcp.PromptsListChangedNotificationMethod)
 	unsubPrompts, subPromptsErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
@@ -706,6 +732,15 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// Bridge tools/list_changed notifications via the internal bus as well.
+	if toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, sh.Session()); err == nil && ok {
+		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {
+			_, _ = lc.Register(ctx, sh.Session(), func(cbCtx context.Context, sess sessions.Session) {
+				_ = h.sessionHost.PublishEvent(cbCtx, sess.SessionID(), toolsListChangedTopic, nil)
+			})
+		}
+	}
+
 	// Bridge prompts/list_changed notifications via the internal bus as well.
 	if promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, sh.Session()); err == nil && ok {
 		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {
@@ -725,6 +760,9 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	wf.Flush()
+
+	// Ensure per-session outbound dispatcher exists and is wired to cancelled notifications.
+	_ = h.ensureDispatcher(ctx, sh)
 
 	// Requests to the GET /mcp endpoint MUST be in the context of an already
 	// established session. Session establishment can only happen in POST /mcp.
@@ -1543,4 +1581,123 @@ func (h *StreamingHTTPHandler) teardownSession(sessionID string) {
 		delete(h.subCancels, sessionID)
 	}
 	h.subMu.Unlock()
+
+	// Also close outbound dispatcher and unsubscribe from cancelled listener.
+	h.dispMu.Lock()
+	if h.dispatchers != nil {
+		if holder, ok := h.dispatchers[sessionID]; ok && holder != nil {
+			if holder.cancelledUnsub != nil {
+				holder.cancelledUnsub()
+			}
+			holder.d.Close(context.Canceled)
+			delete(h.dispatchers, sessionID)
+		}
+	}
+	h.dispMu.Unlock()
+}
+
+// --- Outbound dispatcher integration ---
+
+// Holder for per-session dispatcher and unsubs.
+type outboundDispatcherHolder struct {
+	d *outbound.Dispatcher
+	// unsubscribe from notifications/cancelled stream
+	cancelledUnsub func()
+}
+
+// streamingTransport implements outbound.Transport over the sessionHost/session.
+type streamingTransport struct {
+	h  *StreamingHTTPHandler
+	sh *sessioncore.SessionHandle // for SessionID, WriteMessage
+}
+
+func (t streamingTransport) SendRequest(ctx context.Context, id *jsonrpc.RequestID, req *jsonrpc.Request) error {
+	// Subscribe to rv:<id> before emitting request to avoid missing responses.
+	key := "rv:" + id.String()
+	var unsub func()
+	var err error
+	unsub, err = t.h.sessionHost.SubscribeEvents(ctx, t.sh.SessionID(), key, func(evtCtx context.Context, payload []byte) error {
+		var resp jsonrpc.Response
+		if err := json.Unmarshal(payload, &resp); err != nil {
+			return err
+		}
+		// Route to the session's dispatcher if still present.
+		if d := t.h.getDispatcher(t.sh.SessionID()); d != nil {
+			d.OnResponse(&resp)
+		}
+		// One-shot responders: we can unsubscribe on first message.
+		if unsub != nil {
+			unsub()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Emit request to client.
+	b, err := json.Marshal(req)
+	if err != nil {
+		unsub()
+		return err
+	}
+	if err := t.sh.WriteMessage(ctx, b); err != nil {
+		unsub()
+		return err
+	}
+	return nil
+}
+
+func (t streamingTransport) SendCancelled(ctx context.Context, requestID string) error {
+	// Build params raw message
+	p := struct {
+		RequestID string `json:"requestId"`
+	}{RequestID: requestID}
+	pb, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CancelledNotificationMethod), Params: pb}
+	b, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	return t.sh.WriteMessage(ctx, b)
+}
+
+// ensureDispatcher creates or returns the per-session dispatcher and wires the
+// notifications/cancelled subscription. Safe for concurrent calls.
+func (h *StreamingHTTPHandler) ensureDispatcher(ctx context.Context, sh *sessioncore.SessionHandle) *outbound.Dispatcher {
+	h.dispMu.Lock()
+	defer h.dispMu.Unlock()
+	if h.dispatchers == nil {
+		h.dispatchers = make(map[string]*outboundDispatcherHolder)
+	}
+	if holder, ok := h.dispatchers[sh.SessionID()]; ok && holder != nil {
+		return holder.d
+	}
+
+	// Create dispatcher
+	d := outbound.New(streamingTransport{h: h, sh: sh})
+
+	// Subscribe to notifications/cancelled and forward to dispatcher.
+	unsub, err := h.sessionHost.SubscribeEvents(h.ensureSessionParentContext(ctx, sh.SessionID()), sh.SessionID(), string(mcp.CancelledNotificationMethod), func(evtCtx context.Context, payload []byte) error {
+		any := jsonrpc.AnyMessage{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CancelledNotificationMethod), Params: payload}
+		d.OnNotification(any)
+		return nil
+	})
+	if err != nil {
+		return nil
+	}
+
+	h.dispatchers[sh.SessionID()] = &outboundDispatcherHolder{d: d, cancelledUnsub: unsub}
+	return d
+}
+
+func (h *StreamingHTTPHandler) getDispatcher(sessionID string) *outbound.Dispatcher {
+	h.dispMu.Lock()
+	defer h.dispMu.Unlock()
+	if holder, ok := h.dispatchers[sessionID]; ok && holder != nil {
+		return holder.d
+	}
+	return nil
 }
