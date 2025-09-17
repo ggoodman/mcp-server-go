@@ -415,6 +415,11 @@ func TestResourcesSubscribeAndListChanged(t *testing.T) {
 
 	// Write initialize and subscribe
 	mustWriteJSONLToWriter(t, inW, initReq)
+	// Signal that the client finished initialization
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+	// Synchronize: send a ping and wait for init+ping responses so registrations are active
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	waitForLines(t, &linesMu, &lines, 2)
 	mustWriteJSONLToWriter(t, inW, subReq)
 
 	// Trigger a list change by adding a new resource; should yield a list_changed notification.
@@ -503,10 +508,11 @@ func TestToolsListChangedNotification(t *testing.T) {
 			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
 		},
 	})
-	// Send a ping to ensure we've passed the post-initialize registration boundary
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	// Send notifications/initialized to mark client readiness for notifications
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
 
-	// Wait for initialize + ping response so listChanged registration is active
+	// Synchronize: send a ping and wait for init+ping responses so registrations are active
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
 	waitForLines(t, &linesMu, &lines, 2)
 
 	// Trigger tools change -> should emit list_changed
@@ -592,10 +598,11 @@ func TestPromptsListChangedNotification(t *testing.T) {
 		},
 	})
 
-	// Send a ping to ensure we've passed the post-initialize registration boundary
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	// Send notifications/initialized to mark client readiness for notifications
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
 
-	// Wait for initialize + ping response so listChanged registration is active
+	// Synchronize: send a ping and wait for init+ping responses so registrations are active
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
 	waitForLines(t, &linesMu, &lines, 2)
 
 	// Trigger prompts change -> should emit list_changed
@@ -707,4 +714,144 @@ func waitForNotification(t *testing.T, mu *sync.Mutex, lines *[]string, method s
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timeout waiting for notification %q", method)
+}
+
+func TestIgnoreClientResponseAndContinue(t *testing.T) {
+	t.Parallel()
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-ignore-response", Version: "0.1.0"}),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+	// Client sends notifications/initialized
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+
+	// Send a stray client response (should be ignored)
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 999, "result": map[string]any{"ok": true}})
+
+	// Then a valid ping request which should get a response
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+
+	// Close input and collect
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+
+	linesMu.Lock()
+	defer linesMu.Unlock()
+	// Expect at least 2 responses: initialize result and ping result
+	count := 0
+	for _, l := range lines {
+		var any jsonrpc.AnyMessage
+		if err := json.Unmarshal([]byte(l), &any); err != nil {
+			continue
+		}
+		if any.Type() == "response" {
+			count++
+		}
+	}
+	if count < 2 {
+		t.Fatalf("expected at least 2 server responses, got %d; lines=%v", count, lines)
+	}
+}
+
+func TestAcceptProgressAndCancelledNotifications(t *testing.T) {
+	t.Parallel()
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-notifs", Version: "0.1.0"}),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+	// Client sends notifications/initialized
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+
+	// Send progress and cancelled notifications which should be accepted and ignored
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.ProgressNotificationMethod), "params": map[string]any{"progressToken": "t1", "progress": 0.5}})
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.CancelledNotificationMethod), "params": map[string]any{"requestId": "42"}})
+
+	// Then send a ping request and ensure we still get a response
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+
+	linesMu.Lock()
+	defer linesMu.Unlock()
+	// Expect at least 2 responses (init + ping). Notifications should not produce responses.
+	respCount := 0
+	for _, l := range lines {
+		var any jsonrpc.AnyMessage
+		if err := json.Unmarshal([]byte(l), &any); err != nil {
+			continue
+		}
+		if any.Type() == "response" {
+			respCount++
+		}
+	}
+	if respCount < 2 {
+		t.Fatalf("expected at least 2 responses, got %d; lines=%v", respCount, lines)
+	}
 }

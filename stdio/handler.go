@@ -75,7 +75,8 @@ func (h *Handler) Serve(ctx context.Context) error {
 
 	// Session state
 	var sess *stdioSession // established after initialize
-	initialized := false
+	initialized := false   // JSON-RPC initialize handshake completed (server replied)
+	registered := false    // listChanged callbacks registered after client notifications/initialized
 
 	for {
 		// Respect context
@@ -223,33 +224,6 @@ func (h *Handler) Serve(ctx context.Context) error {
 				return werr
 			}
 
-			// After successful initialize, register listChanged callbacks where supported.
-			// Use the Serve context for automatic teardown on handler exit.
-			if resCap, ok, err := h.srv.GetResourcesCapability(ctx, sess); err == nil && ok && resCap != nil {
-				if lcap, ok, err := resCap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
-					_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session, _ string) {
-						n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
-						_ = wm.writeJSONRPC(n)
-					})
-				}
-			}
-			if tcap, ok, err := h.srv.GetToolsCapability(ctx, sess); err == nil && ok && tcap != nil {
-				if lcap, ok, err := tcap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
-					_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session) {
-						n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListChangedNotificationMethod)}
-						_ = wm.writeJSONRPC(n)
-					})
-				}
-			}
-			if pcap, ok, err := h.srv.GetPromptsCapability(ctx, sess); err == nil && ok && pcap != nil {
-				if lcap, ok, err := pcap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
-					_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session) {
-						n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListChangedNotificationMethod)}
-						_ = wm.writeJSONRPC(n)
-					})
-				}
-			}
-
 			initialized = true
 			continue
 		}
@@ -257,7 +231,37 @@ func (h *Handler) Serve(ctx context.Context) error {
 		// After initialization
 		switch any.Type() {
 		case "notification":
-			// We accept notifications like notifications/initialized, cancelled, progress, etc., and ignore by default.
+			// notifications/initialized marks that the client completed its side of init.
+			// Only after this point should the server begin emitting list_changed notifications.
+			if any.Method == string(mcp.InitializedNotificationMethod) && !registered {
+				// Register listChanged callbacks where supported. Use Serve context for teardown.
+				if resCap, ok, err := h.srv.GetResourcesCapability(ctx, sess); err == nil && ok && resCap != nil {
+					if lcap, ok, err := resCap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
+						_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session, _ string) {
+							n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
+							_ = wm.writeJSONRPC(n)
+						})
+					}
+				}
+				if tcap, ok, err := h.srv.GetToolsCapability(ctx, sess); err == nil && ok && tcap != nil {
+					if lcap, ok, err := tcap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
+						_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session) {
+							n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListChangedNotificationMethod)}
+							_ = wm.writeJSONRPC(n)
+						})
+					}
+				}
+				if pcap, ok, err := h.srv.GetPromptsCapability(ctx, sess); err == nil && ok && pcap != nil {
+					if lcap, ok, err := pcap.GetListChangedCapability(ctx, sess); err == nil && ok && lcap != nil {
+						_, _ = lcap.Register(ctx, sess, func(_ context.Context, _ sessions.Session) {
+							n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListChangedNotificationMethod)}
+							_ = wm.writeJSONRPC(n)
+						})
+					}
+				}
+				registered = true
+			}
+			// Other notifications (progress, cancelled, etc.) are accepted and ignored.
 			continue
 		case "response":
 			// No server-initiated requests in stdio baseline. Ignore.
