@@ -94,8 +94,8 @@ func (h *Handler) Serve(ctx context.Context) error {
 		line, rerr := reader.ReadBytes('\n')
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
-				// Graceful shutdown on EOF
-				_ = bw.Flush()
+				// Graceful shutdown on EOF. Serialize Flush with writeMux to avoid races.
+				_ = wm.flush()
 				disp.Close(io.EOF)
 				return nil
 			}
@@ -525,6 +525,13 @@ func (w *writeMux) writeJSONRPC(v any) error {
 	if err := w.w.WriteByte('\n'); err != nil {
 		return err
 	}
+	return w.w.Flush()
+}
+
+// flush serializes a direct Flush on the underlying writer to avoid races with writeJSONRPC.
+func (w *writeMux) flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.w.Flush()
 }
 
