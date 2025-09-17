@@ -24,6 +24,24 @@ const (
 	LoggingLevelEmergency LoggingLevel = "emergency"
 )
 
+// IsValidLoggingLevel reports whether the provided level is one of the
+// protocol-defined syslog severities.
+func IsValidLoggingLevel(level LoggingLevel) bool {
+	switch level {
+	case LoggingLevelDebug,
+		LoggingLevelInfo,
+		LoggingLevelNotice,
+		LoggingLevelWarning,
+		LoggingLevelError,
+		LoggingLevelCritical,
+		LoggingLevelAlert,
+		LoggingLevelEmergency:
+		return true
+	default:
+		return false
+	}
+}
+
 // Capabilities
 // ClientCapabilities advertises client features.
 type ClientCapabilities struct {

@@ -32,6 +32,10 @@ type server struct {
 	// prompts capability
 	staticPromptsCap PromptsCapability
 	promptsProvider  func(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error)
+
+	// logging capability
+	staticLoggingCap LoggingCapability
+	loggingProvider  func(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error)
 }
 
 // NewServer builds a ServerCapabilities using functional options. Options allow
@@ -120,6 +124,16 @@ func WithPromptsProvider(fn func(ctx context.Context, session sessions.Session) 
 	return func(s *server) { s.promptsProvider = fn }
 }
 
+// WithLoggingCapability wires a static LoggingCapability (used for all sessions).
+func WithLoggingCapability(cap LoggingCapability) ServerOption {
+	return func(s *server) { s.staticLoggingCap = cap }
+}
+
+// WithLoggingProvider wires a per-session logging capability provider.
+func WithLoggingProvider(fn func(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error)) ServerOption {
+	return func(s *server) { s.loggingProvider = fn }
+}
+
 // GetServerInfo implements ServerCapabilities.
 func (s *server) GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error) {
 	if s.infoProvider != nil {
@@ -183,6 +197,17 @@ func (s *server) GetPromptsCapability(ctx context.Context, session sessions.Sess
 	}
 	if s.staticPromptsCap != nil {
 		return s.staticPromptsCap, true, nil
+	}
+	return nil, false, nil
+}
+
+// GetLoggingCapability implements ServerCapabilities.
+func (s *server) GetLoggingCapability(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error) {
+	if s.loggingProvider != nil {
+		return s.loggingProvider(ctx, session)
+	}
+	if s.staticLoggingCap != nil {
+		return s.staticLoggingCap, true, nil
 	}
 	return nil, false, nil
 }

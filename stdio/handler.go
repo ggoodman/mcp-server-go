@@ -242,6 +242,13 @@ func (h *Handler) Serve(ctx context.Context) error {
 				initRes.Instructions = instr
 			}
 
+			// Logging capability (advertised if supported)
+			if _, ok, err := h.srv.GetLoggingCapability(ctx, sess); err == nil && ok {
+				if initRes.Capabilities.Logging == nil {
+					initRes.Capabilities.Logging = &struct{}{}
+				}
+			}
+
 			// Respond
 			if resp, err := jsonrpc.NewResultResponse(req.ID, initRes); err != nil {
 				r2 := jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "failed to encode initialize result", nil)
@@ -572,6 +579,30 @@ func (h *Handler) handleRequest(ctx context.Context, session sessions.Session, r
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
 		}
 		return jsonrpc.NewResultResponse(req.ID, result)
+
+	case string(mcp.LoggingSetLevelMethod):
+		lcap, ok, err := h.srv.GetLoggingCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || lcap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
+		}
+		var in mcp.SetLevelRequest
+		if err := json.Unmarshal(req.Params, &in); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+		if !mcp.IsValidLoggingLevel(in.Level) {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
+		}
+		if err := lcap.SetLevel(ctx, session, in.Level); err != nil {
+			// Map known invalid-level error to Invalid Params; everything else is internal.
+			if errors.Is(err, mcpservice.ErrInvalidLoggingLevel) {
+				return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
+			}
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
 	}
 	return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "method not found", nil), nil
 }

@@ -203,6 +203,93 @@ func TestSingleInstance(t *testing.T) {
 			t.Fatalf("expected WWW-Authenticate header, got %q", h)
 		}
 	})
+
+	t.Run("Logging setLevel over POST", func(t *testing.T) {
+		var lv slog.LevelVar
+		lv.Set(slog.LevelInfo)
+
+		server := mcpservice.NewServer(
+			mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "http-logging", Version: "0.1.0"}),
+			mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize to create session
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			ID:             jsonrpc.NewRequestID(1),
+			Params:         mustJSON(map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "c", "version": "0"}}),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("init status: %d", resp.StatusCode)
+		}
+		// capture session id
+		sessID := resp.Header.Get("MCP-Session-ID")
+		if sessID == "" {
+			t.Fatalf("missing session id")
+		}
+
+		// Now send logging/setLevel to debug
+		setReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.LoggingSetLevelMethod),
+			ID:             jsonrpc.NewRequestID(2),
+			Params:         mustJSON(map[string]any{"level": string(mcp.LoggingLevelDebug)}),
+		}
+		resp2, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, setReq)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("setLevel status: %d", resp2.StatusCode)
+		}
+		if got := lv.Level(); got != slog.LevelDebug {
+			t.Fatalf("expected debug, got %v", got)
+		}
+	})
+
+	t.Run("Logging setLevel invalid level returns -32602", func(t *testing.T) {
+		var lv slog.LevelVar
+		lv.Set(slog.LevelInfo)
+
+		server := mcpservice.NewServer(
+			mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "http-logging", Version: "0.1.0"}),
+			mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			ID:             jsonrpc.NewRequestID(1),
+			Params:         mustJSON(map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "c", "version": "0"}}),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("init status: %d", resp.StatusCode)
+		}
+		sessID := resp.Header.Get("MCP-Session-ID")
+		resp.Body.Close()
+
+		// Invalid level
+		setReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.LoggingSetLevelMethod),
+			ID:             jsonrpc.NewRequestID(2),
+			Params:         mustJSON(map[string]any{"level": "verbose"}),
+		}
+		resp2, evt := mustPostMCP(t, srv, "Bearer test-token", sessID, setReq)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("setLevel status: %d", resp2.StatusCode)
+		}
+		var rpcRes jsonrpc.Response
+		mustUnmarshalJSON(t, evt.data, &rpcRes)
+		if rpcRes.Error == nil || rpcRes.Error.Code != jsonrpc.ErrorCodeInvalidParams {
+			t.Fatalf("expected invalid params error, got %#v", rpcRes.Error)
+		}
+	})
 }
 
 func TestMultiInstance(t *testing.T) {

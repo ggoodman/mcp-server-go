@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -1077,4 +1078,133 @@ func TestStdioClientRootsListChangedForwarding(t *testing.T) {
 	<-done
 	_ = outW.Close()
 	<-scanDone
+}
+
+func TestLoggingSetLevelOnStdio(t *testing.T) {
+	t.Parallel()
+
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-logging", Version: "0.1.0"}),
+		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+
+	// Change level to debug
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": string(mcp.LoggingSetLevelMethod),
+		"params": map[string]any{"level": string(mcp.LoggingLevelDebug)},
+	})
+
+	// Close input and wait
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+
+	// Expect two responses (init + setLevel) and level var changed
+	if got := lv.Level(); got != slog.LevelDebug {
+		t.Fatalf("expected slog level debug, got %v", got)
+	}
+}
+
+func TestLoggingSetLevelOnStdio_InvalidLevel(t *testing.T) {
+	t.Parallel()
+
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-logging", Version: "0.1.0"}),
+		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+
+	// Invalid level
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": string(mcp.LoggingSetLevelMethod),
+		"params": map[string]any{"level": "verbose"},
+	})
+
+	// Close input and wait
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+
+	// Expect two responses and the second should be an error -32602
+	linesMu.Lock()
+	defer linesMu.Unlock()
+	if len(lines) < 2 {
+		t.Fatalf("expected at least 2 response lines, got %d", len(lines))
+	}
+	var res2 jsonrpc.Response
+	if err := json.Unmarshal([]byte(lines[1]), &res2); err != nil {
+		t.Fatalf("unmarshal setLevel response: %v", err)
+	}
+	if res2.Error == nil || res2.Error.Code != jsonrpc.ErrorCodeInvalidParams {
+		t.Fatalf("expected invalid params error, got %#v", res2.Error)
+	}
 }

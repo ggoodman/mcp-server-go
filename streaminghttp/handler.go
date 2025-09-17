@@ -1006,6 +1006,14 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		}
 	}
 
+	// Discover logging capability
+	if _, ok, err := h.mcp.GetLoggingCapability(ctx, session.Session()); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get logging capability: %w", err)
+	} else if ok {
+		initializeRes.Capabilities.Logging = &struct{}{}
+	}
+
 	res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1374,6 +1382,32 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, result)
+	case string(mcp.LoggingSetLevelMethod):
+		loggingCap, ok, err := h.mcp.GetLoggingCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || loggingCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
+		}
+
+		var setLevelReq mcp.SetLevelRequest
+		if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		if !mcp.IsValidLoggingLevel(setLevelReq.Level) {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
+		}
+
+		if err := loggingCap.SetLevel(ctx, session, setLevelReq.Level); err != nil {
+			if errors.Is(err, mcpservice.ErrInvalidLoggingLevel) {
+				return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
+			}
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, struct{}{})
 		// case string(mcp.LoggingSetLevelMethod):
 		// 	loggingCap := h.hooks.GetLoggingCapability()
 
