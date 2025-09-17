@@ -81,6 +81,56 @@ func TestSingleInstance(t *testing.T) {
 		}
 	})
 
+	t.Run("Resources templates list over POST", func(t *testing.T) {
+		server := mcpservice.NewServer(
+			mcpservice.WithResourcesOptions(
+				mcpservice.WithListResourceTemplates(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+					return mcpservice.NewPage([]mcp.ResourceTemplate{{URITemplate: "file://{path}", Name: "file"}}), nil
+				}),
+			),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize to get a session
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			Params:         mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}}),
+			ID:             jsonrpc.NewRequestID(1),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		sessID := resp.Header.Get("mcp-session-id")
+		resp.Body.Close()
+
+		// List resource templates
+		listReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ResourcesTemplatesListMethod),
+			Params:         mustJSON(mcp.ListResourceTemplatesRequest{}),
+			ID:             jsonrpc.NewRequestID(2),
+		}
+		resp2, evt := mustPostMCP(t, srv, "Bearer test-token", sessID, listReq)
+		defer resp2.Body.Close()
+
+		if want, got := http.StatusOK, resp2.StatusCode; want != got {
+			t.Fatalf("unexpected status: want %d got %d", want, got)
+		}
+		var rpcRes jsonrpc.Response
+		mustUnmarshalJSON(t, evt.data, &rpcRes)
+		if rpcRes.Error != nil {
+			t.Fatalf("resources/templates/list error: %+v", rpcRes.Error)
+		}
+		var listRes mcp.ListResourceTemplatesResult
+		mustUnmarshalJSON(t, rpcRes.Result, &listRes)
+		if want, got := 1, len(listRes.ResourceTemplates); want != got {
+			t.Fatalf("unexpected templates length: want %d got %d", want, got)
+		}
+		if listRes.ResourceTemplates[0].URITemplate == "" {
+			t.Fatalf("expected non-empty URITemplate")
+		}
+	})
+
 	t.Run("Tools list over POST is empty", func(t *testing.T) {
 		server := mcpservice.NewServer(
 			mcpservice.WithToolsOptions(
@@ -151,6 +201,93 @@ func TestSingleInstance(t *testing.T) {
 		// Should include a WWW-Authenticate header per spec
 		if h := resp.Header.Get("www-authenticate"); !strings.HasPrefix(strings.ToLower(h), "bearer ") {
 			t.Fatalf("expected WWW-Authenticate header, got %q", h)
+		}
+	})
+
+	t.Run("Logging setLevel over POST", func(t *testing.T) {
+		var lv slog.LevelVar
+		lv.Set(slog.LevelInfo)
+
+		server := mcpservice.NewServer(
+			mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "http-logging", Version: "0.1.0"}),
+			mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize to create session
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			ID:             jsonrpc.NewRequestID(1),
+			Params:         mustJSON(map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "c", "version": "0"}}),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("init status: %d", resp.StatusCode)
+		}
+		// capture session id
+		sessID := resp.Header.Get("MCP-Session-ID")
+		if sessID == "" {
+			t.Fatalf("missing session id")
+		}
+
+		// Now send logging/setLevel to debug
+		setReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.LoggingSetLevelMethod),
+			ID:             jsonrpc.NewRequestID(2),
+			Params:         mustJSON(map[string]any{"level": string(mcp.LoggingLevelDebug)}),
+		}
+		resp2, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, setReq)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("setLevel status: %d", resp2.StatusCode)
+		}
+		if got := lv.Level(); got != slog.LevelDebug {
+			t.Fatalf("expected debug, got %v", got)
+		}
+	})
+
+	t.Run("Logging setLevel invalid level returns -32602", func(t *testing.T) {
+		var lv slog.LevelVar
+		lv.Set(slog.LevelInfo)
+
+		server := mcpservice.NewServer(
+			mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "http-logging", Version: "0.1.0"}),
+			mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+		)
+		srv := mustServer(t, server)
+		defer srv.Close()
+
+		// Initialize
+		initReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.InitializeMethod),
+			ID:             jsonrpc.NewRequestID(1),
+			Params:         mustJSON(map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "c", "version": "0"}}),
+		}
+		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("init status: %d", resp.StatusCode)
+		}
+		sessID := resp.Header.Get("MCP-Session-ID")
+		resp.Body.Close()
+
+		// Invalid level
+		setReq := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.LoggingSetLevelMethod),
+			ID:             jsonrpc.NewRequestID(2),
+			Params:         mustJSON(map[string]any{"level": "verbose"}),
+		}
+		resp2, evt := mustPostMCP(t, srv, "Bearer test-token", sessID, setReq)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("setLevel status: %d", resp2.StatusCode)
+		}
+		var rpcRes jsonrpc.Response
+		mustUnmarshalJSON(t, evt.data, &rpcRes)
+		if rpcRes.Error == nil || rpcRes.Error.Code != jsonrpc.ErrorCodeInvalidParams {
+			t.Fatalf("expected invalid params error, got %#v", rpcRes.Error)
 		}
 	})
 }

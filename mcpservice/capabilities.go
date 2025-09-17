@@ -72,6 +72,22 @@ type ServerCapabilities interface {
 	// Implementations may return a session-scoped value. The returned value
 	// MUST be safe for concurrent use.
 	GetPromptsCapability(ctx context.Context, session sessions.Session) (cap PromptsCapability, ok bool, err error)
+
+	// GetLoggingCapability returns the logging capability if supported by the server
+	// for the given session. If ok is false, the handler will not advertise logging
+	// support in the server capabilities.
+	//
+	// Implementations may return a session-scoped value. The returned value
+	// MUST be safe for concurrent use.
+	GetLoggingCapability(ctx context.Context, session sessions.Session) (cap LoggingCapability, ok bool, err error)
+
+	// GetCompletionsCapability returns the completions capability if supported by the server
+	// for the given session. If ok is false, the handler will not advertise completions
+	// support in the server capabilities.
+	//
+	// Implementations may return a session-scoped value. The returned value
+	// MUST be safe for concurrent use.
+	GetCompletionsCapability(ctx context.Context, session sessions.Session) (cap CompletionsCapability, ok bool, err error)
 }
 
 // ResourcesCapability defines the basic resource operations supported by the server.
@@ -214,4 +230,22 @@ type NotifyPromptsListChangedFunc func(ctx context.Context, session sessions.Ses
 // cancellation to stop delivering callbacks.
 type PromptListChangedCapability interface {
 	Register(ctx context.Context, session sessions.Session, fn NotifyPromptsListChangedFunc) (ok bool, err error)
+}
+
+// LoggingCapability allows the client to adjust the server's logging level for
+// the session or process depending on implementation. Implementations should be
+// thread-safe and return quickly; expensive work should be done asynchronously.
+type LoggingCapability interface {
+	// SetLevel updates the server's logging level. Implementations decide scope
+	// (process-wide vs session-specific) and mapping to underlying logger(s).
+	SetLevel(ctx context.Context, session sessions.Session, level mcp.LoggingLevel) error
+}
+
+// CompletionsCapability enables argument autocompletion suggestions for prompts
+// and resource template arguments. Implementations SHOULD validate the reference
+// and argument values and return suggestions consistent with the MCP spec.
+// Implementations MUST be safe for concurrent use.
+type CompletionsCapability interface {
+	// Complete returns completion suggestions for the provided request.
+	Complete(ctx context.Context, session sessions.Session, req *mcp.CompleteRequest) (*mcp.CompleteResult, error)
 }

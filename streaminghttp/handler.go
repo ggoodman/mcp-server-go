@@ -140,6 +140,10 @@ type StreamingHTTPHandler struct {
 	// long-lived subscriptions (e.g., notifications/cancelled).
 	dispMu      sync.Mutex
 	dispatchers map[string]*outboundDispatcherHolder
+
+	// in-flight server-handled requests per session (for inbound cancellation)
+	inflightMu sync.Mutex
+	inflight   map[string]map[string]context.CancelFunc // sessionID -> requestID -> cancel
 }
 
 // lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
@@ -257,6 +261,7 @@ func New(
 		sessParents: make(map[string]context.Context),
 		sessCancel:  make(map[string]context.CancelFunc),
 	}
+	h.inflight = make(map[string]map[string]context.CancelFunc)
 
 	// Build PRM based on auth mode
 	switch {
@@ -549,8 +554,33 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		// the session backend if writing to the client fails.
 		sess := newSessionWithWriter(ctx, sh.Session(), wf, sh.WriteMessage)
 
+		// Track inflight cancellable request by session+requestID
+		rid := req.ID.String()
+		sid := sh.SessionID()
+		h.inflightMu.Lock()
+		if _, ok := h.inflight[sid]; !ok {
+			h.inflight[sid] = make(map[string]context.CancelFunc)
+		}
+		h.inflight[sid][rid] = cancel
+		h.inflightMu.Unlock()
+
+		// Inject a ProgressReporter bound to this request ID that writes notifications/progress
+		// back to the client via the session writer.
+		if mw, ok := any(sess).(messageWriter); ok {
+			ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: mw, requestID: rid})
+		}
+
 		// This is a request with an ID, so we need to handle it as a request.
 		res, err := h.handleRequest(ctx, sess, userInfo, req)
+		// Remove inflight entry
+		h.inflightMu.Lock()
+		if m, ok := h.inflight[sid]; ok {
+			delete(m, rid)
+			if len(m) == 0 {
+				delete(h.inflight, sid)
+			}
+		}
+		h.inflightMu.Unlock()
 		if err != nil {
 			res = &jsonrpc.Response{
 				JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -864,6 +894,26 @@ func (h *StreamingHTTPHandler) handleOptionsAuthorizationServerMetadata(w http.R
 
 func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
 	h.log.Debug("handleNotification", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
+	// Intercept notifications/cancelled to cancel in-flight server-handled requests for this session.
+	if req.Method == string(mcp.CancelledNotificationMethod) && len(req.Params) > 0 {
+		var p struct {
+			RequestID string `json:"requestId"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err == nil && p.RequestID != "" {
+			sid := session.SessionID()
+			h.inflightMu.Lock()
+			if m, ok := h.inflight[sid]; ok {
+				if cancel, ok := m[p.RequestID]; ok && cancel != nil {
+					cancel()
+					delete(m, p.RequestID)
+					if len(m) == 0 {
+						delete(h.inflight, sid)
+					}
+				}
+			}
+			h.inflightMu.Unlock()
+		}
+	}
 	// Publish server-internal event for fan-out to interested listeners.
 	// Topic is the JSON-RPC method; payload is the raw params.
 	if err := h.sessionHost.PublishEvent(ctx, session.SessionID(), req.Method, req.Params); err != nil {
@@ -1004,6 +1054,22 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 		}{
 			ListChanged: hasPromptsListChanged,
 		}
+	}
+
+	// Discover logging capability
+	if _, ok, err := h.mcp.GetLoggingCapability(ctx, session.Session()); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get logging capability: %w", err)
+	} else if ok {
+		initializeRes.Capabilities.Logging = &struct{}{}
+	}
+
+	// Discover completions capability
+	if _, ok, err := h.mcp.GetCompletionsCapability(ctx, session.Session()); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return fmt.Errorf("failed to get completions capability: %w", err)
+	} else if ok {
+		initializeRes.Capabilities.Completions = &struct{}{}
 	}
 
 	res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
@@ -1152,6 +1218,42 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ReadResourceResult{
 			Contents: contents,
+		})
+	case string(mcp.ResourcesTemplatesListMethod):
+		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+		}
+
+		var listTemplatesReq mcp.ListResourceTemplatesRequest
+		if err := json.Unmarshal(req.Params, &listTemplatesReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		page, err := resourcesCap.ListResourceTemplates(ctx, session, func() *string {
+			if listTemplatesReq.Cursor == "" {
+				return nil
+			}
+			s := listTemplatesReq.Cursor
+			return &s
+		}())
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourceTemplatesResult{
+			ResourceTemplates: page.Items,
+			PaginatedResult: mcp.PaginatedResult{
+				NextCursor: func() string {
+					if page.NextCursor == nil {
+						return ""
+					}
+					return *page.NextCursor
+				}(),
+			},
 		})
 	case string(mcp.ResourcesSubscribeMethod):
 		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
@@ -1333,6 +1435,52 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 		}
 
 		result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
+		if err != nil {
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, result)
+	case string(mcp.LoggingSetLevelMethod):
+		loggingCap, ok, err := h.mcp.GetLoggingCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || loggingCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
+		}
+
+		var setLevelReq mcp.SetLevelRequest
+		if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		if !mcp.IsValidLoggingLevel(setLevelReq.Level) {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
+		}
+
+		if err := loggingCap.SetLevel(ctx, session, setLevelReq.Level); err != nil {
+			if errors.Is(err, mcpservice.ErrInvalidLoggingLevel) {
+				return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
+			}
+			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+		}
+
+		return jsonrpc.NewResultResponse(req.ID, struct{}{})
+	case string(mcp.CompletionCompleteMethod):
+		completionsCap, ok, err := h.mcp.GetCompletionsCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || completionsCap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
+		}
+
+		var completeReq mcp.CompleteRequest
+		if err := json.Unmarshal(req.Params, &completeReq); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+
+		result, err := completionsCap.Complete(ctx, session, &completeReq)
 		if err != nil {
 			return mapHooksErrorToJSONRPCError(req.ID, err), nil
 		}
@@ -1700,4 +1848,33 @@ func (h *StreamingHTTPHandler) getDispatcher(sessionID string) *outbound.Dispatc
 		return holder.d
 	}
 	return nil
+}
+
+// messageWriter is satisfied by sessionWithWriter; it provides the low-level message send primitive.
+type messageWriter interface {
+	WriteMessage(context.Context, []byte) error
+}
+
+// streamingProgressReporter emits notifications/progress for a given request over the session stream.
+type streamingProgressReporter struct {
+	mw        messageWriter
+	requestID string
+}
+
+func (p streamingProgressReporter) Report(ctx context.Context, progress, total float64) error {
+	params := mcp.ProgressNotificationParams{ProgressToken: p.requestID, Progress: progress}
+	if total > 0 {
+		params.Total = total
+	}
+	n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ProgressNotificationMethod)}
+	b, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	n.Params = b
+	msg, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	return p.mw.WriteMessage(ctx, msg)
 }

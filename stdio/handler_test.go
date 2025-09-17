@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -246,6 +247,69 @@ func TestResourcesListAndRead(t *testing.T) {
 	}
 	if len(readPayload.Contents) != 1 || readPayload.Contents[0].Text != "hello" {
 		t.Fatalf("unexpected read payload: %+v", readPayload)
+	}
+}
+
+func TestResourcesTemplatesList(t *testing.T) {
+	t.Parallel()
+
+	tmpl := mcp.ResourceTemplate{URITemplate: "file://{path}", Name: "file"}
+	resources := mcpservice.NewResourcesCapability(
+		mcpservice.WithListResourceTemplates(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+			return mcpservice.NewPage([]mcp.ResourceTemplate{tmpl}), nil
+		}),
+	)
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-res-templates", Version: "0.1.0"}),
+		mcpservice.WithResourcesCapability(resources),
+	)
+
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  string(mcp.InitializeMethod),
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
+		},
+	}
+	listReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  string(mcp.ResourcesTemplatesListMethod),
+		"params":  map[string]any{"cursor": ""},
+	}
+
+	var in bytes.Buffer
+	mustWriteJSONL(t, &in, initReq)
+	mustWriteJSONL(t, &in, listReq)
+	var out bytes.Buffer
+
+	h := NewHandler(server, WithIO(&in, &out))
+	if err := h.Serve(context.Background()); err != nil {
+		t.Fatalf("Serve returned error: %v", err)
+	}
+
+	lines := splitNonEmptyLines(out.String())
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 responses, got %d: %q", len(lines), out.String())
+	}
+
+	var rpcRes jsonrpc.Response
+	if err := json.Unmarshal([]byte(lines[1]), &rpcRes); err != nil {
+		t.Fatalf("unmarshal templates response: %v", err)
+	}
+	if rpcRes.Error != nil {
+		t.Fatalf("templates list error: %+v", rpcRes.Error)
+	}
+	var payload mcp.ListResourceTemplatesResult
+	if err := json.Unmarshal(rpcRes.Result, &payload); err != nil {
+		t.Fatalf("unmarshal templates payload: %v", err)
+	}
+	if len(payload.ResourceTemplates) != 1 || payload.ResourceTemplates[0].URITemplate != tmpl.URITemplate {
+		t.Fatalf("unexpected templates payload: %+v", payload)
 	}
 }
 
@@ -641,6 +705,76 @@ func TestPromptsListChangedNotification(t *testing.T) {
 	}
 }
 
+func TestResourcesUpdatedNotificationOnStdio(t *testing.T) {
+	t.Parallel()
+
+	// StaticResources with one file and subscribe support
+	sr := mcpservice.NewStaticResources(
+		[]mcp.Resource{{URI: "res://a.txt", Name: "a.txt"}},
+		nil,
+		map[string][]mcp.ResourceContents{
+			"res://a.txt": {{URI: "res://a.txt", Text: "A"}},
+		},
+	)
+	resources := mcpservice.NewResourcesCapability(mcpservice.WithStaticResourceContainer(sr))
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-updated", Version: "0.1.0"}),
+		mcpservice.WithResourcesCapability(resources),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize and mark notifications/initialized
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+	// Sync to ensure list_changed registrations are active
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	waitForLines(t, &linesMu, &lines, 2)
+
+	// Subscribe to the resource
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ResourcesSubscribeMethod), "params": map[string]any{"uri": "res://a.txt"}})
+
+	// Trigger an update by replacing contents (best-effort signal should tick)
+	sr.ReplaceAllContents(context.Background(), map[string][]mcp.ResourceContents{
+		"res://a.txt": {{URI: "res://a.txt", Text: "B"}},
+	})
+
+	// Wait for notifications/resources/updated
+	waitForNotification(t, &linesMu, &lines, string(mcp.ResourcesUpdatedNotificationMethod))
+
+	// Cleanup
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+}
+
 // helpers
 func mustWriteJSONL(t *testing.T, buf *bytes.Buffer, v any) {
 	t.Helper()
@@ -855,5 +989,222 @@ func TestAcceptProgressAndCancelledNotifications(t *testing.T) {
 	}
 	if respCount < 2 {
 		t.Fatalf("expected at least 2 responses, got %d; lines=%v", respCount, lines)
+	}
+}
+
+func TestStdioClientRootsListChangedForwarding(t *testing.T) {
+	t.Parallel()
+
+	// Channel to observe server-side roots list_changed listener invocations
+	fired := make(chan struct{}, 1)
+
+	// Tools capability that registers a roots list_changed listener on first list
+	tools := mcpservice.NewToolsCapability(
+		mcpservice.WithListTools(func(ctx context.Context, sess sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
+			if rootsCap, ok := sess.GetRootsCapability(); ok {
+				_, _ = rootsCap.RegisterRootsListChangedListener(ctx, func(ctx context.Context) error {
+					select {
+					case fired <- struct{}{}:
+					default:
+					}
+					return nil
+				})
+			}
+			return mcpservice.NewPage[mcp.Tool](nil), nil
+		}),
+	)
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-roots-forward", Version: "0.1.0"}),
+		mcpservice.WithToolsCapability(tools),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize with client capabilities advertising roots listChanged support
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{"roots": map[string]any{"listChanged": true}},
+			"clientInfo":      map[string]any{"name": "t", "version": "0"},
+		},
+	})
+
+	// Mark notifications/initialized and ping to flush handler registrations
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
+	waitForLines(t, &linesMu, &lines, 2)
+
+	// Trigger the tools/list request to cause the server to register a roots listener
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ToolsListMethod), "params": map[string]any{"cursor": ""}})
+	// Wait for the tools/list response to ensure registration has occurred
+	waitForLines(t, &linesMu, &lines, 3)
+
+	// Now send a client-originated roots list_changed notification
+	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.RootsListChangedNotificationMethod)})
+
+	// Expect the listener to be invoked
+	select {
+	case <-fired:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for server roots list_changed listener to fire")
+	}
+
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+}
+
+func TestLoggingSetLevelOnStdio(t *testing.T) {
+	t.Parallel()
+
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-logging", Version: "0.1.0"}),
+		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+
+	// Change level to debug
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": string(mcp.LoggingSetLevelMethod),
+		"params": map[string]any{"level": string(mcp.LoggingLevelDebug)},
+	})
+
+	// Close input and wait
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+
+	// Expect two responses (init + setLevel) and level var changed
+	if got := lv.Level(); got != slog.LevelDebug {
+		t.Fatalf("expected slog level debug, got %v", got)
+	}
+}
+
+func TestLoggingSetLevelOnStdio_InvalidLevel(t *testing.T) {
+	t.Parallel()
+
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+
+	server := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-logging", Version: "0.1.0"}),
+		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+	)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+
+	var (
+		lines    []string
+		linesMu  sync.Mutex
+		scanDone = make(chan struct{})
+	)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			s := strings.TrimSpace(scanner.Text())
+			if s != "" {
+				linesMu.Lock()
+				lines = append(lines, s)
+				linesMu.Unlock()
+			}
+		}
+		close(scanDone)
+	}()
+
+	h := NewHandler(server, WithIO(inR, outW))
+	done := make(chan error, 1)
+	go func() { done <- h.Serve(context.Background()) }()
+
+	// Initialize
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
+		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
+	})
+
+	// Invalid level
+	mustWriteJSONLToWriter(t, inW, map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": string(mcp.LoggingSetLevelMethod),
+		"params": map[string]any{"level": "verbose"},
+	})
+
+	// Close input and wait
+	_ = inW.Close()
+	<-done
+	_ = outW.Close()
+	<-scanDone
+
+	// Expect two responses and the second should be an error -32602
+	linesMu.Lock()
+	defer linesMu.Unlock()
+	if len(lines) < 2 {
+		t.Fatalf("expected at least 2 response lines, got %d", len(lines))
+	}
+	var res2 jsonrpc.Response
+	if err := json.Unmarshal([]byte(lines[1]), &res2); err != nil {
+		t.Fatalf("unmarshal setLevel response: %v", err)
+	}
+	if res2.Error == nil || res2.Error.Code != jsonrpc.ErrorCodeInvalidParams {
+		t.Fatalf("expected invalid params error, got %#v", res2.Error)
 	}
 }

@@ -24,6 +24,24 @@ const (
 	LoggingLevelEmergency LoggingLevel = "emergency"
 )
 
+// IsValidLoggingLevel reports whether the provided level is one of the
+// protocol-defined syslog severities.
+func IsValidLoggingLevel(level LoggingLevel) bool {
+	switch level {
+	case LoggingLevelDebug,
+		LoggingLevelInfo,
+		LoggingLevelNotice,
+		LoggingLevelWarning,
+		LoggingLevelError,
+		LoggingLevelCritical,
+		LoggingLevelAlert,
+		LoggingLevelEmergency:
+		return true
+	default:
+		return false
+	}
+}
+
 // Capabilities
 // ClientCapabilities advertises client features.
 type ClientCapabilities struct {
@@ -47,6 +65,7 @@ type ServerCapabilities struct {
 	Tools *struct {
 		ListChanged bool `json:"listChanged"`
 	} `json:"tools,omitempty"`
+	Completions *struct{} `json:"completions,omitempty"`
 }
 
 // ImplementationInfo describes the implementation name and version.
