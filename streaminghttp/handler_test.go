@@ -368,9 +368,25 @@ func TestMultiInstance(t *testing.T) {
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Step 3: Trigger a resources list change by publishing the internal server event.
-		// This emulates any instance detecting a change and publishing to the session-scoped topic.
+		// Step 3: Coordinate on server-side readiness, then publish once
 		ctx := t.Context()
+		readyCh := make(chan struct{}, 1)
+		unsub, err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+			select {
+			case readyCh <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		if err == nil && unsub != nil {
+			defer unsub()
+		}
+		select {
+		case <-readyCh:
+			// stream ready
+		case <-time.After(3 * time.Second):
+			// proceed anyway; worst case the publish below races (rare on CI), the SSE reader still loops
+		}
 		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.ResourcesListChangedNotificationMethod), nil)
 
 		// Step 4: Wait for notification
@@ -439,8 +455,25 @@ func TestMultiInstance(t *testing.T) {
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Step 3: Publish tools list_changed event on the session bus
+		// Step 3: Coordinate on server-side readiness, then publish once
 		ctx := t.Context()
+		readyCh := make(chan struct{}, 1)
+		unsub, err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+			select {
+			case readyCh <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		if err == nil && unsub != nil {
+			defer unsub()
+		}
+		select {
+		case <-readyCh:
+			// stream ready
+		case <-time.After(3 * time.Second):
+			// proceed anyway
+		}
 		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.ToolsListChangedNotificationMethod), nil)
 
 		// Step 4: Wait for notification
