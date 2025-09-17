@@ -14,8 +14,31 @@ import (
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 )
 
-// writeMux implements jsonrpcWriter for tests via the real mux.
-func newTestMux(buf *bytes.Buffer) *writeMux { return &writeMux{w: bufio.NewWriter(buf)} }
+// safeBuffer is a concurrency-safe bytes.Buffer for tests.
+// It avoids races when reading while writes are in-flight.
+type safeBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+// Snapshot returns the current contents as a string under lock.
+func (s *safeBuffer) Snapshot() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// writeMux implements jsonrpcWriter for tests via the real mux, backed by a safeBuffer.
+func newTestMux() (*writeMux, *safeBuffer) {
+	sb := &safeBuffer{}
+	return &writeMux{w: bufio.NewWriter(sb)}, sb
+}
 
 func readLines(t *testing.T, s string) []string {
 	t.Helper()
@@ -29,12 +52,11 @@ func readLines(t *testing.T, s string) []string {
 	return out
 }
 
-func waitForBufferLines(t *testing.T, mux *writeMux, buf *bytes.Buffer, n int, timeout time.Duration) []string {
+func waitForBufferLines(t *testing.T, buf *safeBuffer, n int, timeout time.Duration) []string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		_ = mux.w.Flush()
-		lines := readLines(t, buf.String())
+		lines := readLines(t, buf.Snapshot())
 		if len(lines) >= n {
 			return lines
 		}
@@ -48,8 +70,7 @@ func waitForBufferLines(t *testing.T, mux *writeMux, buf *bytes.Buffer, n int, t
 func TestOutboundDispatcher_RequestResponse_OutOfOrder(t *testing.T) {
 	t.Parallel()
 
-	var w bytes.Buffer
-	mux := newTestMux(&w)
+	mux, sb := newTestMux()
 	d := newOutboundDispatcher(mux)
 
 	ctx := context.Background()
@@ -76,7 +97,7 @@ func TestOutboundDispatcher_RequestResponse_OutOfOrder(t *testing.T) {
 	}()
 
 	// Extract written requests from buffer
-	lines := waitForBufferLines(t, mux, &w, 2, time.Second)
+	lines := waitForBufferLines(t, sb, 2, time.Second)
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 outbound requests, got %d", len(lines))
 	}
@@ -101,8 +122,7 @@ func TestOutboundDispatcher_RequestResponse_OutOfOrder(t *testing.T) {
 func TestOutboundDispatcher_CancelContext_SendsCancelled(t *testing.T) {
 	t.Parallel()
 
-	var w bytes.Buffer
-	mux := newTestMux(&w)
+	mux, sb := newTestMux()
 	d := newOutboundDispatcher(mux)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -113,7 +133,7 @@ func TestOutboundDispatcher_CancelContext_SendsCancelled(t *testing.T) {
 	}()
 
 	// Find the request ID written
-	lines := waitForBufferLines(t, mux, &w, 1, time.Second)
+	lines := waitForBufferLines(t, sb, 1, time.Second)
 	if len(lines) < 1 {
 		t.Fatalf("expected at least 1 outbound request, got %d", len(lines))
 	}
@@ -128,7 +148,7 @@ func TestOutboundDispatcher_CancelContext_SendsCancelled(t *testing.T) {
 	}
 
 	// A notifications/cancelled should have been written
-	lines = waitForBufferLines(t, mux, &w, 2, time.Second)
+	lines = waitForBufferLines(t, sb, 2, time.Second)
 	if len(lines) < 2 {
 		t.Fatalf("expected at least 2 outbound messages (request + cancel), got %d", len(lines))
 	}
@@ -150,8 +170,7 @@ func TestOutboundDispatcher_CancelContext_SendsCancelled(t *testing.T) {
 func TestOutboundDispatcher_RemoteCancelled(t *testing.T) {
 	t.Parallel()
 
-	var w bytes.Buffer
-	mux := newTestMux(&w)
+	mux, sb := newTestMux()
 	d := newOutboundDispatcher(mux)
 
 	ctx := context.Background()
@@ -165,7 +184,7 @@ func TestOutboundDispatcher_RemoteCancelled(t *testing.T) {
 		}
 	}()
 
-	lines := waitForBufferLines(t, mux, &w, 1, time.Second)
+	lines := waitForBufferLines(t, sb, 1, time.Second)
 	if len(lines) < 1 {
 		t.Fatalf("expected at least 1 outbound request, got %d", len(lines))
 	}
