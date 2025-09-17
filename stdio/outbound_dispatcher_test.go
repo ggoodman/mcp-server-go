@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -159,7 +160,7 @@ func TestOutboundDispatcher_RemoteCancelled(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_, err := d.Call(ctx, "test/m", nil)
-		if !errorsIs(err, ErrRemoteCancelled) {
+		if !errors.Is(err, ErrRemoteCancelled) {
 			t.Errorf("expected ErrRemoteCancelled, got %v", err)
 		}
 	}()
@@ -175,8 +176,4 @@ func TestOutboundDispatcher_RemoteCancelled(t *testing.T) {
 	notif := jsonrpc.AnyMessage{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: "notifications/cancelled", Params: mustJSON(map[string]any{"requestId": req.ID.String()})}
 	d.OnNotification(notif)
 	wg.Wait()
-}
-
-func errorsIs(err, target error) bool {
-	return (err != nil && target != nil && err.Error() == target.Error())
 }
