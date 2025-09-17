@@ -66,10 +66,13 @@ func (h *Handler) Serve(ctx context.Context) error {
 	reader := bufio.NewReader(h.r)
 	bw := bufio.NewWriter(h.w)
 	wm := &writeMux{w: bw}
+	// Outbound dispatcher for server-initiated RPCs
+	disp := newOutboundDispatcher(wm)
 
 	// Identify user via provider
 	uid, err := h.userProvider.CurrentUserID()
 	if err != nil {
+		disp.Close(err)
 		return err
 	}
 
@@ -82,6 +85,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 		// Respect context
 		select {
 		case <-ctx.Done():
+			disp.Close(ctx.Err())
 			return ctx.Err()
 		default:
 		}
@@ -92,6 +96,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 			if errors.Is(rerr, io.EOF) {
 				// Graceful shutdown on EOF
 				_ = bw.Flush()
+				disp.Close(io.EOF)
 				return nil
 			}
 			// Retry briefly on read timeouts
@@ -100,6 +105,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
+			disp.Close(rerr)
 			return rerr
 		}
 		if len(line) == 0 || isAllWhitespace(line) {
@@ -231,6 +237,8 @@ func (h *Handler) Serve(ctx context.Context) error {
 		// After initialization
 		switch any.Type() {
 		case "notification":
+			// Let dispatcher observe notifications (cancel/progress)
+			disp.OnNotification(any)
 			// notifications/initialized marks that the client completed its side of init.
 			// Only after this point should the server begin emitting list_changed notifications.
 			if any.Method == string(mcp.InitializedNotificationMethod) && !registered {
@@ -264,7 +272,10 @@ func (h *Handler) Serve(ctx context.Context) error {
 			// Other notifications (progress, cancelled, etc.) are accepted and ignored.
 			continue
 		case "response":
-			// No server-initiated requests in stdio baseline. Ignore.
+			// Route responses to the outbound dispatcher if any pending call exists.
+			if resp := any.AsResponse(); resp != nil {
+				disp.OnResponse(resp)
+			}
 			continue
 		case "request":
 			req := any.AsRequest()

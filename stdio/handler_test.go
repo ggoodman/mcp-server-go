@@ -424,6 +424,8 @@ func TestResourcesSubscribeAndListChanged(t *testing.T) {
 
 	// Trigger a list change by adding a new resource; should yield a list_changed notification.
 	_ = sr.AddResource(context.Background(), mcp.Resource{URI: "res://b.txt", Name: "b.txt"})
+	// Wait until we observe the notification before proceeding to avoid race with shutdown.
+	waitForNotification(t, &linesMu, &lines, string(mcp.ResourcesListChangedNotificationMethod))
 
 	// Now request unsubscribe and close input to end the handler loop gracefully
 	mustWriteJSONLToWriter(t, inW, unsubReq)
