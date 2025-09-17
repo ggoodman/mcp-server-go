@@ -681,6 +681,26 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 	defer unsubUpdated()
 
+	// Also subscribe for tools list_changed to forward to the client
+	const toolsListChangedTopic = string(mcp.ToolsListChangedNotificationMethod)
+	unsubTools, subToolsErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), toolsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+		n := &jsonrpc.Request{
+			JSONRPCVersion: jsonrpc.ProtocolVersion,
+			Method:         string(mcp.ToolsListChangedNotificationMethod),
+			Params:         nil,
+		}
+		b, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		return sh.WriteMessage(evtCtx, b)
+	})
+	if subToolsErr != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer unsubTools()
+
 	// Also subscribe for prompts list_changed to forward to the client
 	const promptsListChangedTopic = string(mcp.PromptsListChangedNotificationMethod)
 	unsubPrompts, subPromptsErr := h.sessionHost.SubscribeEvents(ctx, sh.SessionID(), promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
@@ -708,6 +728,15 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 			_, _ = lc.Register(ctx, sh.Session(), func(cbCtx context.Context, sess sessions.Session, _ string) {
 				// best-effort publish to internal topic; no payload required
 				_ = h.sessionHost.PublishEvent(cbCtx, sess.SessionID(), resourcesListChangedTopic, nil)
+			})
+		}
+	}
+
+	// Bridge tools/list_changed notifications via the internal bus as well.
+	if toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, sh.Session()); err == nil && ok {
+		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {
+			_, _ = lc.Register(ctx, sh.Session(), func(cbCtx context.Context, sess sessions.Session) {
+				_ = h.sessionHost.PublishEvent(cbCtx, sess.SessionID(), toolsListChangedTopic, nil)
 			})
 		}
 	}
