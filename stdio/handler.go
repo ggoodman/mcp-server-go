@@ -41,6 +41,10 @@ type Handler struct {
 
 	// writeMux for the current Serve invocation (single use per handler)
 	wm *writeMux
+
+	// inFlight guards per-request cancellation and progress correlation by JSON-RPC ID
+	inFlightMu sync.Mutex
+	inFlight   map[string]context.CancelFunc
 }
 
 // NewHandler constructs a stdio Handler with defaults and applies options.
@@ -56,6 +60,7 @@ func NewHandler(srv mcpservice.ServerCapabilities, opts ...Option) *Handler {
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.inFlight = make(map[string]context.CancelFunc)
 	return h
 }
 
@@ -275,6 +280,20 @@ func (h *Handler) Serve(ctx context.Context) error {
 		case "notification":
 			// Let dispatcher observe notifications (cancel/progress)
 			disp.OnNotification(any)
+			// Inbound cancellation from client for server-handled request IDs
+			if any.Method == string(mcp.CancelledNotificationMethod) && len(any.Params) > 0 {
+				var p struct {
+					RequestID string `json:"requestId"`
+				}
+				if err := json.Unmarshal(any.Params, &p); err == nil && p.RequestID != "" {
+					h.inFlightMu.Lock()
+					if cancel, ok := h.inFlight[p.RequestID]; ok && cancel != nil {
+						cancel()
+						delete(h.inFlight, p.RequestID)
+					}
+					h.inFlightMu.Unlock()
+				}
+			}
 			// Client-originated roots list_changed: invoke registered listeners if present.
 			if any.Method == string(mcp.RootsListChangedNotificationMethod) && sess != nil && sess.roots != nil {
 				sess.roots.notifyListeners(ctx)
@@ -322,8 +341,27 @@ func (h *Handler) Serve(ctx context.Context) error {
 			if req == nil || req.ID == nil {
 				continue
 			}
+			// Create a per-request context that we can cancel if the client sends notifications/cancelled
+			reqCtx, cancel := context.WithCancel(ctx)
+			// Track cancel by request ID string
+			rid := req.ID.String()
+			h.inFlightMu.Lock()
+			h.inFlight[rid] = cancel
+			h.inFlightMu.Unlock()
+
+			// Inject a ProgressReporter tied to this request ID
+			if req.ID != nil && !req.ID.IsNil() {
+				pr := stdioProgressReporter{w: wm, requestID: rid}
+				reqCtx = mcpservice.WithProgressReporter(reqCtx, pr)
+			}
+
 			// Dispatch
-			resp, err := h.handleRequest(ctx, sess, req)
+			resp, err := h.handleRequest(reqCtx, sess, req)
+			// Cleanup inflight entry
+			h.inFlightMu.Lock()
+			delete(h.inFlight, rid)
+			h.inFlightMu.Unlock()
+			cancel()
 			if err != nil {
 				// Map internal error
 				r := jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
@@ -339,6 +377,21 @@ func (h *Handler) Serve(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// stdioProgressReporter emits notifications/progress for a given JSON-RPC request ID.
+type stdioProgressReporter struct {
+	w         jsonrpcWriter
+	requestID string
+}
+
+func (p stdioProgressReporter) Report(ctx context.Context, progress, total float64) error {
+	params := mcp.ProgressNotificationParams{ProgressToken: p.requestID, Progress: progress}
+	if total > 0 {
+		params.Total = total
+	}
+	n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ProgressNotificationMethod), Params: mustJSON(params)}
+	return p.w.writeJSONRPC(n)
 }
 
 // handleRequest routes JSON-RPC requests to server capabilities and produces a response.

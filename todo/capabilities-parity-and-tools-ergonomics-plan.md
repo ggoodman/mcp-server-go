@@ -15,14 +15,14 @@ This plan tracks work to reach full capability coverage across transports and to
     - [ ] Provide helper to emit notifications/message (LoggingMessageNotification) to the client
     - [ ] Add optional mcpservice LoggingMessages capability or a utility: mcpservice.NewSlogBridge(h slog.Handler) to forward logs
     - [ ] Advertise support in initialize when enabled; document usage and impact
-  - [ ] Progress notifications for long-running requests
-    - [ ] Define a transport-agnostic ProgressEmitter interface and context injection: mcpservice.Progress(ctx).Report(current, total)
-    - [ ] Derive progress token from JSON-RPC request ID (string form) and emit notifications/progress
-    - [ ] Implement emission paths in stdio and streaminghttp
+  - [x] Progress notifications for long-running requests
+    - [x] Define a transport-agnostic ProgressEmitter interface and context injection: mcpservice.Progress(ctx).Report(current, total)
+    - [x] Derive progress token from JSON-RPC request ID (string form) and emit notifications/progress
+    - [x] Implement emission paths in stdio and streaminghttp
     - [ ] Add tests for progress during tools/call and resources/read
-  - [ ] Inbound request cancellation
-    - [ ] Track in-flight server-handled requests by JSON-RPC ID and cancel their contexts when notifications/cancelled arrives from client
-    - [ ] Implement in stdio and streaminghttp with minimal contention and safe teardown
+  - [x] Inbound request cancellation
+    - [x] Track in-flight server-handled requests by JSON-RPC ID and cancel their contexts when notifications/cancelled arrives from client
+    - [x] Implement in stdio and streaminghttp with minimal contention and safe teardown
     - [ ] Tests: cancellation of tools/call and resources/read mid-flight
   - [ ] Client-side capabilities parity (server calling client)
     - [ ] Verify sampling, roots (incl. listChanged), and elicitation already work over both transports
@@ -48,12 +48,12 @@ This plan tracks work to reach full capability coverage across transports and to
 
 - [ ] Transport updates to support ergonomics
 
-  - [ ] streaminghttp
-    - [ ] Capture request ID and inject progress emitter into ctx for each call
-    - [ ] Ensure SSE writer path can interleave progress events before final response
-    - [ ] Implement inbound cancellation mapping to per-request contexts
-  - [ ] stdio
-    - [ ] Same as above: progress and cancellation mapping; ensure writeMux handles interleaving notifications safely
+  - [x] streaminghttp
+    - [x] Capture request ID and inject progress emitter into ctx for each call
+    - [x] Ensure SSE writer path can interleave progress events before final response
+    - [x] Implement inbound cancellation mapping to per-request contexts
+  - [x] stdio
+    - [x] Same as above: progress and cancellation mapping; ensure writeMux handles interleaving notifications safely
 
 - [ ] API consistency and polish (breaking changes acceptable)
 
