@@ -249,6 +249,13 @@ func (h *Handler) Serve(ctx context.Context) error {
 				}
 			}
 
+			// Completions capability (advertised if supported)
+			if _, ok, err := h.srv.GetCompletionsCapability(ctx, sess); err == nil && ok {
+				if initRes.Capabilities.Completions == nil {
+					initRes.Capabilities.Completions = &struct{}{}
+				}
+			}
+
 			// Respond
 			if resp, err := jsonrpc.NewResultResponse(req.ID, initRes); err != nil {
 				r2 := jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "failed to encode initialize result", nil)
@@ -603,6 +610,24 @@ func (h *Handler) handleRequest(ctx context.Context, session sessions.Session, r
 			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
 		}
 		return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+
+	case string(mcp.CompletionCompleteMethod):
+		ccap, ok, err := h.srv.GetCompletionsCapability(ctx, session)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !ok || ccap == nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
+		}
+		var in mcp.CompleteRequest
+		if err := json.Unmarshal(req.Params, &in); err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
+		}
+		result, err := ccap.Complete(ctx, session, &in)
+		if err != nil {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		return jsonrpc.NewResultResponse(req.ID, result)
 	}
 	return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "method not found", nil), nil
 }

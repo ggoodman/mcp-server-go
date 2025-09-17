@@ -36,6 +36,10 @@ type server struct {
 	// logging capability
 	staticLoggingCap LoggingCapability
 	loggingProvider  func(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error)
+
+	// completions capability
+	staticCompletionsCap CompletionsCapability
+	completionsProvider  func(ctx context.Context, session sessions.Session) (CompletionsCapability, bool, error)
 }
 
 // NewServer builds a ServerCapabilities using functional options. Options allow
@@ -134,6 +138,16 @@ func WithLoggingProvider(fn func(ctx context.Context, session sessions.Session) 
 	return func(s *server) { s.loggingProvider = fn }
 }
 
+// WithCompletionsCapability wires a static CompletionsCapability (used for all sessions).
+func WithCompletionsCapability(cap CompletionsCapability) ServerOption {
+	return func(s *server) { s.staticCompletionsCap = cap }
+}
+
+// WithCompletionsProvider wires a per-session completions capability provider.
+func WithCompletionsProvider(fn func(ctx context.Context, session sessions.Session) (CompletionsCapability, bool, error)) ServerOption {
+	return func(s *server) { s.completionsProvider = fn }
+}
+
 // GetServerInfo implements ServerCapabilities.
 func (s *server) GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error) {
 	if s.infoProvider != nil {
@@ -208,6 +222,17 @@ func (s *server) GetLoggingCapability(ctx context.Context, session sessions.Sess
 	}
 	if s.staticLoggingCap != nil {
 		return s.staticLoggingCap, true, nil
+	}
+	return nil, false, nil
+}
+
+// GetCompletionsCapability implements ServerCapabilities.
+func (s *server) GetCompletionsCapability(ctx context.Context, session sessions.Session) (CompletionsCapability, bool, error) {
+	if s.completionsProvider != nil {
+		return s.completionsProvider(ctx, session)
+	}
+	if s.staticCompletionsCap != nil {
+		return s.staticCompletionsCap, true, nil
 	}
 	return nil, false, nil
 }

@@ -65,6 +65,7 @@ type ServerCapabilities struct {
 	Tools *struct {
 		ListChanged bool `json:"listChanged"`
 	} `json:"tools,omitempty"`
+	Completions *struct{} `json:"completions,omitempty"`
 }
 
 // ImplementationInfo describes the implementation name and version.
