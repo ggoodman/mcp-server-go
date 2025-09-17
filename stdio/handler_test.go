@@ -759,8 +759,10 @@ func TestResourcesUpdatedNotificationOnStdio(t *testing.T) {
 
 	// Subscribe to the resource
 	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ResourcesSubscribeMethod), "params": map[string]any{"uri": "res://a.txt"}})
+	// Wait for the subscribe response to ensure the registration is active before triggering updates
+	waitForLines(t, &linesMu, &lines, 3)
 
-	// Trigger an update by replacing contents (best-effort signal should tick)
+	// Trigger an update by replacing contents (best-effort signal should tick) after subscription is active
 	sr.ReplaceAllContents(context.Background(), map[string][]mcp.ResourceContents{
 		"res://a.txt": {{URI: "res://a.txt", Text: "B"}},
 	})
