@@ -11,30 +11,29 @@ Drop-in `http.Handler` for the Model Context Protocol (MCP) Streaming HTTP trans
 
 1. Horizontal scalability
 
-- Multiple instances can serve the same MCP endpoint and coordinate safely.
-- Per-session ordered messaging with resume using `Last-Event-ID`.
-- Pluggable cross-instance coordination via `sessions.SessionHost`.
-  - In-memory host for single-process or tests: `sessions/memoryhost`.
-  - Redis-backed host for multi-instance deployments: `sessions/redishost`.
+   - Multiple instances can serve the same MCP endpoint and coordinate safely.
+   - Per-session ordered messaging with resume using `Last-Event-ID`.
+   - Pluggable cross-instance coordination via `sessions.SessionHost`.
+     - In-memory host for single-process or tests: `sessions/memoryhost`.
+     - Redis-backed host for multi-instance deployments: `sessions/redishost`.
 
 2. Authorization and session management
 
-- Treats auth and sessions as first-class production concerns.
-- Out-of-the-box JWT access-token validation (RFC 9068) via OIDC discovery.
-- Protected Resource Metadata and Authorization Server Metadata endpoints are served for discovery. See `/.well-known/oauth-protected-resource/` and `/.well-known/oauth-authorization-server`.
-- Clean, minimal `auth.Authenticator` interface if you need custom logic.
+   - Treats auth and sessions as first-class production concerns.
+   - Out-of-the-box JWT access-token validation (RFC 9068) via OIDC discovery.
+   - Protected Resource Metadata and Authorization Server Metadata endpoints are served for discovery. See `/.well-known/oauth-protected-resource/` and `/.well-known/oauth-authorization-server`.
+   - Clean, minimal `auth.Authenticator` interface if you need custom logic.
 
 3. Dynamic capabilities
 
-- Don’t assume your resources or tools are static. Implement dynamic listings and behaviors that pull from databases, APIs, or filesystems.
-- Prefer static containers when that’s simpler — you still get listChanged notifications and strict input schemas.
-- Swap static for dynamic later without rewriting your server.
+   - Don’t assume your resources or tools are static. Implement dynamic listings and behaviors that pull from databases, APIs, or filesystems.
+   - Prefer static containers when that’s simpler — you still get listChanged notifications and strict input schemas.
+   - Swap static for dynamic later without rewriting your server.
 
 4. Easy adoption, long-term power
-
-- Layered API: start with the drop-in handler, grow into custom capabilities.
-- Pragmatic defaults; minimal opinions. Security and isolation are non-negotiable.
-- Designed around the hard cases first so simple cases stay simple.
+   - Layered API: start with the drop-in handler, grow into custom capabilities.
+   - Pragmatic defaults; minimal opinions. Security and isolation are non-negotiable.
+   - Designed around the hard cases first so simple cases stay simple.
 
 ## Install
 
@@ -44,7 +43,7 @@ go get github.com/ggoodman/mcp-server-go
 
 ## Quick start (prod-friendly with OIDC)
 
-This minimal server exposes a typed tool, validates bearer tokens discovered from your issuer, and is horizontally scalable with Redis.
+This minimal server exposes a typed tool using the writer-based API, validates bearer tokens discovered from your issuer, and is horizontally scalable with Redis.
 
 ```go
 package main
@@ -83,8 +82,10 @@ func main() {
     // 2) Typed tool with strict input schema by default
     translate := mcpservice.NewTool[TranslateArgs](
         "translate",
-        func(ctx context.Context, _ sessions.Session, a TranslateArgs) (*mcp.CallToolResult, error) {
-            return mcpservice.TextResult("Translated to "+a.To+": "+a.Text), nil
+        func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
+            a := r.Args()
+            _ = w.AppendText("Translated to " + a.To + ": " + a.Text)
+            return nil
         },
         mcpservice.WithToolDescription("Translate text to a target language."),
     )
@@ -173,7 +174,7 @@ When you enable discovery with `WithAuthorizationServerDiscovery(issuer)`, the h
 - Mirrors Authorization Server Metadata at `/.well-known/oauth-authorization-server`.
 - Responds to unauthorized requests with a standards-compliant `WWW-Authenticate` header that points at the resource metadata.
 
-See the spec documents under `docs/` for details.
+See the spec documents under `specs/` for details.
 
 ## Dynamic capabilities (and static containers)
 
@@ -211,10 +212,19 @@ sr := mcpservice.NewStaticResources(nil, nil, nil)
 rc := mcpservice.NewResourcesCapability(
     mcpservice.WithStaticResourceContainer(sr),
 )
+
+type HelloArgs struct {
+    Name string `json:"name"`
+}
+
 st := mcpservice.NewStaticTools(
-    mcpservice.NewTool[struct{ Name string `json:"name"` }]("hello", func(ctx context.Context, _ sessions.Session, a struct{ Name string }) (*mcp.CallToolResult, error) {
-        return mcpservice.TextResult("hi, "+a.Name), nil
-    }),
+    mcpservice.NewTool[HelloArgs](
+        "hello",
+        func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[HelloArgs]) error {
+            _ = w.AppendText("hi, " + r.Args().Name)
+            return nil
+        },
+    ),
 )
 server := mcpservice.NewServer(
     mcpservice.WithResourcesCapability(rc),

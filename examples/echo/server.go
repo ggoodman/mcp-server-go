@@ -28,9 +28,14 @@ func New() mcpservice.ServerCapabilities {
 	}
 
 	tools := mcpservice.NewStaticTools(
-		mcpservice.TypedTool(echoDesc, func(ctx context.Context, _ sessions.Session, a EchoArgs) (*mcp.CallToolResult, error) {
-			return mcpservice.TextResult("you said: " + a.Message), nil
-		}),
+		mcpservice.NewTool[EchoArgs](
+			"echo",
+			func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[EchoArgs]) error {
+				_ = w.AppendText("you said: " + r.Args().Message)
+				return nil
+			},
+			mcpservice.WithToolDescription(echoDesc.Description),
+		),
 	)
 
 	return mcpservice.NewServer(

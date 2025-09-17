@@ -751,6 +751,11 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 	defer unsubPrompts()
 
+	// Signal to server-internal listeners (e.g., tests) that the SSE stream
+	// has finished wiring its internal subscriptions and is ready to receive
+	// server-internal events. This event is not forwarded to clients.
+	_ = h.sessionHost.PublishEvent(ctx, sh.SessionID(), "streaminghttp/ready", nil)
+
 	// Discover resources capability and (optionally) listChanged capability
 	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, sh.Session()); err == nil && ok {
 		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, sh.Session()); lErr == nil && hasLC {

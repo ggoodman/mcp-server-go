@@ -21,6 +21,77 @@ type StaticTool struct {
 	Handler    ToolHandler
 }
 
+// ToolRequest is the container for tool call input and request metadata.
+// It is generic over the typed argument struct A.
+type ToolRequest[A any] struct {
+	name string
+	raw  json.RawMessage
+	args A
+}
+
+func (r *ToolRequest[A]) Name() string                  { return r.name }
+func (r *ToolRequest[A]) RawArguments() json.RawMessage { return r.raw }
+func (r *ToolRequest[A]) Args() A                       { return r.args }
+
+// ToolResponseWriterTyped extends ToolResponseWriter for typed output tools.
+// It allows setting a structuredContent value of type O.
+type ToolResponseWriterTyped[O any] interface {
+	ToolResponseWriter
+	SetStructured(v O)
+}
+
+// internal typed writer wrapper
+type toolResponseWriterTyped[O any] struct {
+	ToolResponseWriter
+	structured any // stored as concrete O; serialized at finalize
+}
+
+func (tw *toolResponseWriterTyped[O]) SetStructured(v O) { tw.structured = v }
+
+// NewToolWithWriter constructs a StaticTool using a typed input struct and a
+// writer-based handler shape. It keeps the current typed-input decoding logic
+// and enforces the writer path for composing results.
+// NewTool constructs a writer-based tool with typed input A and a ToolRequest container.
+func NewTool[A any](name string, fn func(ctx context.Context, session sessions.Session, w ToolResponseWriter, r *ToolRequest[A]) error, opts ...ToolOption) StaticTool {
+	// Leverage existing input schema reflection and tool descriptor building
+	cfg := toolConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	input := reflectToMCPInputSchema[A](cfg.allowAdditionalProperties)
+	desc := mcp.Tool{
+		Name:        name,
+		Description: cfg.description,
+		InputSchema: input,
+	}
+
+	handler := func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+		// Strict/lenient decoding mirrors existing behavior
+		var a A
+		if len(req.Arguments) > 0 {
+			if cfg.allowAdditionalProperties {
+				if err := json.Unmarshal(req.Arguments, &a); err != nil {
+					return Errorf("invalid arguments: %v", err), nil
+				}
+			} else {
+				dec := json.NewDecoder(bytes.NewReader(req.Arguments))
+				dec.DisallowUnknownFields()
+				if err := dec.Decode(&a); err != nil {
+					return Errorf("invalid arguments: %v", err), nil
+				}
+			}
+		}
+		w := newToolResponseWriter(ctx)
+		r := &ToolRequest[A]{name: req.Name, raw: req.Arguments, args: a}
+		if err := fn(ctx, session, w, r); err != nil {
+			return nil, err
+		}
+		return w.Result(), nil
+	}
+
+	return StaticTool{Descriptor: desc, Handler: handler}
+}
+
 // TypedTool wraps a strongly typed args function into a StaticTool.
 // It unmarshals req.Arguments into A and invokes fn.
 func TypedTool[A any](desc mcp.Tool, fn func(ctx context.Context, session sessions.Session, args A) (*mcp.CallToolResult, error)) StaticTool {
@@ -63,22 +134,21 @@ func WithToolAllowAdditionalProperties(allow bool) ToolOption {
 // - Down-converts it to MCP's simplified ToolInputSchema
 // - Builds the tool descriptor with the provided name and options
 // - Wraps the handler with runtime JSON decoding (rejecting unknown fields by default)
-func NewTool[A any](name string, fn func(ctx context.Context, session sessions.Session, args A) (*mcp.CallToolResult, error), opts ...ToolOption) StaticTool {
-	// Apply options
+// NewToolWithOutput constructs a typed-input, typed-output tool.
+func NewToolWithOutput[A, O any](name string, fn func(ctx context.Context, session sessions.Session, w ToolResponseWriterTyped[O], r *ToolRequest[A]) error, opts ...ToolOption) StaticTool {
 	cfg := toolConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-
-	// Build descriptor from reflected schema
 	input := reflectToMCPInputSchema[A](cfg.allowAdditionalProperties)
+	// Reflect O as output schema; always object per spec simplification.
+	outSchema := reflectToMCPOutputSchema[O]()
 	desc := mcp.Tool{
-		Name:        name,
-		Description: cfg.description,
-		InputSchema: input,
+		Name:         name,
+		Description:  cfg.description,
+		InputSchema:  input,
+		OutputSchema: &outSchema,
 	}
-
-	// Build handler with strict/lenient decoding as configured
 	handler := func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
 		var a A
 		if len(req.Arguments) > 0 {
@@ -94,9 +164,27 @@ func NewTool[A any](name string, fn func(ctx context.Context, session sessions.S
 				}
 			}
 		}
-		return fn(ctx, session, a)
+		baseWriter := newToolResponseWriter(ctx)
+		tw := &toolResponseWriterTyped[O]{ToolResponseWriter: baseWriter}
+		r := &ToolRequest[A]{name: req.Name, raw: req.Arguments, args: a}
+		if err := fn(ctx, session, tw, r); err != nil {
+			return nil, err
+		}
+		res := baseWriter.Result()
+		// Attach structuredContent if set
+		if tw.structured != nil {
+			// We rely on JSON marshalling of the concrete value later; store as map via json roundtrip if needed.
+			// For simplicity, marshal+unmarshal once to map[string]any.
+			b, err := json.Marshal(tw.structured)
+			if err == nil {
+				var m map[string]any
+				if err2 := json.Unmarshal(b, &m); err2 == nil {
+					res.StructuredContent = m
+				}
+			}
+		}
+		return res, nil
 	}
-
 	return StaticTool{Descriptor: desc, Handler: handler}
 }
 
@@ -141,6 +229,31 @@ func reflectToMCPInputSchema[A any](allowAdditional bool) mcp.ToolInputSchema {
 		Required:             required,
 		AdditionalProperties: allowAdditional,
 	}
+}
+
+// reflectToMCPOutputSchema reflects a Go type O into a mcp.ToolOutputSchema.
+func reflectToMCPOutputSchema[O any]() mcp.ToolOutputSchema {
+	r := &jsonschema.Reflector{
+		DoNotReference: true,
+		ExpandedStruct: true,
+	}
+	s := r.Reflect(new(O))
+	if s == nil || s.Type != "object" {
+		return mcp.ToolOutputSchema{Type: "object", Properties: map[string]mcp.SchemaProperty{}}
+	}
+	props := make(map[string]mcp.SchemaProperty)
+	if s.Properties != nil {
+		for el := s.Properties.Oldest(); el != nil; el = el.Next() {
+			key := el.Key
+			val := el.Value
+			props[key] = toMCPProperty(val)
+		}
+	}
+	var required []string
+	if len(s.Required) > 0 {
+		required = append(required, s.Required...)
+	}
+	return mcp.ToolOutputSchema{Type: "object", Properties: props, Required: required}
 }
 
 // toMCPProperty recursively maps a jsonschema.Schema to the simplified MCP SchemaProperty.

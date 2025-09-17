@@ -157,6 +157,9 @@ type ElicitResultReceived struct {
 type CallToolResult struct {
 	Content []ContentBlock `json:"content,omitempty"`
 	IsError bool           `json:"isError,omitzero"`
+	// StructuredContent contains a typed object that conforms to the tool's
+	// OutputSchema when provided.
+	StructuredContent map[string]any `json:"structuredContent,omitempty"`
 	BaseMetadata
 }
 

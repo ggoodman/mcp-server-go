@@ -50,11 +50,18 @@ func main() {
 	// 2) Tools (auto-derived JSON Schema; strict by default)
 	translate := mcpservice.NewTool[TranslateArgs](
 		"translate",
-		func(ctx context.Context, _ sessions.Session, args TranslateArgs) (*mcp.CallToolResult, error) {
-			return mcpservice.TextResult("Translated to " + args.To + ": " + args.Text), nil
+		func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
+			a := r.Args()
+			if a.Text == "" {
+				w.SetError(true)
+				_ = w.AppendText("text is required")
+				return nil
+			}
+			_ = w.AppendText("Translated to " + a.To + ": " + a.Text)
+			return nil
 		},
 		mcpservice.WithToolDescription("Translate text to a target language."),
-		// mcpserver.WithToolAllowAdditionalProperties(true), // opt-in to unknown fields
+		// mcpservice.WithToolAllowAdditionalProperties(true), // opt-in to unknown fields
 	)
 	tools := mcpservice.NewStaticTools(translate)
 

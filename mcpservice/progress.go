@@ -17,6 +17,18 @@ type ProgressReporter interface {
 
 type progressKey struct{}
 
+// ReportProgress is a convenience helper that looks up a ProgressReporter from
+// context and reports the provided values. It returns true if a reporter was
+// present and the call was attempted, and false if no reporter was found. Any
+// transport error is ignored here; use ProgressFrom(ctx) directly for full control.
+func ReportProgress(ctx context.Context, progress, total float64) bool {
+	if pr, ok := ProgressFrom(ctx); ok && pr != nil {
+		_ = pr.Report(ctx, progress, total)
+		return true
+	}
+	return false
+}
+
 // WithProgressReporter returns a new context carrying the provided reporter.
 func WithProgressReporter(ctx context.Context, pr ProgressReporter) context.Context {
 	if pr == nil {
