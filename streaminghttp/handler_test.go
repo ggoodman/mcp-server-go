@@ -534,7 +534,23 @@ func TestMultiInstance(t *testing.T) {
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
+		// Coordinate on server readiness before publishing
 		ctx := t.Context()
+		readyCh := make(chan struct{}, 1)
+		unsub, err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+			select {
+			case readyCh <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		if err == nil && unsub != nil {
+			defer unsub()
+		}
+		select {
+		case <-readyCh:
+		case <-time.After(3 * time.Second):
+		}
 		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.PromptsListChangedNotificationMethod), nil)
 
 		select {
