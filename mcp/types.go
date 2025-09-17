@@ -105,6 +105,9 @@ type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema ToolInputSchema `json:"inputSchema"`
+	// OutputSchema optionally declares the structure of structuredContent
+	// in CallToolResult for this tool.
+	OutputSchema *ToolOutputSchema `json:"outputSchema,omitempty"`
 }
 
 // ToolInputSchema is a JSON-schema-like description of tool input.
@@ -113,6 +116,14 @@ type ToolInputSchema struct {
 	Properties           map[string]SchemaProperty `json:"properties,omitempty"`
 	Required             []string                  `json:"required,omitempty"`
 	AdditionalProperties bool                      `json:"additionalProperties,omitzero"`
+}
+
+// ToolOutputSchema mirrors ToolInputSchema but omits additionalProperties.
+// The schema must be an object shape.
+type ToolOutputSchema struct {
+	Type       string                    `json:"type"`
+	Properties map[string]SchemaProperty `json:"properties,omitempty"`
+	Required   []string                  `json:"required,omitempty"`
 }
 
 // SchemaProperty is a simplified schema node used in tool/elicitation schemas.

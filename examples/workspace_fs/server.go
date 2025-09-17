@@ -101,40 +101,50 @@ func New(root string) mcpservice.ServerCapabilities {
 		URI  string `json:"uri,omitempty"`
 		Path string `json:"path,omitempty"`
 	}
-	readTool := mcpservice.NewTool("fs.read", func(ctx context.Context, _ sessions.Session, a ReadArgs) (*mcp.CallToolResult, error) {
+	readTool := mcpservice.NewTool[ReadArgs]("fs.read", func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[ReadArgs]) error {
+		a := r.Args()
 		var rel string
 		switch {
 		case a.URI != "":
 			r, ok := uriToRel(a.URI)
 			if !ok {
-				return mcpservice.Errorf("invalid uri: %s", a.URI), nil
+				w.SetError(true)
+				_ = w.AppendText(fmt.Sprintf("invalid uri: %s", a.URI))
+				return nil
 			}
 			rel = r
 		case a.Path != "":
 			rel = path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 			if rel == "." || strings.HasPrefix(rel, "../") {
-				return mcpservice.Errorf("invalid path: %s", a.Path), nil
+				w.SetError(true)
+				_ = w.AppendText(fmt.Sprintf("invalid path: %s", a.Path))
+				return nil
 			}
 		default:
-			return mcpservice.Errorf("must provide either uri or path"), nil
+			w.SetError(true)
+			_ = w.AppendText("must provide either uri or path")
+			return nil
 		}
 
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpservice.Errorf("access denied: %v", err), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("access denied: %v", err))
+			return nil
 		}
 		data, err := os.ReadFile(abs)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				return mcpservice.Errorf("not found: %s", rel), nil
+				w.SetError(true)
+				_ = w.AppendText(fmt.Sprintf("not found: %s", rel))
+				return nil
 			}
-			return nil, err
+			return err
 		}
 		uri := relToURI(rel)
 		mime := mimeByExt(abs)
-		return &mcp.CallToolResult{Content: []mcp.ContentBlock{
-			embeddedText(uri, mime, string(data)),
-		}}, nil
+		_ = w.AppendBlocks(embeddedText(uri, mime, string(data)))
+		return nil
 	},
 		mcpservice.WithToolDescription("Read a file by URI or path and return its contents as an embedded resource."),
 	)
@@ -146,37 +156,47 @@ func New(root string) mcpservice.ServerCapabilities {
 		CreateDirs bool   `json:"createDirs,omitempty"`
 		Overwrite  bool   `json:"overwrite,omitempty"`
 	}
-	writeTool := mcpservice.NewTool("fs.write", func(ctx context.Context, _ sessions.Session, a WriteArgs) (*mcp.CallToolResult, error) {
+	writeTool := mcpservice.NewTool[WriteArgs]("fs.write", func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[WriteArgs]) error {
+		a := r.Args()
 		if a.Path == "" {
-			return mcpservice.Errorf("path is required"), nil
+			w.SetError(true)
+			_ = w.AppendText("path is required")
+			return nil
 		}
 		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 		if rel == "." || strings.HasPrefix(rel, "../") {
-			return mcpservice.Errorf("invalid path: %s", a.Path), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("invalid path: %s", a.Path))
+			return nil
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpservice.Errorf("access denied: %v", err), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("access denied: %v", err))
+			return nil
 		}
 		if a.CreateDirs {
 			if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		if !a.Overwrite {
 			if _, err := os.Stat(abs); err == nil {
-				return mcpservice.Errorf("file exists: %s", rel), nil
+				w.SetError(true)
+				_ = w.AppendText(fmt.Sprintf("file exists: %s", rel))
+				return nil
 			}
 		}
 		if err := os.WriteFile(abs, []byte(a.Content), 0o644); err != nil {
-			return nil, err
+			return err
 		}
 		uri := relToURI(rel)
 		mime := mimeByExt(abs)
-		return &mcp.CallToolResult{Content: []mcp.ContentBlock{
+		_ = w.AppendBlocks(
 			resourceLink(uri, path.Base(rel), mime),
 			embeddedText(uri, mime, a.Content),
-		}}, nil
+		)
+		return nil
 	},
 		mcpservice.WithToolDescription("Write text to a file at the given path (relative to the workspace root). Returns a resource link and the embedded contents."),
 	)
@@ -186,36 +206,44 @@ func New(root string) mcpservice.ServerCapabilities {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
-	appendTool := mcpservice.NewTool("fs.append", func(ctx context.Context, _ sessions.Session, a AppendArgs) (*mcp.CallToolResult, error) {
+	appendTool := mcpservice.NewTool[AppendArgs]("fs.append", func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[AppendArgs]) error {
+		a := r.Args()
 		if a.Path == "" {
-			return mcpservice.Errorf("path is required"), nil
+			w.SetError(true)
+			_ = w.AppendText("path is required")
+			return nil
 		}
 		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 		if rel == "." || strings.HasPrefix(rel, "../") {
-			return mcpservice.Errorf("invalid path: %s", a.Path), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("invalid path: %s", a.Path))
+			return nil
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpservice.Errorf("access denied: %v", err), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("access denied: %v", err))
+			return nil
 		}
 		if err := os.MkdirAll(filepath.Dir(abs), 0o750); err != nil {
-			return nil, err
+			return err
 		}
 		f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer f.Close()
 		if _, err := f.WriteString(a.Content); err != nil {
-			return nil, err
+			return err
 		}
 		data, _ := os.ReadFile(abs)
 		uri := relToURI(rel)
 		mime := mimeByExt(abs)
-		return &mcp.CallToolResult{Content: []mcp.ContentBlock{
+		_ = w.AppendBlocks(
 			resourceLink(uri, path.Base(rel), mime),
 			embeddedText(uri, mime, string(data)),
-		}}, nil
+		)
+		return nil
 	},
 		mcpservice.WithToolDescription("Append text to a file. Returns a resource link and the full embedded contents after append."),
 	)
@@ -225,31 +253,41 @@ func New(root string) mcpservice.ServerCapabilities {
 		From string `json:"from"`
 		To   string `json:"to"`
 	}
-	moveTool := mcpservice.NewTool("fs.move", func(ctx context.Context, _ sessions.Session, a MoveArgs) (*mcp.CallToolResult, error) {
+	moveTool := mcpservice.NewTool[MoveArgs]("fs.move", func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[MoveArgs]) error {
+		a := r.Args()
 		if a.From == "" || a.To == "" {
-			return mcpservice.Errorf("from and to are required"), nil
+			w.SetError(true)
+			_ = w.AppendText("from and to are required")
+			return nil
 		}
 		fromRel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.From), "/"))
 		toRel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.To), "/"))
 		if fromRel == "." || strings.HasPrefix(fromRel, "../") || toRel == "." || strings.HasPrefix(toRel, "../") {
-			return mcpservice.Errorf("invalid path"), nil
+			w.SetError(true)
+			_ = w.AppendText("invalid path")
+			return nil
 		}
 		fromAbs := filepath.Join(root, filepath.FromSlash(fromRel))
 		toAbs := filepath.Join(root, filepath.FromSlash(toRel))
 		if err := ensureInsideRoot(fromAbs); err != nil {
-			return mcpservice.Errorf("access denied: %v", err), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("access denied: %v", err))
+			return nil
 		}
 		if err := ensureInsideRoot(toAbs); err != nil {
-			return mcpservice.Errorf("access denied: %v", err), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("access denied: %v", err))
+			return nil
 		}
 		if err := os.MkdirAll(filepath.Dir(toAbs), 0o750); err != nil {
-			return nil, err
+			return err
 		}
 		if err := os.Rename(fromAbs, toAbs); err != nil {
-			return nil, err
+			return err
 		}
 		uri := relToURI(toRel)
-		return &mcp.CallToolResult{Content: []mcp.ContentBlock{resourceLink(uri, path.Base(toRel), mimeByExt(toAbs))}}, nil
+		_ = w.AppendBlocks(resourceLink(uri, path.Base(toRel), mimeByExt(toAbs)))
+		return nil
 	},
 		mcpservice.WithToolDescription("Move or rename a file within the workspace."),
 	)
@@ -258,22 +296,30 @@ func New(root string) mcpservice.ServerCapabilities {
 	type DeleteArgs struct {
 		Path string `json:"path"`
 	}
-	deleteTool := mcpservice.NewTool("fs.delete", func(ctx context.Context, _ sessions.Session, a DeleteArgs) (*mcp.CallToolResult, error) {
+	deleteTool := mcpservice.NewTool[DeleteArgs]("fs.delete", func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[DeleteArgs]) error {
+		a := r.Args()
 		if a.Path == "" {
-			return mcpservice.Errorf("path is required"), nil
+			w.SetError(true)
+			_ = w.AppendText("path is required")
+			return nil
 		}
 		rel := path.Clean(strings.TrimPrefix(filepath.ToSlash(a.Path), "/"))
 		if rel == "." || strings.HasPrefix(rel, "../") {
-			return mcpservice.Errorf("invalid path: %s", a.Path), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("invalid path: %s", a.Path))
+			return nil
 		}
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		if err := ensureInsideRoot(abs); err != nil {
-			return mcpservice.Errorf("access denied: %v", err), nil
+			w.SetError(true)
+			_ = w.AppendText(fmt.Sprintf("access denied: %v", err))
+			return nil
 		}
 		if err := os.Remove(abs); err != nil {
-			return nil, err
+			return err
 		}
-		return mcpservice.TextResult(fmt.Sprintf("deleted %s", rel)), nil
+		_ = w.AppendText(fmt.Sprintf("deleted %s", rel))
+		return nil
 	},
 		mcpservice.WithToolDescription("Delete a file within the workspace."),
 	)
