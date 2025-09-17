@@ -157,8 +157,18 @@ func (h *Handler) Serve(ctx context.Context) error {
 				negotiated = v
 			}
 
-			// Construct a minimal session for capability discovery and subsequent requests.
-			sess = &stdioSession{userID: uid, proto: negotiated}
+			// Construct a session for capability discovery and subsequent requests.
+			sess = &stdioSession{userID: uid, proto: negotiated, d: disp}
+			// Hydrate client-declared capabilities on the session so server code can use them.
+			if initReq.Capabilities.Sampling != nil {
+				sess.samp = &stdioSamplingCap{d: disp}
+			}
+			if initReq.Capabilities.Roots != nil {
+				sess.roots = &stdioRootsCap{d: disp, supportsListChanged: initReq.Capabilities.Roots.ListChanged}
+			}
+			if initReq.Capabilities.Elicitation != nil {
+				sess.elic = &stdioElicitCap{d: disp}
+			}
 
 			// Build initialize result by probing server capabilities.
 			serverInfo, err := h.srv.GetServerInfo(ctx, sess)
@@ -251,6 +261,10 @@ func (h *Handler) Serve(ctx context.Context) error {
 		case "notification":
 			// Let dispatcher observe notifications (cancel/progress)
 			disp.OnNotification(any)
+			// Client-originated roots list_changed: invoke registered listeners if present.
+			if any.Method == string(mcp.RootsListChangedNotificationMethod) && sess != nil && sess.roots != nil {
+				sess.roots.notifyListeners(ctx)
+			}
 			// notifications/initialized marks that the client completed its side of init.
 			// Only after this point should the server begin emitting list_changed notifications.
 			if any.Method == string(mcp.InitializedNotificationMethod) && !registered {
@@ -566,15 +580,110 @@ func (h *Handler) handleRequest(ctx context.Context, session sessions.Session, r
 type stdioSession struct {
 	userID string
 	proto  string
+	d      *outboundDispatcher
+	// optional client-declared capabilities
+	samp  *stdioSamplingCap
+	roots *stdioRootsCap
+	elic  *stdioElicitCap
 }
 
-func (s *stdioSession) SessionID() string                                          { return fmt.Sprintf("%d", os.Getpid()) }
-func (s *stdioSession) UserID() string                                             { return s.userID }
-func (s *stdioSession) ProtocolVersion() string                                    { return s.proto }
-func (s *stdioSession) GetSamplingCapability() (sessions.SamplingCapability, bool) { return nil, false }
-func (s *stdioSession) GetRootsCapability() (sessions.RootsCapability, bool)       { return nil, false }
+func (s *stdioSession) SessionID() string       { return fmt.Sprintf("%d", os.Getpid()) }
+func (s *stdioSession) UserID() string          { return s.userID }
+func (s *stdioSession) ProtocolVersion() string { return s.proto }
+func (s *stdioSession) GetSamplingCapability() (sessions.SamplingCapability, bool) {
+	if s.samp == nil {
+		return nil, false
+	}
+	return s.samp, true
+}
+func (s *stdioSession) GetRootsCapability() (sessions.RootsCapability, bool) {
+	if s.roots == nil {
+		return nil, false
+	}
+	return s.roots, true
+}
 func (s *stdioSession) GetElicitationCapability() (sessions.ElicitationCapability, bool) {
-	return nil, false
+	if s.elic == nil {
+		return nil, false
+	}
+	return s.elic, true
+}
+
+// --- stdio client capability implementations ---
+
+type stdioSamplingCap struct{ d *outboundDispatcher }
+
+func (c *stdioSamplingCap) CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
+	if c == nil || c.d == nil || req == nil {
+		return nil, fmt.Errorf("invalid sampling request")
+	}
+	resp, err := c.d.Call(ctx, string(mcp.SamplingCreateMessageMethod), req)
+	if err != nil {
+		return nil, err
+	}
+	var out mcp.CreateMessageResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+type stdioRootsCap struct {
+	d                   *outboundDispatcher
+	supportsListChanged bool
+	mu                  sync.Mutex
+	listeners           []sessions.RootsListChangedListener
+}
+
+func (r *stdioRootsCap) ListRoots(ctx context.Context) (*mcp.ListRootsResult, error) {
+	if r == nil || r.d == nil {
+		return nil, fmt.Errorf("roots capability unavailable")
+	}
+	resp, err := r.d.Call(ctx, string(mcp.RootsListMethod), &mcp.ListRootsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	var out mcp.ListRootsResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (r *stdioRootsCap) RegisterRootsListChangedListener(ctx context.Context, listener sessions.RootsListChangedListener) (bool, error) {
+	if !r.supportsListChanged || listener == nil {
+		return false, nil
+	}
+	r.mu.Lock()
+	r.listeners = append(r.listeners, listener)
+	r.mu.Unlock()
+	return true, nil
+}
+
+func (r *stdioRootsCap) notifyListeners(ctx context.Context) {
+	r.mu.Lock()
+	ls := append([]sessions.RootsListChangedListener(nil), r.listeners...)
+	r.mu.Unlock()
+	for _, fn := range ls {
+		_ = fn(ctx)
+	}
+}
+
+type stdioElicitCap struct{ d *outboundDispatcher }
+
+func (e *stdioElicitCap) Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+	if e == nil || e.d == nil || req == nil {
+		return nil, fmt.Errorf("invalid elicitation request")
+	}
+	resp, err := e.d.Call(ctx, string(mcp.ElicitationCreateMethod), req)
+	if err != nil {
+		return nil, err
+	}
+	var out mcp.ElicitResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // bootstrapSession is used only for version preference probe during initialize.
