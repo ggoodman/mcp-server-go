@@ -43,8 +43,8 @@ var (
 const (
 	// Use canonical header names for clarity; Go matches headers case-insensitively.
 	lastEventIDHeader        = "Last-Event-ID"
-	mcpSessionIDHeader       = "MCP-Session-ID"
-	mcpProtocolVersionHeader = "MCP-Protocol-Version"
+	mcpSessionIDHeader       = "Mcp-Session-Id"
+	mcpProtocolVersionHeader = "Mcp-Protocol-Version"
 	authorizationHeader      = "Authorization"
 	wwwAuthenticateHeader    = "WWW-Authenticate"
 )
@@ -597,6 +597,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			// TODO: Log the error
 			return
 		}
+
+		return
 	}
 
 	if res := msg.AsResponse(); res != nil {
@@ -1088,11 +1090,10 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 	if negotiatedVersion != "" {
 		w.Header().Set(mcpProtocolVersionHeader, negotiatedVersion)
 	}
-	w.Header().Set("Content-Type", eventStreamMediaType.String())
+	w.Header().Set("Content-Type", jsonMediaType.String())
 	w.WriteHeader(http.StatusOK)
-	if err := writeSSEEvent(wf, "response", "", res); err != nil {
-		// At this point headers are already written, so we can't change the status code
-		return fmt.Errorf("failed to write SSE event: %w", err)
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		return fmt.Errorf("failed to encode initialize response: %w", err)
 	}
 
 	return nil
@@ -1609,7 +1610,7 @@ func writeSSEEvent(wf *lockedWriteFlusher, eventType string, msgID string, messa
 		}
 	}
 
-	if _, err := fmt.Fprintf(wf, "event: %s\ndata: ", eventType); err != nil {
+	if _, err := fmt.Fprintf(wf, "data: "); err != nil {
 		return fmt.Errorf("failed to write SSE event header: %w", err)
 	}
 
