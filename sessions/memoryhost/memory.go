@@ -189,47 +189,44 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 
 // DeleteSession removes all artifacts for a session (idempotent).
 func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
+	// Remove session data bucket (if any) and snapshot subscribers under lock.
 	h.mu.Lock()
 	sd, ok := h.sessions[sessionID]
 	if ok {
 		delete(h.sessions, sessionID)
 	}
 	h.mu.Unlock()
+
+	// Always remove metadata + kv (idempotent) to ensure deletion is authoritative.
+	h.metaMu.Lock()
+	delete(h.meta, sessionID)
+	h.metaMu.Unlock()
+	h.dataMu.Lock()
+	delete(h.data, sessionID)
+	h.dataMu.Unlock()
+
 	if !ok {
-		// still delete metadata / kv if present
-		h.metaMu.Lock()
-		delete(h.meta, sessionID)
-		h.metaMu.Unlock()
-		h.dataMu.Lock()
-		delete(h.data, sessionID)
-		h.dataMu.Unlock()
 		return nil
 	}
-	// Collect subscribers under lock, then stop them without holding the lock
+
+	// Collect subscribers under sd lock.
 	sd.mu.Lock()
 	subs := make([]*subscription, 0, len(sd.subscribers))
 	for sub := range sd.subscribers {
 		subs = append(subs, sub)
 	}
-	// Collect all event subscribers under lock
 	var evSubs []*eventSub
 	for _, set := range sd.eventSubs {
 		for sub := range set {
 			evSubs = append(evSubs, sub)
 		}
 	}
-	// Clear event subscriber map so subsequent stops don't contend on delete
+	// Clear maps so stop() calls don't fight over removal.
 	sd.eventSubs = make(map[string]map[*eventSub]struct{})
 	sd.mu.Unlock()
 
-	// Stop event subscribers outside the lock to avoid self-deadlock in eventSub.stop()
-	for _, es := range evSubs {
-		es.stop()
-	}
-	// Stop session message subscribers outside the lock as well
-	for _, sub := range subs {
-		sub.stop()
-	}
+	for _, es := range evSubs { es.stop() }
+	for _, sub := range subs { sub.stop() }
 	return nil
 }
 

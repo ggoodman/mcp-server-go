@@ -261,3 +261,6 @@ type PrimitiveSchemaDefinition struct {
 	// For EnumSchema
 	Enum []any `json:"enum,omitempty"`
 }
+
+// LatestProtocolVersion is the latest version of the protocol.
+const LatestProtocolVersion = "2025-06-18"

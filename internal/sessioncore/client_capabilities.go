@@ -13,8 +13,14 @@ import (
 
 // Private concrete implementations for capabilities
 
+// simpleSession is a minimal adapter the capability impls use to reach the host.
+type SimpleSession struct {
+	id      string
+	backend sessions.SessionHost
+}
+
 type samplingCapabilityImpl struct {
-	sess *SessionHandle
+	sess *SimpleSession
 }
 
 func (s *samplingCapabilityImpl) CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
@@ -29,7 +35,7 @@ func (s *samplingCapabilityImpl) CreateMessage(ctx context.Context, req *mcp.Cre
 }
 
 type rootsCapabilityImpl struct {
-	sess                *SessionHandle
+	sess                *SimpleSession
 	supportsListChanged bool
 }
 
@@ -56,7 +62,7 @@ func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Conte
 }
 
 type elicitationCapabilityImpl struct {
-	sess *SessionHandle
+	sess *SimpleSession
 }
 
 func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
@@ -72,7 +78,7 @@ func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitR
 
 // rpcCallToClient sends a JSON-RPC request to the client via the session's
 // message stream and awaits the corresponding response using the host rendezvous.
-func rpcCallToClient[T any](ctx context.Context, sess *SessionHandle, method mcp.Method, params any, out *T) error {
+func rpcCallToClient[T any](ctx context.Context, sess *SimpleSession, method mcp.Method, params any, out *T) error {
 	if sess == nil || sess.backend == nil {
 		return fmt.Errorf("session backend unavailable")
 	}

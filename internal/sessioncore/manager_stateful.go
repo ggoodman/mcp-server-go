@@ -220,6 +220,11 @@ type StatefulSessionHandle struct {
 	mgr  *Manager
 }
 
+// Internal accessor helpers (avoid exposing meta directly outside package).
+func (h *StatefulSessionHandle) ID() string       { return h.meta.SessionID }
+func (h *StatefulSessionHandle) Protocol() string { return h.meta.ProtocolVersion }
+func (h *StatefulSessionHandle) User() string     { return h.meta.UserID }
+
 // ToSession constructs the public session implementation (to be added later).
 func (h *StatefulSessionHandle) ToSession() sessions.Session {
 	if h == nil || h.meta == nil {
@@ -235,14 +240,15 @@ func (h *StatefulSessionHandle) ToSession() sessions.Session {
 		full = fh
 	}
 	if full != nil {
+		base := &SimpleSession{id: h.meta.SessionID, backend: full}
 		if caps.Sampling {
-			impl.sampling = &samplingCapabilityImpl{sess: &SessionHandle{id: h.meta.SessionID, userID: h.meta.UserID, backend: full}}
+			impl.sampling = &samplingCapabilityImpl{sess: base}
 		}
 		if caps.Roots {
-			impl.roots = &rootsCapabilityImpl{sess: &SessionHandle{id: h.meta.SessionID, userID: h.meta.UserID, backend: full}, supportsListChanged: caps.RootsListChanged}
+			impl.roots = &rootsCapabilityImpl{sess: base, supportsListChanged: caps.RootsListChanged}
 		}
 		if caps.Elicitation {
-			impl.elicitation = &elicitationCapabilityImpl{sess: &SessionHandle{id: h.meta.SessionID, userID: h.meta.UserID, backend: full}}
+			impl.elicitation = &elicitationCapabilityImpl{sess: base}
 		}
 	}
 	return impl
