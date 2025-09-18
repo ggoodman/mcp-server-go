@@ -119,7 +119,8 @@ type StreamingHTTPHandler struct {
 
 	auth        auth.Authenticator
 	mcp         mcpservice.ServerCapabilities
-	sessions    *sessioncore.SessionManager
+	sessions    *sessioncore.SessionManager // legacy manager (stateless token based)
+	stateful    *sessioncore.Manager        // new stateful manager
 	sessionHost sessions.SessionHost
 
 	// Per-session subscription bridges for resources/updated notifications.
@@ -247,7 +248,8 @@ func New(
 	if cfg.logger != nil {
 		log = cfg.logger
 	}
-	sm := sessioncore.NewManager(host)
+	sm := sessioncore.NewManager(host) // legacy
+	statefulMgr := sessioncore.NewStatefulManager(host, sessioncore.ManagerConfig{})
 
 	h := &StreamingHTTPHandler{
 		log:         log,
@@ -255,6 +257,7 @@ func New(
 		auth:        authenticator,
 		mcp:         server,
 		sessions:    sm,
+		stateful:    statefulMgr,
 		sessionHost: host,
 		subCancels:  make(map[string]map[string]context.CancelFunc),
 		sessParents: make(map[string]context.Context),

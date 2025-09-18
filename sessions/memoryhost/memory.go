@@ -19,13 +19,11 @@ type Host struct {
 	sessions map[string]*sessionData
 	counter  atomic.Int64
 
-	// revocation map: sessID -> expiresAt
-	revokedMu sync.RWMutex
-	revoked   map[string]time.Time
+	metaMu sync.RWMutex
+	meta   map[string]*sessions.SessionMetadata
 
-	// epoch map keyed by scope string
-	epochMu sync.RWMutex
-	epochs  map[string]int64
+	dataMu sync.RWMutex
+	data   map[string]map[string][]byte
 }
 
 type sessionData struct {
@@ -53,34 +51,49 @@ type subscription struct {
 	stopOnce sync.Once
 }
 
-func New() *Host {
-	return &Host{
-		sessions: make(map[string]*sessionData),
-		revoked:  make(map[string]time.Time),
-		epochs:   make(map[string]int64),
-	}
+func (s *subscription) stop() {
+	s.stopOnce.Do(func() {
+		s.sd.mu.Lock()
+		delete(s.sd.subscribers, s)
+		s.sd.mu.Unlock()
+		close(s.stopCh)
+	})
 }
 
-// --- Messaging ---
+func New() *Host {
+	return &Host{sessions: make(map[string]*sessionData), meta: make(map[string]*sessions.SessionMetadata), data: make(map[string]map[string][]byte)}
+}
 
+// ensureSession returns existing or creates a new sessionData bucket for messaging/events.
+func (h *Host) ensureSession(sessionID string) *sessionData {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sd := h.sessions[sessionID]
+	if sd == nil {
+		sd = &sessionData{subscribers: make(map[*subscription]struct{}), eventSubs: make(map[string]map[*eventSub]struct{})}
+		h.sessions[sessionID] = sd
+	}
+	return sd
+}
+
+// PublishSession appends a message to the ordered client-facing stream.
 func (h *Host) PublishSession(ctx context.Context, sessionID string, data []byte) (string, error) {
-	evID := strconv.FormatInt(h.counter.Add(1), 10)
+	sd := h.ensureSession(sessionID)
+	// allocate id
+	idNum := h.counter.Add(1)
+	evID := strconv.FormatInt(idNum, 10)
 	msg := message{id: evID, data: append([]byte(nil), data...)}
 
-	sd := h.ensureSession(sessionID)
-
+	// snapshot subscribers under lock & append message
 	sd.mu.Lock()
 	sd.messages = append(sd.messages, msg)
-	idx := len(sd.messages) - 1
-	// snapshot subscribers to notify
 	subs := make([]*subscription, 0, len(sd.subscribers))
 	for sub := range sd.subscribers {
-		if idx >= sub.startIdx {
-			subs = append(subs, sub)
-		}
+		subs = append(subs, sub)
 	}
 	sd.mu.Unlock()
 
+	// fan-out (non-blocking best-effort)
 	for _, sub := range subs {
 		s := sub
 		select {
@@ -96,7 +109,6 @@ func (h *Host) PublishSession(ctx context.Context, sessionID string, data []byte
 			// drop if subscriber is busy
 		}
 	}
-
 	return evID, nil
 }
 
@@ -175,7 +187,8 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 	}
 }
 
-func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
+// DeleteSession removes all artifacts for a session (idempotent).
+func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	h.mu.Lock()
 	sd, ok := h.sessions[sessionID]
 	if ok {
@@ -183,6 +196,13 @@ func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
 	}
 	h.mu.Unlock()
 	if !ok {
+		// still delete metadata / kv if present
+		h.metaMu.Lock()
+		delete(h.meta, sessionID)
+		h.metaMu.Unlock()
+		h.dataMu.Lock()
+		delete(h.data, sessionID)
+		h.dataMu.Unlock()
 		return nil
 	}
 	// Collect subscribers under lock, then stop them without holding the lock
@@ -213,71 +233,81 @@ func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// --- Revocation ---
+// (Revocation/epoch logic removed in stateful refactor.)
 
-func (h *Host) AddRevocation(ctx context.Context, sessionID string, ttl time.Duration) error {
-	h.revokedMu.Lock()
-	h.revoked[sessionID] = time.Now().Add(ttl)
-	h.revokedMu.Unlock()
+// Metadata & KV operations
+func (h *Host) CreateSession(ctx context.Context, meta *sessions.SessionMetadata) error {
+	h.metaMu.Lock()
+	defer h.metaMu.Unlock()
+	if _, ok := h.meta[meta.SessionID]; ok {
+		return fmt.Errorf("session exists")
+	}
+	cp := *meta
+	h.meta[meta.SessionID] = &cp
 	return nil
 }
-
-func (h *Host) IsRevoked(ctx context.Context, sessionID string) (bool, error) {
-	h.revokedMu.RLock()
-	exp, ok := h.revoked[sessionID]
-	h.revokedMu.RUnlock()
-	if !ok {
-		return false, nil
+func (h *Host) GetSession(ctx context.Context, sessionID string) (*sessions.SessionMetadata, error) {
+	h.metaMu.RLock()
+	m := h.meta[sessionID]
+	h.metaMu.RUnlock()
+	if m == nil {
+		return nil, fmt.Errorf("not found")
 	}
-	if time.Now().After(exp) {
-		h.revokedMu.Lock()
-		delete(h.revoked, sessionID)
-		h.revokedMu.Unlock()
-		return false, nil
+	cp := *m
+	return &cp, nil
+}
+func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*sessions.SessionMetadata) error) error {
+	h.metaMu.Lock()
+	defer h.metaMu.Unlock()
+	m := h.meta[sessionID]
+	if m == nil {
+		return fmt.Errorf("not found")
 	}
-	return true, nil
-}
-
-func (h *Host) BumpEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {
-	key := scopeKey(scope)
-	h.epochMu.Lock()
-	defer h.epochMu.Unlock()
-	// Increment epoch atomically under lock.
-	h.epochs[key]++
-	return h.epochs[key], nil
-}
-
-func (h *Host) GetEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {
-	key := scopeKey(scope)
-	h.epochMu.RLock()
-	v := h.epochs[key]
-	h.epochMu.RUnlock()
-	return v, nil
-}
-
-func (h *Host) ensureSession(sessionID string) *sessionData {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	sd, ok := h.sessions[sessionID]
-	if !ok {
-		sd = &sessionData{messages: make([]message, 0), subscribers: make(map[*subscription]struct{}), eventSubs: make(map[string]map[*eventSub]struct{})}
-		h.sessions[sessionID] = sd
+	cp := *m
+	if err := fn(&cp); err != nil {
+		return err
 	}
-	return sd
+	cp.UpdatedAt = time.Now().UTC()
+	h.meta[sessionID] = &cp
+	return nil
 }
-
-func (s *subscription) stop() {
-	s.stopOnce.Do(func() {
-		s.sd.mu.Lock()
-		delete(s.sd.subscribers, s)
-		s.sd.mu.Unlock()
-		close(s.stopCh)
-	})
+func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
+	h.metaMu.Lock()
+	if m := h.meta[sessionID]; m != nil {
+		m.LastAccess = time.Now().UTC()
+		m.UpdatedAt = m.LastAccess
+	}
+	h.metaMu.Unlock()
+	return nil
 }
-
-func scopeKey(s sessions.RevocationScope) string {
-	// Compose a stable key across provided dimensions.
-	return "u=" + s.UserID + "|c=" + s.ClientID + "|t=" + s.TenantID
+func (h *Host) PutSessionData(ctx context.Context, sessionID, key string, value []byte) error {
+	h.dataMu.Lock()
+	defer h.dataMu.Unlock()
+	m := h.data[sessionID]
+	if m == nil {
+		m = make(map[string][]byte)
+		h.data[sessionID] = m
+	}
+	m[key] = append([]byte(nil), value...)
+	return nil
+}
+func (h *Host) GetSessionData(ctx context.Context, sessionID, key string) ([]byte, error) {
+	h.dataMu.RLock()
+	defer h.dataMu.RUnlock()
+	if m := h.data[sessionID]; m != nil {
+		if v, ok := m[key]; ok {
+			return append([]byte(nil), v...), nil
+		}
+	}
+	return nil, fmt.Errorf("not found")
+}
+func (h *Host) DeleteSessionData(ctx context.Context, sessionID, key string) error {
+	h.dataMu.Lock()
+	defer h.dataMu.Unlock()
+	if m := h.data[sessionID]; m != nil {
+		delete(m, key)
+	}
+	return nil
 }
 
 // Ensure interface compliance: implement server-internal event pub/sub
