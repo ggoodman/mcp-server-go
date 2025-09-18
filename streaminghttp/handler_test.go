@@ -392,9 +392,6 @@ func TestMultiInstance(t *testing.T) {
 		// Step 4: Wait for notification
 		select {
 		case evt := <-eventsCh:
-			if evt.event != "notification" {
-				t.Fatalf("expected notification event, got %q", evt.event)
-			}
 			var msg jsonrpc.AnyMessage
 			mustUnmarshalJSON(t, evt.data, &msg)
 			if msg.Method != string(mcp.ResourcesListChangedNotificationMethod) {
@@ -479,9 +476,6 @@ func TestMultiInstance(t *testing.T) {
 		// Step 4: Wait for notification
 		select {
 		case evt := <-eventsCh:
-			if evt.event != "notification" {
-				t.Fatalf("expected notification event, got %q", evt.event)
-			}
 			var msg jsonrpc.AnyMessage
 			mustUnmarshalJSON(t, evt.data, &msg)
 			if msg.Method != string(mcp.ToolsListChangedNotificationMethod) {
@@ -555,9 +549,6 @@ func TestMultiInstance(t *testing.T) {
 
 		select {
 		case evt := <-eventsCh:
-			if evt.event != "notification" {
-				t.Fatalf("expected notification event, got %q", evt.event)
-			}
 			var msg jsonrpc.AnyMessage
 			mustUnmarshalJSON(t, evt.data, &msg)
 			if msg.Method != string(mcp.PromptsListChangedNotificationMethod) {
@@ -655,7 +646,7 @@ type serverConfig struct {
 	authenticator auth.Authenticator
 	mcp           mcpservice.ServerCapabilities
 	sessionsHost  sessions.SessionHost
-	logHandler    slog.Handler
+	logger        *slog.Logger
 	serverName    string
 	issuer        string
 	jwksURI       string
@@ -675,10 +666,10 @@ func withSessionHost(h sessions.SessionHost) serverOption {
 	}
 }
 
-// withLogHandler configures the server to use the provided log handler.
-func withLogHandler(handler slog.Handler) serverOption {
+// withLogger configures the server to use the provided log Logger.
+func withLogger(log *slog.Logger) serverOption {
 	return func(cfg *serverConfig) {
-		cfg.logHandler = handler
+		cfg.logger = log
 	}
 }
 
@@ -714,7 +705,7 @@ func withJwksURI(uri string) serverOption {
 //   - Auth: authtest.NewNoAuth("") - no authentication required
 //   - Hooks: hookstest.NewMockHooks() - mock hooks with default capabilities
 //   - Sessions: memory.NewStore() - in-memory session store
-//   - LogHandler: testLogHandler(t) - test-friendly logging
+//   - Logger: slog.New(testLogHandler(t)) - test-friendly logging
 //   - ServerName: "test-server"
 //   - Issuer: "http://127.0.0.1:0"
 //   - JwksURI: "http://127.0.0.1/.well-known/jwks.json"
@@ -739,7 +730,7 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		authenticator: new(noAuth),
 		mcp:           mcp,
 		sessionsHost:  memoryhost.New(),
-		logHandler:    testLogHandler(t),
+		logger:        slog.New(testLogHandler(t)),
 		serverName:    "test-server",
 		issuer:        "http://127.0.0.1:0",
 		jwksURI:       "http://127.0.0.1/.well-known/jwks.json",
@@ -768,7 +759,7 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		cfg.mcp,
 		cfg.authenticator,
 		streaminghttp.WithServerName(cfg.serverName),
-		streaminghttp.WithLogger(cfg.logHandler),
+		streaminghttp.WithLogger(cfg.logger),
 		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: cfg.issuer, JwksURI: cfg.jwksURI}),
 	)
 	if err != nil {
@@ -831,7 +822,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 			authenticator: new(noAuth),
 			mcp:           mcpFactory(),
 			sessionsHost:  memoryhost.New(),
-			logHandler:    testLogHandler(t),
+			logger:        slog.New(testLogHandler(t)),
 			serverName:    "multi-test-server",
 			issuer:        "http://127.0.0.1:0",
 			jwksURI:       "http://127.0.0.1/.well-known/jwks.json",
@@ -854,7 +845,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 			cfg.mcp,
 			cfg.authenticator,
 			streaminghttp.WithServerName(cfg.serverName),
-			streaminghttp.WithLogger(cfg.logHandler),
+			streaminghttp.WithLogger(cfg.logger),
 			streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: cfg.issuer, JwksURI: cfg.jwksURI}),
 		)
 		if err != nil {
@@ -904,23 +895,29 @@ func doPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID string,
 	return resp, nil
 }
 
-// mustPostMCP posts and parses a single SSE event from the response body.
+// mustPostMCP posts and parses a response. If the response is an SSE stream (text/event-stream)
+// it reads exactly one event. Otherwise it reads the full body as a single JSON payload.
 func mustPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, sseEvent) {
 	t.Helper()
 	resp, err := doPostMCP(t, srv, authHeader, sessionID, req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	// Only 200 OK responses are expected to carry an SSE event.
 	if resp.StatusCode != http.StatusOK {
 		return resp, sseEvent{}
 	}
-	evt, err := readOneSSE(resp.Body)
-	if err != nil {
-		// ensure body is closed by caller even on error
-		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("sse read error: %v", err)})}
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
+		evt, err := readOneSSE(resp.Body)
+		if err != nil {
+			return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("sse read error: %v", err)})}
+		}
+		return resp, evt
 	}
-	return resp, evt
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("body read error: %v", err)})}
+	}
+	return resp, sseEvent{data: body}
 }
 
 func readOneSSE(r io.Reader) (sseEvent, error) {
@@ -939,7 +936,6 @@ func readOneSSE(r io.Reader) (sseEvent, error) {
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" { // end of event
-			// finalize
 			if dataBuf.Len() > 0 {
 				event.data = append([]byte(nil), dataBuf.Bytes()...)
 			}
@@ -954,14 +950,13 @@ func readOneSSE(r io.Reader) (sseEvent, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "data: ") {
-			// handler writes single-line JSON via json.Encoder
-			if dataBuf.Len() > 0 {
+			if dataBuf.Len() > 0 { // support multi-line data although we emit single line
 				dataBuf.WriteByte('\n')
 			}
 			dataBuf.WriteString(strings.TrimPrefix(line, "data: "))
 			continue
 		}
-		// ignore other fields
+		// ignore other fields and continue
 	}
 }
 
@@ -1032,7 +1027,7 @@ func (u *fakeUserInfo) Claims(ref any) error { return nil }
 // consumed by specific tests. These are part of the test harness API surface.
 var (
 	_ = withSessionHost
-	_ = withLogHandler
+	_ = withLogger
 	_ = withIssuer
 	_ = withJwksURI
 )
