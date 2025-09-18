@@ -127,13 +127,12 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 		t.Fatalf("get status: %d", getResp.StatusCode)
 	}
 
-	// 4) Read SSE until we see notifications/resources/list_changed
+	// 4) Read SSE until we see a JSON-RPC notification with method resources/list_changed.
 	defer getResp.Body.Close()
 	scanner := bufio.NewScanner(getResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
-	eventType := ""
 	for {
 		select {
 		case <-deadline.C:
@@ -146,22 +145,16 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 			continue
 		}
 		line := scanner.Text()
-		if strings.HasPrefix(line, "event: ") {
-			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event: "))
+		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-		if strings.HasPrefix(line, "data: ") {
-			if eventType != "notification" {
-				continue
-			}
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-			var m map[string]any
-			if err := json.Unmarshal([]byte(payload), &m); err != nil {
-				continue
-			}
-			if method, _ := m["method"].(string); method == string(mcp.ResourcesListChangedNotificationMethod) {
-				break
-			}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		var m map[string]any
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			continue
+		}
+		if method, _ := m["method"].(string); method == string(mcp.ResourcesListChangedNotificationMethod) {
+			break
 		}
 	}
 }

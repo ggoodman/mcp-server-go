@@ -74,7 +74,7 @@ type ManualOIDC struct {
 
 type newConfig struct {
 	serverName string
-	logHandler slog.Handler
+	logger     *slog.Logger
 	// auth mode: exactly one must be set
 	discoveryURL string
 	manualOIDC   *ManualOIDC
@@ -86,8 +86,8 @@ func WithServerName(name string) Option {
 }
 
 // WithLogger sets the slog handler used by the server. If not provided, logs are discarded.
-func WithLogger(h slog.Handler) Option {
-	return func(c *newConfig) { c.logHandler = h }
+func WithLogger(h *slog.Logger) Option {
+	return func(c *newConfig) { c.logger = h }
 }
 
 // WithAuthorizationServerDiscovery enables auto-configuration via OAuth 2.0
@@ -243,11 +243,10 @@ func New(
 		return nil, fmt.Errorf("exactly one of WithAuthorizationServerDiscovery or WithManualOIDC must be provided")
 	}
 
-	logHandler := slog.DiscardHandler
-	if cfg.logHandler != nil {
-		logHandler = cfg.logHandler
+	log := slog.Default()
+	if cfg.logger != nil {
+		log = cfg.logger
 	}
-	log := slog.New(logHandler)
 	sm := sessioncore.NewManager(host)
 
 	h := &StreamingHTTPHandler{
@@ -592,7 +591,14 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			}
 		}
 
-		if err := writeSSEEvent(wf, "response", "", res); err != nil {
+		// TODO: The silliness of needing to write to the _SAME_ sse stream means that we
+		// we can't write to the session handle's broker. So here we're stuck with an empty
+		// message ID that can't be replayed or recovered :(.
+		b, mErr := json.Marshal(res)
+		if mErr != nil {
+			return
+		}
+		if err := writeSSEEvent(wf, "", b); err != nil {
 			// At this point headers are already written, so we can't change the status code
 			// TODO: Log the error
 			return
@@ -805,33 +811,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	// established session. Session establishment can only happen in POST /mcp.
 	// As a result, we can respond with an error in the case of a missing session.
 	if err := sh.ConsumeMessages(ctx, lastEventID, func(ctx context.Context, msgID string, bytes []byte) error {
-		var msg jsonrpc.AnyMessage
-
-		if err := json.Unmarshal(bytes, &msg); err != nil {
-			return fmt.Errorf("failed to unmarshal session message: %w", err)
-		}
-
-		if msgID != "" {
-			if _, err := fmt.Fprintf(w, "id: %s\n", msgID); err != nil {
-				return fmt.Errorf("failed to write session message to http response: %w", err)
-			}
-		}
-
-		if res := msg.AsRequest(); res != nil {
-			msgType := "request"
-			if res.ID.IsNil() {
-				msgType = "notification"
-			}
-
-			if err := writeSSEEvent(wf, msgType, msgID, res); err != nil {
-				return fmt.Errorf("failed to write session message to http response: %w", err)
-			}
-		}
-
-		if res := msg.AsResponse(); res != nil {
-			if err := writeSSEEvent(wf, "response", msgID, res); err != nil {
-				return fmt.Errorf("failed to write session message to http response: %w", err)
-			}
+		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
+			return fmt.Errorf("failed to write session message to http response: %w", err)
 		}
 
 		return nil
@@ -1603,25 +1584,21 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 // writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.
 // The message will be JSON encoded and written as the data field of the SSE event.
 // It automatically flushes the response after writing.
-func writeSSEEvent(wf *lockedWriteFlusher, eventType string, msgID string, message any) error {
+func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
 	if msgID != "" {
 		if _, err := fmt.Fprintf(wf, "id: %s\n", msgID); err != nil {
 			return fmt.Errorf("failed to write SSE event ID: %w", err)
 		}
 	}
-
-	if _, err := fmt.Fprintf(wf, "data: "); err != nil {
-		return fmt.Errorf("failed to write SSE event header: %w", err)
+	if _, err := wf.Write([]byte("data: ")); err != nil {
+		return fmt.Errorf("failed to write SSE data prefix: %w", err)
 	}
-
-	if err := json.NewEncoder(wf).Encode(message); err != nil {
-		return fmt.Errorf("failed to write SSE event data: %w", err)
+	if _, err := wf.Write(payload); err != nil {
+		return fmt.Errorf("failed to write SSE payload: %w", err)
 	}
-
 	if _, err := wf.Write([]byte("\n\n")); err != nil {
-		return fmt.Errorf("failed to write SSE event footer: %w", err)
+		return fmt.Errorf("failed to write SSE frame terminator: %w", err)
 	}
-
 	wf.Flush()
 	return nil
 }
@@ -1660,14 +1637,8 @@ func (s *sessionWithWriter) WriteMessage(ctx context.Context, bytes []byte) erro
 		return fmt.Errorf("no fallback available for session WriteMessage")
 	}
 
-	var msg jsonrpc.AnyMessage
-	if err := json.Unmarshal(bytes, &msg); err != nil {
-		// We failed to unmarshal the message. There's no point writing it to the session.
-		return err
-	}
-
 	s.mu.Lock()
-	err := writeSSEEvent(s.wf, msg.Type(), "", bytes)
+	err := writeSSEEvent(s.wf, "", bytes)
 	s.mu.Unlock()
 
 	if err != nil {

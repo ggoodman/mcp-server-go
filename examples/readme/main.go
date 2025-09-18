@@ -62,6 +62,8 @@ func main() {
 		panic(err)
 	}
 
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
 	// 5) Drop-in handler
 	h, err := streaminghttp.New(
 		ctx,
@@ -70,7 +72,7 @@ func main() {
 		server,
 		authenticator,
 		streaminghttp.WithServerName("My MCP Server"),
-		streaminghttp.WithLogger(slog.NewTextHandler(os.Stdout, nil)),
+		streaminghttp.WithLogger(log),
 		streaminghttp.WithAuthorizationServerDiscovery(issuer),
 	)
 	if err != nil {
