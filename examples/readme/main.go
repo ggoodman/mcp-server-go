@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/redishost"
+	"github.com/ggoodman/mcp-server-go/signing"
 	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
@@ -36,9 +38,36 @@ func main() {
 	// 2) Typed tool with strict input schema by default
 	translate := mcpservice.NewTool[TranslateArgs](
 		"translate",
-		func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
+		func(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
 			a := r.Args()
-			_ = w.AppendText("Translated to " + a.To + ": " + a.Text)
+
+			sc, ok := s.GetSamplingCapability()
+			if !ok {
+				w.SetError(true)
+				w.AppendText("Sampling capability required")
+				return nil
+			}
+
+			res, err := sc.CreateMessage(ctx, &mcp.CreateMessageRequest{
+				Messages: []mcp.SamplingMessage{{
+					Role: "user", Content: []mcp.ContentBlock{
+						{
+							Type: "text",
+							Text: fmt.Sprintf("Translate the string, '%s' to the language '%s'", a.Text, a.To),
+						},
+					},
+				}},
+				SystemPrompt:  "You are an expert translator. Respond with only the translated text.",
+				MaxTokens:     100,
+				Temperature:   0.8,
+				StopSequences: []string{"\n"},
+			})
+			if err != nil {
+				return err
+			}
+
+			w.AppendBlocks(res.Content)
+
 			return nil
 		},
 		mcpservice.WithToolDescription("Translate text to a target language."),
@@ -64,7 +93,13 @@ func main() {
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	// 5) Drop-in handler
+	// 5) Session signer (Ed25519) – production should supply stable keys shared across nodes.
+	signer, err := signing.NewEphemeralMemoryJWS()
+	if err != nil {
+		panic(err)
+	}
+
+	// 6) Drop-in handler
 	h, err := streaminghttp.New(
 		ctx,
 		publicEndpoint,
@@ -74,11 +109,12 @@ func main() {
 		streaminghttp.WithServerName("My MCP Server"),
 		streaminghttp.WithLogger(log),
 		streaminghttp.WithAuthorizationServerDiscovery(issuer),
+		streaminghttp.WithSessionSigner(signer, issuer),
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	// 6) Serve
+	// 7) Serve
 	http.ListenAndServe("127.0.0.1:8080", h)
 }
