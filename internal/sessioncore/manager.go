@@ -127,6 +127,16 @@ func (sm *SessionManager) CreateSession(ctx context.Context, userID string, opts
 
 	sid := sm.mintSessionID(session, epoch)
 	session.id = sid
+
+	sm.logger.InfoContext(ctx, "created session",
+		slog.String("session_id", sid),
+		slog.String("user_id", userID),
+		slog.String("protocol_version", session.protocolVersion),
+		slog.Bool("cap_sampling", session.sampling != nil),
+		slog.Bool("cap_roots", session.roots != nil),
+		slog.Bool("cap_elicitation", session.elicitation != nil),
+	)
+
 	return session, nil
 }
 

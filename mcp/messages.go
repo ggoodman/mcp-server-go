@@ -277,10 +277,10 @@ type CreateMessageRequest struct {
 
 // CreateMessageResult returns a generated message.
 type CreateMessageResult struct {
-	Role       Role           `json:"role"`
-	Content    []ContentBlock `json:"content"`
-	Model      string         `json:"model"`
-	StopReason string         `json:"stopReason,omitzero"`
+	Role       Role         `json:"role"`
+	Content    ContentBlock `json:"content"`
+	Model      string       `json:"model"`
+	StopReason string       `json:"stopReason,omitzero"`
 	BaseMetadata
 }
 
