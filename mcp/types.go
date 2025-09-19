@@ -199,8 +199,8 @@ type PromptMessage struct {
 // Sampling
 // SamplingMessage is a message used as input to model sampling.
 type SamplingMessage struct {
-	Role    Role           `json:"role"`
-	Content []ContentBlock `json:"content"`
+	Role    Role         `json:"role"`
+	Content ContentBlock `json:"content"`
 }
 
 // ModelPreferences encode model selection tradeoffs.

@@ -313,13 +313,14 @@ type RootsListChangedNotification struct{}
 // Elicitation
 // ElicitRequest asks for structured input per schema.
 type ElicitRequest struct {
-	Prompt string            `json:"prompt"`
-	Schema ElicitationSchema `json:"schema"`
+	Message         string            `json:"message"`
+	RequestedSchema ElicitationSchema `json:"requestedSchema"`
 }
 
 // ElicitResult returns schema-conformant values.
 type ElicitResult struct {
-	Values map[string]any `json:"values"`
+	Action  string         `json:"action"`
+	Content map[string]any `json:"content"`
 	BaseMetadata
 }
 

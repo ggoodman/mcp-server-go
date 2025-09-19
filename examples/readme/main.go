@@ -53,8 +53,8 @@ func main() {
 			}
 
 			res, err := el.Elicit(ctx, &mcp.ElicitRequest{
-				Prompt: "Which language should I translate to?",
-				Schema: mcp.ElicitationSchema{
+				Message: "Which language should I translate to?",
+				RequestedSchema: mcp.ElicitationSchema{
 					Type: "object",
 					Properties: map[string]mcp.PrimitiveSchemaDefinition{
 						"language": {
@@ -62,6 +62,7 @@ func main() {
 							Description: "Target language for translation (e.g. 'French', 'Spanish')",
 						},
 					},
+
 					Required: []string{"language"},
 				},
 			})
@@ -71,7 +72,7 @@ func main() {
 				return nil
 			}
 
-			lang, ok := res.Values["language"].(string)
+			lang, ok := res.Content["language"].(string)
 			if !ok || lang == "" {
 				w.SetError(true)
 				w.AppendText("Elicitation did not return a valid language.")
@@ -82,10 +83,11 @@ func main() {
 				Messages: []mcp.SamplingMessage{
 					{
 						Role:    "user",
-						Content: []mcp.ContentBlock{{Type: "text", Text: "Translate the following text to " + lang + ": " + a.Text}},
+						Content: mcp.ContentBlock{Type: "text", Text: "Translate the following text to " + lang + ": " + a.Text},
 					},
 				},
 				SystemPrompt: "You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else.",
+				MaxTokens:    100,
 			})
 			if err != nil {
 				w.SetError(true)
@@ -117,7 +119,7 @@ func main() {
 		panic(err)
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// 5) Drop-in handler
 	h, err := streaminghttp.New(
