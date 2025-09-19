@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/validation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/google/uuid"
@@ -70,7 +71,7 @@ func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitR
 		return nil, fmt.Errorf("nil request")
 	}
 	// Internal validation of schema before sending to client to catch server-side errors early.
-	if err := elicitationValidate(req); err != nil {
+	if err := validation.ElicitationSchema(&req.RequestedSchema); err != nil {
 		return nil, err
 	}
 	var out mcp.ElicitResult
@@ -80,48 +81,7 @@ func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitR
 	return &out, nil
 }
 
-// elicitationValidate performs internal validation equivalent to the previous public helper.
-func elicitationValidate(req *mcp.ElicitRequest) error {
-	if req.RequestedSchema.Type != "object" {
-		return fmt.Errorf("elicitation schema type must be object")
-	}
-	props := req.RequestedSchema.Properties
-	if len(props) == 0 {
-		return fmt.Errorf("elicitation schema requires at least one property")
-	}
-	seen := map[string]struct{}{}
-	var dedup []string
-	for _, name := range req.RequestedSchema.Required {
-		if _, ok := props[name]; !ok {
-			return fmt.Errorf("required property missing: %s", name)
-		}
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			dedup = append(dedup, name)
-		}
-	}
-	req.RequestedSchema.Required = dedup
-	for name, p := range props {
-		if p.Type == "" {
-			return fmt.Errorf("property %s missing type", name)
-		}
-		if p.Minimum != 0 || p.Maximum != 0 {
-			if p.Minimum != 0 && p.Maximum != 0 && p.Minimum > p.Maximum {
-				return fmt.Errorf("property %s minimum greater than maximum", name)
-			}
-		}
-		if len(p.Enum) > 1 {
-			uniq := map[any]struct{}{}
-			for _, v := range p.Enum {
-				uniq[v] = struct{}{}
-			}
-			if len(uniq) != len(p.Enum) {
-				return fmt.Errorf("duplicate enum values for property %s", name)
-			}
-		}
-	}
-	return nil
-}
+// (validation logic unified in internal/validation)
 
 // rpcCallToClient sends a JSON-RPC request to the client via the session's
 // message stream and awaits the corresponding response using the host rendezvous.

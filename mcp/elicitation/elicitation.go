@@ -1,8 +1,7 @@
 package elicitation
 
 import (
-	"errors"
-
+	"github.com/ggoodman/mcp-server-go/internal/validation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 )
 
@@ -104,49 +103,4 @@ func WithMaximum(v float64) NumberOpt {
 //
 // NOTE: This mutates the provided schema in-place by de-duplicating the Required
 // slice while preserving the order of first occurrence.
-func validateObjectSchema(s *mcp.ElicitationSchema) error {
-	if s == nil {
-		return errors.New("nil schema")
-	}
-	if s.Type != "object" {
-		return errors.New("schema type must be object")
-	}
-	if len(s.Properties) == 0 {
-		return errors.New("object schema requires at least one property")
-	}
-	// Check required names exist and dedupe required slice while preserving order of first occurrence.
-	seenReq := map[string]bool{}
-	var dedupReq []string
-	for _, name := range s.Required {
-		if _, ok := s.Properties[name]; !ok {
-			return errors.New("required property missing: " + name)
-		}
-		if !seenReq[name] {
-			seenReq[name] = true
-			dedupReq = append(dedupReq, name)
-		}
-	}
-	s.Required = dedupReq
-	// Basic per-property checks
-	for name, prop := range s.Properties {
-		if prop.Type == "" {
-			return errors.New("property " + name + " missing type")
-		}
-		if prop.Minimum != 0 || prop.Maximum != 0 { // bounds sanity when both set
-			if prop.Minimum != 0 && prop.Maximum != 0 && prop.Minimum > prop.Maximum {
-				return errors.New("property " + name + " minimum greater than maximum")
-			}
-		}
-		// enum uniqueness
-		if len(prop.Enum) > 1 {
-			uniq := map[any]struct{}{}
-			for _, v := range prop.Enum {
-				uniq[v] = struct{}{}
-			}
-			if len(uniq) != len(prop.Enum) {
-				return errors.New("duplicate enum values for property " + name)
-			}
-		}
-	}
-	return nil
-}
+func validateObjectSchema(s *mcp.ElicitationSchema) error { return validation.ElicitationSchema(s) }
