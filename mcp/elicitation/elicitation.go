@@ -100,11 +100,11 @@ func WithMaximum(v float64) NumberOpt {
 	return func(c *numberConfig) { c.maximum = v; c.maximumSet = true }
 }
 
-// ValidateObjectSchema validates an object ElicitationSchema produced by ObjectSchema.
+// validateObjectSchema validates an object ElicitationSchema produced by ObjectSchema.
 //
-// NOTE: This function mutates the provided schema in-place by de-duplicating
-// the Required slice while preserving the order of first occurrence.
-func ValidateObjectSchema(s *mcp.ElicitationSchema) error {
+// NOTE: This mutates the provided schema in-place by de-duplicating the Required
+// slice while preserving the order of first occurrence.
+func validateObjectSchema(s *mcp.ElicitationSchema) error {
 	if s == nil {
 		return errors.New("nil schema")
 	}

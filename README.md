@@ -326,15 +326,11 @@ schema := elicitation.ObjectSchema(
     elicitation.PropString("language", "Target language", elicitation.WithEnum("French", "Spanish", "German")),
     elicitation.Required("language"),
 )
-if err := elicitation.ValidateObjectSchema(&schema); err != nil { /* handle */ }
-
 res, err := el.Elicit(ctx, &mcp.ElicitRequest{
     Message:         "Which language should I translate to?",
     RequestedSchema: schema,
 })
 ```
-
-`ValidateObjectSchema` mutates the provided schema by de-duplicating `Required` entries.
 
 ### Design goals
 

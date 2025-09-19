@@ -9,6 +9,8 @@ import (
 
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/mcp/elicitation"
+	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/redishost"
@@ -52,19 +54,13 @@ func main() {
 				return nil
 			}
 
+			schema := elicitation.ObjectSchema(
+				elicitation.PropString("language", "Target language for translation (e.g. 'French', 'Spanish')"),
+				elicitation.Required("language"),
+			)
 			res, err := el.Elicit(ctx, &mcp.ElicitRequest{
-				Message: "Which language should I translate to?",
-				RequestedSchema: mcp.ElicitationSchema{
-					Type: "object",
-					Properties: map[string]mcp.PrimitiveSchemaDefinition{
-						"language": {
-							Type:        "string",
-							Description: "Target language for translation (e.g. 'French', 'Spanish')",
-						},
-					},
-
-					Required: []string{"language"},
-				},
+				Message:         "Which language should I translate to?",
+				RequestedSchema: schema,
 			})
 			if err != nil {
 				w.SetError(true)
@@ -79,16 +75,13 @@ func main() {
 				return nil
 			}
 
-			sres, err := sp.CreateMessage(ctx, &mcp.CreateMessageRequest{
-				Messages: []mcp.SamplingMessage{
-					{
-						Role:    "user",
-						Content: mcp.ContentBlock{Type: "text", Text: "Translate the following text to " + lang + ": " + a.Text},
-					},
+			sres, err := sp.CreateMessage(ctx, sampling.NewCreateMessage(
+				[]mcp.SamplingMessage{
+					sampling.UserText("Translate the following text to " + lang + ": " + a.Text),
 				},
-				SystemPrompt: "You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else.",
-				MaxTokens:    100,
-			})
+				sampling.WithSystemPrompt("You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else."),
+				sampling.WithMaxTokens(100),
+			))
 			if err != nil {
 				w.SetError(true)
 				w.AppendText("Sampling error: " + err.Error())

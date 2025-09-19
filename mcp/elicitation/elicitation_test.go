@@ -9,7 +9,7 @@ func TestObjectSchemaBasic(t *testing.T) {
 		PropString("language", "Target language", WithEnum("French", "Spanish")),
 		Required("language"),
 	)
-	if err := ValidateObjectSchema(&s); err != nil {
+	if err := validateObjectSchema(&s); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if s.Type != "object" {
@@ -25,19 +25,19 @@ func TestObjectSchemaBasic(t *testing.T) {
 
 func TestValidateObjectSchemaErrors(t *testing.T) {
 	empty := ObjectSchema()
-	if err := ValidateObjectSchema(&empty); err == nil {
+	if err := validateObjectSchema(&empty); err == nil {
 		t.Fatal("expected error for empty properties")
 	}
 
 	badReq := ObjectSchema(PropString("language", "desc"), Required("missing"))
-	if err := ValidateObjectSchema(&badReq); err == nil {
+	if err := validateObjectSchema(&badReq); err == nil {
 		t.Fatal("expected error for missing required property")
 	}
 }
 
 func TestValidateObjectSchemaDedupRequired(t *testing.T) {
 	s := ObjectSchema(PropString("a", "A"), Required("a", "a", "a"))
-	if err := ValidateObjectSchema(&s); err != nil {
+	if err := validateObjectSchema(&s); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if len(s.Required) != 1 {
