@@ -119,41 +119,61 @@ func TestProtocolVersionMismatchStillRejected(t *testing.T) {
 }
 
 // Ensure Accept negotiation only enforced for SSE producing requests.
-func TestAcceptHeaderOnlyNeededForSSE(t *testing.T) {
+func TestAcceptHeaderOptionalForSSE(t *testing.T) {
 	srv, _ := setupTestServer(t)
 	defer srv.Close()
-	// initialize (no Accept header)
 	sid := doInitialize(t, srv)
 
-	// notification (no ID) should not require Accept and returns 202
+	// notification (no ID) still accepted without Accept
 	notif := map[string]any{"jsonrpc": "2.0", "method": "ping"}
 	b, _ := json.Marshal(notif)
 	nreq, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(b))
 	nreq.Header.Set("Authorization", "Bearer x")
 	nreq.Header.Set("Content-Type", "application/json")
 	nreq.Header.Set("mcp-session-id", sid)
-	// no Accept header
-	nreq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	nreq.Header.Set("MCP-Protocol-Version", mcp.LatestProtocolVersion)
 	nresp, err := http.DefaultClient.Do(nreq)
-	if err != nil { t.Fatalf("notif post: %v", err) }
+	if err != nil {
+		t.Fatalf("notif post: %v", err)
+	}
 	defer nresp.Body.Close()
 	if nresp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202 for notification without Accept, got %d", nresp.StatusCode)
+		t.Fatalf("expected 202 got %d", nresp.StatusCode)
 	}
 
-	// request with ID (SSE) without Accept should 415
+	// request with ID (SSE) without Accept now allowed
 	reqBody := map[string]any{"jsonrpc": "2.0", "id": "77", "method": "ping"}
 	b2, _ := json.Marshal(reqBody)
 	sreq, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(b2))
 	sreq.Header.Set("Authorization", "Bearer x")
 	sreq.Header.Set("Content-Type", "application/json")
 	sreq.Header.Set("mcp-session-id", sid)
-	sreq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	sreq.Header.Set("MCP-Protocol-Version", mcp.LatestProtocolVersion)
 	sresp, err := http.DefaultClient.Do(sreq)
-	if err != nil { t.Fatalf("stream post: %v", err) }
+	if err != nil {
+		t.Fatalf("stream post: %v", err)
+	}
 	defer sresp.Body.Close()
-	if sresp.StatusCode != http.StatusUnsupportedMediaType { // 415
-		t.Fatalf("expected 415 for SSE request missing Accept, got %d", sresp.StatusCode)
+	if sresp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 got %d", sresp.StatusCode)
+	}
+}
+
+func TestBatchArrayReturnsJSONError(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+	batch := []map[string]any{{"jsonrpc": "2.0", "id": 1, "method": "ping"}}
+	b, _ := json.Marshal(batch)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer x")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", resp.StatusCode)
 	}
 }
 

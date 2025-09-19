@@ -16,7 +16,6 @@ import (
 	"github.com/elnormous/contenttype"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-server-go/internal/outbound"
 	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
 	"github.com/ggoodman/mcp-server-go/internal/wellknown"
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -48,6 +47,19 @@ const (
 	authorizationHeader      = "Authorization"
 	wwwAuthenticateHeader    = "WWW-Authenticate"
 )
+
+// writeJSONError emits a minimal JSON body for HTTP-layer rejections before a JSON-RPC
+// message exchange is possible. We do NOT claim JSON-RPC framing here; this is
+// transport-level. Shape: {"error":{"code":<httpStatus>,"message":"<reason>"}}
+// Safe to call after some headers set but before status written.
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	// Only set content-type if not already committed to SSE.
+	if ct := w.Header().Get("Content-Type"); ct == "" || ct == jsonMediaType.String() {
+		w.Header().Set("Content-Type", jsonMediaType.String())
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": status, "message": msg}})
+}
 
 // Option configures the StreamingHTTPHandler.
 type Option func(*newConfig)
@@ -138,8 +150,7 @@ type StreamingHTTPHandler struct {
 
 	// Per-session outbound dispatchers and their cancel/unsub handlers for
 	// long-lived subscriptions (e.g., notifications/cancelled).
-	dispMu      sync.Mutex
-	dispatchers map[string]*outboundDispatcherHolder
+	// (outbound dispatcher removed in stateful refactor)
 
 	// in-flight server-handled requests per session (for inbound cancellation)
 	inflightMu sync.Mutex
@@ -463,7 +474,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	// notifications / initialize handshakes returning JSON.
 	ctype, err := contenttype.GetMediaType(r)
 	if err != nil || !ctype.Matches(jsonMediaType) {
-		w.WriteHeader(http.StatusUnsupportedMediaType)
+		writeJSONError(w, http.StatusUnsupportedMediaType, "content-type must be application/json")
 		return
 	}
 
@@ -485,17 +496,17 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	var raw json.RawMessage
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&raw); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	if len(raw) > 0 && raw[0] == '[' { // rudimentary array detection
-		w.WriteHeader(http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "JSON-RPC batch arrays are forbidden on streaming HTTP transport")
 		return
 	}
 
 	var msg jsonrpc.AnyMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON-RPC message: "+err.Error())
 		return
 	}
 
@@ -522,7 +533,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	// and potentially perform downgrade/upgrade handshakes here.
 	if req := msg.AsRequest(); req != nil && req.Method == "initialize" {
 		// Second initialize against existing session disallowed.
-		w.WriteHeader(http.StatusConflict)
+		writeJSONError(w, http.StatusConflict, "session already initialized")
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
@@ -531,7 +542,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		if h.log != nil {
 			h.log.Debug("protocol version mismatch", slog.String("session_id", sessID), slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
 		}
-		w.WriteHeader(http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "protocol version mismatch")
 		return
 	}
 	// If clientPV empty, we fall back to the session-bound version (spec allows
@@ -554,24 +565,17 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		}
 
 		// For request-with-ID we will stream a response (SSE). Now negotiate Accept.
-		if r.Header.Get("Accept") == "" { // require explicit header for SSE
-			if h.log != nil { h.log.Debug("reject request: missing Accept header for SSE (explicit requirement)", slog.String("session_id", sessID)) }
-			w.WriteHeader(http.StatusUnsupportedMediaType)
-			return
-		}
-		if _, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes); err != nil {
-			// Distinguish missing Accept vs present but wrong for clarity
-			if h.log != nil {
-				accept := r.Header.Get("Accept")
-				if accept == "" {
-					h.log.Debug("reject request: missing Accept header for SSE", slog.String("session_id", sessID))
-				} else {
-					h.log.Debug("reject request: unacceptable Accept for SSE", slog.String("session_id", sessID), slog.String("accept", accept))
+		acc := r.Header.Get("Accept")
+		if acc != "" { // only enforce if explicitly provided
+			if _, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes); err != nil {
+				if h.log != nil {
+					h.log.Debug("reject request: unacceptable explicit Accept for SSE", slog.String("session_id", sessID), slog.String("accept", acc))
 				}
+				w.WriteHeader(http.StatusUnsupportedMediaType)
+				return
 			}
-			w.WriteHeader(http.StatusUnsupportedMediaType)
-			return
 		}
+		// (If Accept missing, treat as implicit */* and allow.)
 		// Set the content type for the SSE response and advertise protocol version
 		if spv := sh.ToSession().ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
@@ -1751,114 +1755,7 @@ func (h *StreamingHTTPHandler) teardownSession(sessionID string) {
 	}
 	h.subMu.Unlock()
 
-	// Also close outbound dispatcher and unsubscribe from cancelled listener.
-	h.dispMu.Lock()
-	if h.dispatchers != nil {
-		if holder, ok := h.dispatchers[sessionID]; ok && holder != nil {
-			if holder.cancelledUnsub != nil {
-				holder.cancelledUnsub()
-			}
-			holder.d.Close(context.Canceled)
-			delete(h.dispatchers, sessionID)
-		}
-	}
-	h.dispMu.Unlock()
-}
-
-// --- Outbound dispatcher integration ---
-
-// Holder for per-session dispatcher and unsubs.
-type outboundDispatcherHolder struct {
-	d *outbound.Dispatcher
-	// unsubscribe from notifications/cancelled stream
-	cancelledUnsub func()
-}
-
-// streamingTransport implements outbound.Transport over the sessionHost/session.
-type streamingTransport struct {
-	h         *StreamingHTTPHandler
-	sessionID string
-}
-
-func (t streamingTransport) SendRequest(ctx context.Context, id *jsonrpc.RequestID, req *jsonrpc.Request) error {
-	key := "rv:" + id.String()
-	var unsub func()
-	var err error
-	unsub, err = t.h.sessionHost.SubscribeEvents(ctx, t.sessionID, key, func(evtCtx context.Context, payload []byte) error {
-		var resp jsonrpc.Response
-		if err := json.Unmarshal(payload, &resp); err != nil {
-			return err
-		}
-		if d := t.h.getDispatcher(t.sessionID); d != nil {
-			d.OnResponse(&resp)
-		}
-		if unsub != nil {
-			unsub()
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	b, err := json.Marshal(req)
-	if err != nil {
-		unsub()
-		return err
-	}
-	if _, err := t.h.sessionHost.PublishSession(ctx, t.sessionID, b); err != nil {
-		unsub()
-		return err
-	}
-	return nil
-}
-
-func (t streamingTransport) SendCancelled(ctx context.Context, requestID string) error {
-	p := struct {
-		RequestID string `json:"requestId"`
-	}{RequestID: requestID}
-	pb, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CancelledNotificationMethod), Params: pb}
-	b, err := json.Marshal(n)
-	if err != nil {
-		return err
-	}
-	_, err = t.h.sessionHost.PublishSession(ctx, t.sessionID, b)
-	return err
-}
-
-// ensureDispatcher creates or returns the per-session dispatcher and wires the cancelled subscription.
-func (h *StreamingHTTPHandler) ensureDispatcher(ctx context.Context, sessionID string) *outbound.Dispatcher {
-	h.dispMu.Lock()
-	defer h.dispMu.Unlock()
-	if h.dispatchers == nil {
-		h.dispatchers = make(map[string]*outboundDispatcherHolder)
-	}
-	if holder, ok := h.dispatchers[sessionID]; ok && holder != nil {
-		return holder.d
-	}
-	d := outbound.New(streamingTransport{h: h, sessionID: sessionID})
-	unsub, err := h.sessionHost.SubscribeEvents(h.ensureSessionParentContext(ctx, sessionID), sessionID, string(mcp.CancelledNotificationMethod), func(evtCtx context.Context, payload []byte) error {
-		any := jsonrpc.AnyMessage{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CancelledNotificationMethod), Params: payload}
-		d.OnNotification(any)
-		return nil
-	})
-	if err != nil {
-		return nil
-	}
-	h.dispatchers[sessionID] = &outboundDispatcherHolder{d: d, cancelledUnsub: unsub}
-	return d
-}
-
-func (h *StreamingHTTPHandler) getDispatcher(sessionID string) *outbound.Dispatcher {
-	h.dispMu.Lock()
-	defer h.dispMu.Unlock()
-	if holder, ok := h.dispatchers[sessionID]; ok && holder != nil {
-		return holder.d
-	}
-	return nil
+	// (outbound dispatcher removal: no-op)
 }
 
 // messageWriter is satisfied by sessionWithWriter; it provides the low-level message send primitive.
