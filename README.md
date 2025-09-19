@@ -261,3 +261,86 @@ server := mcpservice.NewServer(
 ## License
 
 MIT — see `LICENSE`.
+
+## Ergonomic helpers (optional)
+
+The core `mcp` package exposes only wire-level structs. For less boilerplate you can opt into the helper packages:
+
+- `mcp/sampling` – build `CreateMessageRequest` values and message/content blocks.
+- `mcp/elicitation` – build elicitation schemas via a small DSL and validate them.
+
+You can ignore these packages entirely; they never wrap or hide protocol data structures.
+
+### Sampling helpers
+
+Raw (manual struct literals):
+
+```go
+req := &mcp.CreateMessageRequest{
+    Messages: []mcp.SamplingMessage{
+        {Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "Translate to French: Hello"}},
+    },
+    SystemPrompt: "You translate only.",
+    MaxTokens:    80,
+}
+```
+
+With helpers:
+
+```go
+import "github.com/ggoodman/mcp-server-go/mcp/sampling"
+
+req := sampling.NewCreateMessage(
+    []mcp.SamplingMessage{
+        sampling.UserText("Translate to French: Hello"),
+    },
+    sampling.WithSystemPrompt("You translate only."),
+    sampling.WithMaxTokens(80),
+)
+
+if err := sampling.ValidateCreateMessage(req); err != nil { /* handle */ }
+resp, _ := sp.CreateMessage(ctx, req)
+```
+
+### Elicitation schema DSL
+
+Raw:
+
+```go
+schema := mcp.ElicitationSchema{
+    Type: "object",
+    Properties: map[string]mcp.PrimitiveSchemaDefinition{
+        "language": {Type: "string", Description: "Target language"},
+    },
+    Required: []string{"language"},
+}
+_ = schema // then call el.Elicit(...)
+```
+
+With helpers:
+
+```go
+import "github.com/ggoodman/mcp-server-go/mcp/elicitation"
+
+schema := elicitation.ObjectSchema(
+    elicitation.PropString("language", "Target language", elicitation.WithEnum("French", "Spanish", "German")),
+    elicitation.Required("language"),
+)
+if err := elicitation.ValidateObjectSchema(&schema); err != nil { /* handle */ }
+
+res, err := el.Elicit(ctx, &mcp.ElicitRequest{
+    Message:         "Which language should I translate to?",
+    RequestedSchema: schema,
+})
+```
+
+`ValidateObjectSchema` mutates the provided schema by de-duplicating `Required` entries.
+
+### Design goals
+
+1. Pure value builders: never introduce wrapper types.
+2. Everything is additive; raw structs remain first-class.
+3. Minimal API surface: helpers focus on reducing typos and repetition, not inventing new protocol concepts.
+4. Easy escape hatch: you can intermix manual and helper-constructed values freely.
+
+Reflection-based schema derivation and single-value elicitation helpers are intentionally deferred until the DSL stabilizes.
