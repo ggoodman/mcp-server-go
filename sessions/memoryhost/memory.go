@@ -225,8 +225,12 @@ func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	sd.eventSubs = make(map[string]map[*eventSub]struct{})
 	sd.mu.Unlock()
 
-	for _, es := range evSubs { es.stop() }
-	for _, sub := range subs { sub.stop() }
+	for _, es := range evSubs {
+		es.stop()
+	}
+	for _, sub := range subs {
+		sub.stop()
+	}
 	return nil
 }
 

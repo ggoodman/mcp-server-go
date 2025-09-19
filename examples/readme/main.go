@@ -17,7 +17,6 @@ import (
 
 type TranslateArgs struct {
 	Text string `json:"text" jsonschema:"minLength=1,description=Text to translate"`
-	To   string `json:"to"   jsonschema:"enum=en,enum=fr,enum=es,description=Target language (ISO 639-1)"`
 }
 
 func main() {
@@ -36,9 +35,65 @@ func main() {
 	// 2) Typed tool with strict input schema by default
 	translate := mcpservice.NewTool[TranslateArgs](
 		"translate",
-		func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
+		func(ctx context.Context, sess sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
 			a := r.Args()
-			_ = w.AppendText("Translated to " + a.To + ": " + a.Text)
+
+			el, ok := sess.GetElicitationCapability()
+			if !ok {
+				w.SetError(true)
+				w.AppendText("Elicitation capability not available in this session.")
+				return nil
+			}
+
+			sp, ok := sess.GetSamplingCapability()
+			if !ok {
+				w.SetError(true)
+				w.AppendText("Sampling capability not available in this session.")
+				return nil
+			}
+
+			res, err := el.Elicit(ctx, &mcp.ElicitRequest{
+				Prompt: "Which language should I translate to?",
+				Schema: mcp.ElicitationSchema{
+					Type: "object",
+					Properties: map[string]mcp.PrimitiveSchemaDefinition{
+						"language": {
+							Type:        "string",
+							Description: "Target language for translation (e.g. 'French', 'Spanish')",
+						},
+					},
+					Required: []string{"language"},
+				},
+			})
+			if err != nil {
+				w.SetError(true)
+				w.AppendText("Elicitation error: " + err.Error())
+				return nil
+			}
+
+			lang, ok := res.Values["language"].(string)
+			if !ok || lang == "" {
+				w.SetError(true)
+				w.AppendText("Elicitation did not return a valid language.")
+				return nil
+			}
+
+			sres, err := sp.CreateMessage(ctx, &mcp.CreateMessageRequest{
+				Messages: []mcp.SamplingMessage{
+					{
+						Role:    "user",
+						Content: []mcp.ContentBlock{{Type: "text", Text: "Translate the following text to " + lang + ": " + a.Text}},
+					},
+				},
+				SystemPrompt: "You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else.",
+			})
+			if err != nil {
+				w.SetError(true)
+				w.AppendText("Sampling error: " + err.Error())
+				return nil
+			}
+
+			_ = w.AppendBlocks(sres.Content)
 			return nil
 		},
 		mcpservice.WithToolDescription("Translate text to a target language."),

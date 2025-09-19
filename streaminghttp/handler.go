@@ -457,12 +457,10 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
 	// h.log.Debug("handlePostMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
-	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
-	if err != nil {
-		w.WriteHeader(http.StatusUnsupportedMediaType)
-		return
-	}
-
+	// NOTE: We defer Accept negotiation (for text/event-stream) until we know
+	// we will actually produce an SSE response (i.e. a request with an ID).
+	// Earlier code enforced Accept universally which penalized simple
+	// notifications / initialize handshakes returning JSON.
 	ctype, err := contenttype.GetMediaType(r)
 	if err != nil || !ctype.Matches(jsonMediaType) {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
@@ -528,14 +526,16 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
-	if clientPV == "" {
+	sessionPV := pubSession.ProtocolVersion()
+	if clientPV != "" && sessionPV != "" && clientPV != sessionPV {
+		if h.log != nil {
+			h.log.Debug("protocol version mismatch", slog.String("session_id", sessID), slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	if spv := pubSession.ProtocolVersion(); spv != "" && clientPV != spv {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+	// If clientPV empty, we fall back to the session-bound version (spec allows
+	// server to infer). No 400 in this case.
 
 	// We have a valid session now. Let's see what kind of message it is.
 	if req := msg.AsRequest(); req != nil {
@@ -553,8 +553,26 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
-		// Set the content type for the SSE response now that preconditions are satisfied
-		// and advertise the session's protocol version if available
+		// For request-with-ID we will stream a response (SSE). Now negotiate Accept.
+		if r.Header.Get("Accept") == "" { // require explicit header for SSE
+			if h.log != nil { h.log.Debug("reject request: missing Accept header for SSE (explicit requirement)", slog.String("session_id", sessID)) }
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		if _, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes); err != nil {
+			// Distinguish missing Accept vs present but wrong for clarity
+			if h.log != nil {
+				accept := r.Header.Get("Accept")
+				if accept == "" {
+					h.log.Debug("reject request: missing Accept header for SSE", slog.String("session_id", sessID))
+				} else {
+					h.log.Debug("reject request: unacceptable Accept for SSE", slog.String("session_id", sessID), slog.String("accept", accept))
+				}
+			}
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		// Set the content type for the SSE response and advertise protocol version
 		if spv := sh.ToSession().ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}

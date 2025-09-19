@@ -72,11 +72,13 @@ func main() {
     ctx := context.Background()
 
     publicEndpoint := os.Getenv("MCP_PUBLIC_ENDPOINT") // e.g. https://mcp.example.com/mcp
-    issuer := os.Getenv("OIDC_ISSUER")                  // your OAuth/OIDC issuer URL
+    issuer := os.Getenv("OIDC_ISSUER")                 // your OAuth/OIDC issuer URL
 
     // 1) Session host for horizontal scale (Redis)
     host, err := redishost.New(os.Getenv("REDIS_ADDR"))
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
     defer host.Close()
 
     // 2) Typed tool with strict input schema by default
@@ -104,7 +106,11 @@ func main() {
         auth.WithExpectedAudience(publicEndpoint), // audience check (use your public MCP endpoint)
         auth.WithLeeway(2*time.Minute),
     )
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
+
+    log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
     // 5) Drop-in handler
     h, err := streaminghttp.New(
@@ -114,10 +120,12 @@ func main() {
         server,
         authenticator,
         streaminghttp.WithServerName("My MCP Server"),
-        streaminghttp.WithLogger(slog.NewTextHandler(os.Stdout, nil)),
+        streaminghttp.WithLogger(log),
         streaminghttp.WithAuthorizationServerDiscovery(issuer),
     )
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
 
     // 6) Serve
     http.ListenAndServe("127.0.0.1:8080", h)

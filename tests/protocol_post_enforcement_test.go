@@ -69,7 +69,8 @@ func doInitialize(t *testing.T, srv *httptest.Server) string {
 }
 
 // TestMissingProtocolHeaderOnRequest ensures non-initialize calls without header are rejected.
-func TestMissingProtocolHeaderOnRequest(t *testing.T) {
+func TestMissingProtocolHeaderOnRequestAllowed(t *testing.T) {
+	// Now that server infers protocol version from session, missing header should NOT 400.
 	srv, _ := setupTestServer(t)
 	defer srv.Close()
 	sid := doInitialize(t, srv)
@@ -80,13 +81,79 @@ func TestMissingProtocolHeaderOnRequest(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer x")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("mcp-session-id", sid)
+	req.Header.Set("Accept", "text/event-stream") // ensure we test protocol fallback, not Accept enforcement
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK { // request with ID yields SSE 200 OK now
+		t.Fatalf("expected 200 OK with inferred protocol version, got %d", resp.StatusCode)
+	}
+	if pv := resp.Header.Get("MCP-Protocol-Version"); pv == "" {
+		t.Fatalf("expected MCP-Protocol-Version header in response")
+	}
+}
+
+// Ensure we still reject mismatch when header supplied and differs
+func TestProtocolVersionMismatchStillRejected(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+	sid := doInitialize(t, srv)
+
+	reqBody := map[string]any{"jsonrpc": "2.0", "id": "3", "method": "ping"}
+	b, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer x")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("mcp-session-id", sid)
+	req.Header.Set("MCP-Protocol-Version", "2999-01-01")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 missing protocol header, got %d", resp.StatusCode)
+		t.Fatalf("expected 400 on mismatch, got %d", resp.StatusCode)
+	}
+}
+
+// Ensure Accept negotiation only enforced for SSE producing requests.
+func TestAcceptHeaderOnlyNeededForSSE(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	defer srv.Close()
+	// initialize (no Accept header)
+	sid := doInitialize(t, srv)
+
+	// notification (no ID) should not require Accept and returns 202
+	notif := map[string]any{"jsonrpc": "2.0", "method": "ping"}
+	b, _ := json.Marshal(notif)
+	nreq, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(b))
+	nreq.Header.Set("Authorization", "Bearer x")
+	nreq.Header.Set("Content-Type", "application/json")
+	nreq.Header.Set("mcp-session-id", sid)
+	// no Accept header
+	nreq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	nresp, err := http.DefaultClient.Do(nreq)
+	if err != nil { t.Fatalf("notif post: %v", err) }
+	defer nresp.Body.Close()
+	if nresp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for notification without Accept, got %d", nresp.StatusCode)
+	}
+
+	// request with ID (SSE) without Accept should 415
+	reqBody := map[string]any{"jsonrpc": "2.0", "id": "77", "method": "ping"}
+	b2, _ := json.Marshal(reqBody)
+	sreq, _ := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(b2))
+	sreq.Header.Set("Authorization", "Bearer x")
+	sreq.Header.Set("Content-Type", "application/json")
+	sreq.Header.Set("mcp-session-id", sid)
+	sreq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	sresp, err := http.DefaultClient.Do(sreq)
+	if err != nil { t.Fatalf("stream post: %v", err) }
+	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusUnsupportedMediaType { // 415
+		t.Fatalf("expected 415 for SSE request missing Accept, got %d", sresp.StatusCode)
 	}
 }
 
