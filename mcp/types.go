@@ -9,6 +9,18 @@ const (
 	RoleAssistant Role = "assistant"
 )
 
+// Content type string constants for ContentBlock.Type. These mirror the wire
+// protocol vocabulary and are provided to reduce typos in user code. Keeping
+// them here (instead of in a helper package) ensures a single authoritative
+// source of truth.
+const (
+	ContentTypeText             = "text"
+	ContentTypeImage            = "image"
+	ContentTypeAudio            = "audio"
+	ContentTypeResourceLink     = "resource"
+	ContentTypeEmbeddedResource = "embedded-resource"
+)
+
 type LoggingLevel string
 
 // LoggingLevel represents structured log severity.
