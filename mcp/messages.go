@@ -277,10 +277,10 @@ type CreateMessageRequest struct {
 
 // CreateMessageResult returns a generated message.
 type CreateMessageResult struct {
-	Role       Role           `json:"role"`
-	Content    []ContentBlock `json:"content"`
-	Model      string         `json:"model"`
-	StopReason string         `json:"stopReason,omitzero"`
+	Role       Role         `json:"role"`
+	Content    ContentBlock `json:"content"`
+	Model      string       `json:"model"`
+	StopReason string       `json:"stopReason,omitzero"`
 	BaseMetadata
 }
 
@@ -313,14 +313,25 @@ type RootsListChangedNotification struct{}
 // Elicitation
 // ElicitRequest asks for structured input per schema.
 type ElicitRequest struct {
-	Prompt string            `json:"prompt"`
-	Schema ElicitationSchema `json:"schema"`
+	Message         string            `json:"message"`
+	RequestedSchema ElicitationSchema `json:"requestedSchema"`
 }
 
 // ElicitResult returns schema-conformant values.
 type ElicitResult struct {
-	Values map[string]any `json:"values"`
+	Action  string         `json:"action"`
+	Content map[string]any `json:"content"`
 	BaseMetadata
+}
+
+// TypedElicitResult is returned by the higher-level typed elicitation helper.
+// Value points to the decoded struct instance supplied by the caller. Raw
+// mirrors ElicitResult.Content after normalization.
+type TypedElicitResult[T any] struct {
+	Action   string
+	Value    *T
+	Raw      map[string]any
+	Metadata map[string]any
 }
 
 // Empty result for operations that don't return data

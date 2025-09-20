@@ -9,6 +9,18 @@ const (
 	RoleAssistant Role = "assistant"
 )
 
+// Content type string constants for ContentBlock.Type. These mirror the wire
+// protocol vocabulary and are provided to reduce typos in user code. Keeping
+// them here (instead of in a helper package) ensures a single authoritative
+// source of truth.
+const (
+	ContentTypeText             = "text"
+	ContentTypeImage            = "image"
+	ContentTypeAudio            = "audio"
+	ContentTypeResourceLink     = "resource"
+	ContentTypeEmbeddedResource = "embedded-resource"
+)
+
 type LoggingLevel string
 
 // LoggingLevel represents structured log severity.
@@ -199,8 +211,8 @@ type PromptMessage struct {
 // Sampling
 // SamplingMessage is a message used as input to model sampling.
 type SamplingMessage struct {
-	Role    Role           `json:"role"`
-	Content []ContentBlock `json:"content"`
+	Role    Role         `json:"role"`
+	Content ContentBlock `json:"content"`
 }
 
 // ModelPreferences encode model selection tradeoffs.
@@ -261,3 +273,6 @@ type PrimitiveSchemaDefinition struct {
 	// For EnumSchema
 	Enum []any `json:"enum,omitempty"`
 }
+
+// LatestProtocolVersion is the latest version of the protocol.
+const LatestProtocolVersion = "2025-06-18"

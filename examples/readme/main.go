@@ -9,6 +9,7 @@ import (
 
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/redishost"
@@ -17,7 +18,6 @@ import (
 
 type TranslateArgs struct {
 	Text string `json:"text" jsonschema:"minLength=1,description=Text to translate"`
-	To   string `json:"to"   jsonschema:"enum=en,enum=fr,enum=es,description=Target language (ISO 639-1)"`
 }
 
 func main() {
@@ -36,9 +36,53 @@ func main() {
 	// 2) Typed tool with strict input schema by default
 	translate := mcpservice.NewTool[TranslateArgs](
 		"translate",
-		func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
+		func(ctx context.Context, sess sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[TranslateArgs]) error {
 			a := r.Args()
-			_ = w.AppendText("Translated to " + a.To + ": " + a.Text)
+
+			el, ok := sess.GetElicitationCapability()
+			if !ok {
+				w.SetError(true)
+				w.AppendText("Elicitation capability not available in this session.")
+				return nil
+			}
+
+			sp, ok := sess.GetSamplingCapability()
+			if !ok {
+				w.SetError(true)
+				w.AppendText("Sampling capability not available in this session.")
+				return nil
+			}
+
+			type LanguageChoice struct {
+				Language string `json:"language" jsonschema:"minLength=1,description=Target language for translation (e.g. French, Spanish)"`
+			}
+			res, err := sessions.ElicitType[LanguageChoice](el, ctx, "Which language should I translate to?")
+			if err != nil {
+				w.SetError(true)
+				w.AppendText("Elicitation error: " + err.Error())
+				return nil
+			}
+			lang := res.Value.Language
+			if lang == "" {
+				w.SetError(true)
+				w.AppendText("Elicitation did not return a valid language.")
+				return nil
+			}
+
+			sres, err := sp.CreateMessage(ctx, sampling.NewCreateMessage(
+				[]mcp.SamplingMessage{
+					sampling.UserText("Translate the following text to " + lang + ": " + a.Text),
+				},
+				sampling.WithSystemPrompt("You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else."),
+				sampling.WithMaxTokens(100),
+			))
+			if err != nil {
+				w.SetError(true)
+				w.AppendText("Sampling error: " + err.Error())
+				return nil
+			}
+
+			_ = w.AppendBlocks(sres.Content)
 			return nil
 		},
 		mcpservice.WithToolDescription("Translate text to a target language."),
@@ -62,7 +106,7 @@ func main() {
 		panic(err)
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// 5) Drop-in handler
 	h, err := streaminghttp.New(

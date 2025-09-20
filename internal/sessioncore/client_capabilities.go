@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/validation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/google/uuid"
@@ -13,8 +14,14 @@ import (
 
 // Private concrete implementations for capabilities
 
+// simpleSession is a minimal adapter the capability impls use to reach the host.
+type SimpleSession struct {
+	id      string
+	backend sessions.SessionHost
+}
+
 type samplingCapabilityImpl struct {
-	sess *SessionHandle
+	sess *SimpleSession
 }
 
 func (s *samplingCapabilityImpl) CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
@@ -29,7 +36,7 @@ func (s *samplingCapabilityImpl) CreateMessage(ctx context.Context, req *mcp.Cre
 }
 
 type rootsCapabilityImpl struct {
-	sess                *SessionHandle
+	sess                *SimpleSession
 	supportsListChanged bool
 }
 
@@ -56,12 +63,16 @@ func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Conte
 }
 
 type elicitationCapabilityImpl struct {
-	sess *SessionHandle
+	sess *SimpleSession
 }
 
 func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 	if req == nil {
 		return nil, fmt.Errorf("nil request")
+	}
+	// Internal validation of schema before sending to client to catch server-side errors early.
+	if err := validation.ElicitationSchema(&req.RequestedSchema); err != nil {
+		return nil, err
 	}
 	var out mcp.ElicitResult
 	if err := rpcCallToClient(ctx, e.sess, mcp.ElicitationCreateMethod, req, &out); err != nil {
@@ -70,9 +81,11 @@ func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitR
 	return &out, nil
 }
 
+// (validation logic unified in internal/validation)
+
 // rpcCallToClient sends a JSON-RPC request to the client via the session's
 // message stream and awaits the corresponding response using the host rendezvous.
-func rpcCallToClient[T any](ctx context.Context, sess *SessionHandle, method mcp.Method, params any, out *T) error {
+func rpcCallToClient[T any](ctx context.Context, sess *SimpleSession, method mcp.Method, params any, out *T) error {
 	if sess == nil || sess.backend == nil {
 		return fmt.Errorf("session backend unavailable")
 	}
