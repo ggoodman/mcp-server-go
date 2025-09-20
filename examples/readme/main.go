@@ -9,7 +9,6 @@ import (
 
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcp/elicitation"
 	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -54,22 +53,17 @@ func main() {
 				return nil
 			}
 
-			schema := elicitation.ObjectSchema(
-				elicitation.PropString("language", "Target language for translation (e.g. 'French', 'Spanish')"),
-				elicitation.Required("language"),
-			)
-			res, err := el.Elicit(ctx, &mcp.ElicitRequest{
-				Message:         "Which language should I translate to?",
-				RequestedSchema: schema,
-			})
+			type LanguageChoice struct {
+				Language string `json:"language" jsonschema:"minLength=1,description=Target language for translation (e.g. French, Spanish)"`
+			}
+			res, err := sessions.ElicitType[LanguageChoice](el, ctx, "Which language should I translate to?")
 			if err != nil {
 				w.SetError(true)
 				w.AppendText("Elicitation error: " + err.Error())
 				return nil
 			}
-
-			lang, ok := res.Content["language"].(string)
-			if !ok || lang == "" {
+			lang := res.Value.Language
+			if lang == "" {
 				w.SetError(true)
 				w.AppendText("Elicitation did not return a valid language.")
 				return nil
