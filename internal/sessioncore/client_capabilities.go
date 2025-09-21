@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 
+	internalelicitation "github.com/ggoodman/mcp-server-go/internal/elicitation"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/internal/validation"
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -62,23 +64,61 @@ func (r *rootsCapabilityImpl) RegisterRootsListChangedListener(ctx context.Conte
 	return true, nil
 }
 
-type elicitationCapabilityImpl struct {
-	sess *SimpleSession
-}
+type elicitationCapabilityImpl struct{ sess *SimpleSession }
 
-func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-	if req == nil {
-		return nil, fmt.Errorf("nil request")
+func (e *elicitationCapabilityImpl) Elicit(ctx context.Context, text string, target any, opts ...sessions.ElicitOption) (sessions.ElicitAction, error) {
+	if e == nil || e.sess == nil {
+		return "", fmt.Errorf("elicitation capability unavailable")
 	}
-	// Internal validation of schema before sending to client to catch server-side errors early.
+	if target == nil {
+		return "", fmt.Errorf("elicitation: target nil")
+	}
+	rv := reflect.ValueOf(target)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return "", fmt.Errorf("elicitation: target must be non-nil pointer")
+	}
+	if rv.Elem().Kind() != reflect.Struct {
+		return "", fmt.Errorf("elicitation: target must point to struct")
+	}
+	var conf sessions.ElicitConfig
+	for _, opt := range opts {
+		opt(&conf)
+	}
+	// Build schema
+	t := rv.Elem().Type()
+	schema, cp, err := internalelicitation.ProjectSchema(t)
+	if err != nil {
+		return "", err
+	}
+	req := &mcp.ElicitRequest{Message: text, RequestedSchema: *schema}
 	if err := validation.ElicitationSchema(&req.RequestedSchema); err != nil {
-		return nil, err
+		return "", err
 	}
 	var out mcp.ElicitResult
 	if err := rpcCallToClient(ctx, e.sess, mcp.ElicitationCreateMethod, req, &out); err != nil {
-		return nil, err
+		return "", err
 	}
-	return &out, nil
+	// Decode
+	if err := internalelicitation.DecodeForTyped(cp, target, out.Content, conf.Strict); err != nil {
+		return "", err
+	}
+	if conf.RawDst != nil {
+		m := make(map[string]any, len(out.Content))
+		for k, v := range out.Content {
+			m[k] = v
+		}
+		*conf.RawDst = m
+	}
+	switch out.Action {
+	case string(sessions.ElicitActionAccept):
+		return sessions.ElicitActionAccept, nil
+	case string(sessions.ElicitActionDecline):
+		return sessions.ElicitActionDecline, nil
+	case string(sessions.ElicitActionCancel):
+		return sessions.ElicitActionCancel, nil
+	default:
+		return "", fmt.Errorf("elicitation: unknown action %q", out.Action)
+	}
 }
 
 // (validation logic unified in internal/validation)

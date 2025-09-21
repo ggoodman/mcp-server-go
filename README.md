@@ -302,35 +302,41 @@ if err := sampling.ValidateCreateMessage(req); err != nil { /* handle */ }
 resp, _ := sp.CreateMessage(ctx, req)
 ```
 
-### Elicitation schema DSL
+### Elicitation (reflective API)
 
-Raw:
+Elicitation lets the server request structured user input mid-flow. The
+`sessions.ElicitationCapability` turns a struct definition into a restricted
+schema (flat object; primitive properties) and decodes the response back into
+the same struct.
 
 ```go
-schema := mcp.ElicitationSchema{
-    Type: "object",
-    Properties: map[string]mcp.PrimitiveSchemaDefinition{
-        "language": {Type: "string", Description: "Target language"},
-    },
-    Required: []string{"language"},
+type LanguageChoice struct {
+    Language string `json:"language" jsonschema:"description=Target language,minLength=1"`
 }
-_ = schema // then call el.Elicit(...)
+
+el, ok := sess.GetElicitationCapability()
+if ok {
+    var lc LanguageChoice
+    action, err := el.Elicit(ctx, &lc, sessions.WithMessage("Which language should I translate to?"))
+    if err != nil { /* handle transport/validation error */ }
+    if action == sessions.ElicitActionAccept {
+        // use lc.Language
+    }
+}
 ```
 
-With helpers:
+Options:
 
-```go
-import "github.com/ggoodman/mcp-server-go/mcp/elicitation"
+* `sessions.WithMessage(string)` – prompt shown to the user.
+* `sessions.WithStrictKeys()` – reject unknown keys (default: ignore extras).
+* `sessions.WithRawCapture(&map[string]any{})` – access the raw response map.
 
-schema := elicitation.ObjectSchema(
-    elicitation.PropString("language", "Target language", elicitation.WithEnum("French", "Spanish", "German")),
-    elicitation.Required("language"),
-)
-res, err := el.Elicit(ctx, &mcp.ElicitRequest{
-    Message:         "Which language should I translate to?",
-    RequestedSchema: schema,
-})
-```
+Constraints (enforced server-side for now):
+
+* No nested objects / arrays / oneOf / anyOf / refs.
+* Enum only on string fields.
+* Pointer fields are optional; non-pointer fields are required if present in the reflected schema's required set.
+* Numeric min/max derived from jsonschema tags when supported by `invopop/jsonschema`.
 
 ### Design goals
 
@@ -339,4 +345,7 @@ res, err := el.Elicit(ctx, &mcp.ElicitRequest{
 3. Minimal API surface: helpers focus on reducing typos and repetition, not inventing new protocol concepts.
 4. Easy escape hatch: you can intermix manual and helper-constructed values freely.
 
-Reflection-based schema derivation and single-value elicitation helpers are intentionally deferred until the DSL stabilizes.
+The earlier explicit request-building helper layer was removed in favor of the
+single reflective API above. If you need to hand-author a schema, you can still
+construct an `mcp.ElicitationSchema` directly and (in a future add-on) we may
+expose a low-level call, but the reflective path is the primary ergonomics story.

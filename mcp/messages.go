@@ -324,16 +324,6 @@ type ElicitResult struct {
 	BaseMetadata
 }
 
-// TypedElicitResult is returned by the higher-level typed elicitation helper.
-// Value points to the decoded struct instance supplied by the caller. Raw
-// mirrors ElicitResult.Content after normalization.
-type TypedElicitResult[T any] struct {
-	Action   string
-	Value    *T
-	Raw      map[string]any
-	Metadata map[string]any
-}
-
 // Empty result for operations that don't return data
 // EmptyResult is returned for operations that do not return data.
 type EmptyResult struct {

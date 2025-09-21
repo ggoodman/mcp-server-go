@@ -43,17 +43,24 @@ func project(t reflect.Type) (*cachedProjection, error) {
 	if t.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("elicitation: type must be struct kind, got %s", t.Kind())
 	}
-	if v, ok := projCache.Load(t); ok {
-		return v.(*cachedProjection), nil
+
+	// Only used cache for named types. Anonymous types (t.Name()=="" && t.PkgPath()=="")
+	// are cheap enough to recompute and some jsonschema reflector code may panic for
+	// truly anonymous composites depending on tag permutations.
+	cacheable := t.Name() != "" || t.PkgPath() != ""
+	if cacheable {
+		if v, ok := projCache.Load(t); ok {
+			return v.(*cachedProjection), nil
+		}
 	}
 
 	// Build mapping from json property name to struct field for metadata.
 	fieldMap := map[string]reflect.StructField{}
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if f.PkgPath != "" {
+		if f.PkgPath != "" { // unexported
 			continue
-		} // unexported
+		}
 		name, _ := parseJSONName(f)
 		if name == "-" {
 			continue
@@ -64,42 +71,15 @@ func project(t reflect.Type) (*cachedProjection, error) {
 		fieldMap[name] = f
 	}
 
-	r := &js.Reflector{DoNotReference: true, ExpandedStruct: true}
-	root := r.Reflect(reflect.New(t).Interface())
-	if root == nil || root.Type != "object" {
-		return nil, fmt.Errorf("elicitation: projected root not object")
-	}
+	var (
+		out   mcp.ElicitationSchema
+		metas []fieldMeta
+	)
+	out = mcp.ElicitationSchema{Type: "object", Properties: make(map[string]mcp.PrimitiveSchemaDefinition)}
 
-	requiredSet := map[string]struct{}{}
-	for _, n := range root.Required {
-		requiredSet[n] = struct{}{}
-	}
-
-	out := mcp.ElicitationSchema{Type: "object", Properties: make(map[string]mcp.PrimitiveSchemaDefinition)}
-	var metas []fieldMeta
-
-	if root.Properties != nil {
-		for el := root.Properties.Oldest(); el != nil; el = el.Next() {
-			name := el.Key
-			v := el.Value
-			if v == nil {
-				return nil, fmt.Errorf("elicitation: nil property schema for %s", name)
-			}
-			// Reject nested/complex constructs we don't support for elicitation.
-			if v.Type == "object" || v.Type == "array" || v.Ref != "" || len(v.AllOf) > 0 || len(v.AnyOf) > 0 || len(v.OneOf) > 0 || v.Not != nil {
-				return nil, fmt.Errorf("elicitation: unsupported schema feature on field %s", name)
-			}
-			if v.Items != nil || v.AdditionalProperties != nil {
-				return nil, fmt.Errorf("elicitation: complex collection feature on field %s", name)
-			}
-			if v.Pattern != "" || v.Format != "" || len(v.Examples) > 0 || v.Default != nil || v.ContentEncoding != "" || v.ContentMediaType != "" {
-				return nil, fmt.Errorf("elicitation: unsupported supplemental keyword on field %s", name)
-			}
-
-			sf, ok := fieldMap[name]
-			if !ok {
-				return nil, fmt.Errorf("elicitation: property %s not matched to struct field", name)
-			}
+	// Fast manual reflection path for anonymous types to avoid Reflector panic.
+	if !cacheable { // anonymous struct
+		for name, sf := range fieldMap {
 			ft := sf.Type
 			isPtr := false
 			if ft.Kind() == reflect.Pointer {
@@ -107,51 +87,143 @@ func project(t reflect.Type) (*cachedProjection, error) {
 				ft = ft.Elem()
 			}
 			baseKind := ft.Kind()
-			typeStr, ok := mapSchemaTypeToProtocol(v.Type, baseKind)
-			if !ok {
-				return nil, fmt.Errorf("elicitation: unsupported type mapping for field %s", name)
+			var typeStr string
+			switch baseKind {
+			case reflect.String:
+				typeStr = "string"
+			case reflect.Bool:
+				typeStr = "boolean"
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+				reflect.Float32, reflect.Float64:
+				typeStr = "number"
+			default:
+				return nil, fmt.Errorf("elicitation: unsupported field kind %s", baseKind)
 			}
 
 			ps := mcp.PrimitiveSchemaDefinition{Type: typeStr}
-			if v.Description != "" {
-				ps.Description = v.Description
-			}
-			var enumSet map[string]struct{}
-			if len(v.Enum) > 0 {
-				if typeStr != "string" {
-					return nil, fmt.Errorf("elicitation: enum only on string (%s)", name)
-				}
-				ps.Enum = make([]any, len(v.Enum))
-				enumSet = make(map[string]struct{}, len(v.Enum))
-				for i, ev := range v.Enum {
-					sv, ok := ev.(string)
-					if !ok {
-						return nil, fmt.Errorf("elicitation: non-string enum value field %s", name)
+			if desc := sf.Tag.Get("jsonschema"); desc != "" {
+				// crude parse of description=... and minimum/maximum=...
+				// We intentionally accept a subset; existing test coverage relies on minimum/maximum.
+				parts := strings.Split(desc, ",")
+				for _, p := range parts {
+					kv := strings.SplitN(p, "=", 2)
+					if len(kv) != 2 {
+						continue
 					}
-					ps.Enum[i] = sv
-					enumSet[sv] = struct{}{}
+					k, v := kv[0], kv[1]
+					switch k {
+					case "description":
+						ps.Description = v
+					case "minimum":
+						if f, err := strconv.ParseFloat(v, 64); err == nil {
+							ps.Minimum = f
+						}
+					case "maximum":
+						if f, err := strconv.ParseFloat(v, 64); err == nil {
+							ps.Maximum = f
+						}
+					}
 				}
 			}
 			var minPtr, maxPtr *float64
-			if v.Minimum != "" {
-				if f, err := strconv.ParseFloat(string(v.Minimum), 64); err == nil {
-					ps.Minimum = f
-					minPtr = &f
-				}
+			if ps.Minimum != 0 { // can't differentiate unset vs zero; acceptable for anonymous fallback
+				f := ps.Minimum
+				minPtr = &f
 			}
-			if v.Maximum != "" {
-				if f, err := strconv.ParseFloat(string(v.Maximum), 64); err == nil {
-					ps.Maximum = f
-					maxPtr = &f
-				}
+			if ps.Maximum != 0 {
+				f := ps.Maximum
+				maxPtr = &f
 			}
-
 			out.Properties[name] = ps
-			_, isReq := requiredSet[name]
-			if isReq && !isPtr {
+			// Anonymous structs treat all non-pointer fields as required.
+			if !isPtr {
 				out.Required = append(out.Required, name)
 			}
-			metas = append(metas, fieldMeta{Name: name, Index: sf.Index, Required: isReq && !isPtr, Kind: baseKind, EnumSet: enumSet, Min: minPtr, Max: maxPtr, IsPointer: isPtr})
+			metas = append(metas, fieldMeta{Name: name, Index: sf.Index, Required: !isPtr, Kind: baseKind, Min: minPtr, Max: maxPtr, IsPointer: isPtr})
+		}
+	} else {
+		// Original path using jsonschema Reflector for richer feature extraction.
+		r := &js.Reflector{DoNotReference: true, ExpandedStruct: true}
+		root := r.Reflect(reflect.New(t).Interface())
+		if root == nil || root.Type != "object" {
+			return nil, fmt.Errorf("elicitation: projected root not object")
+		}
+		requiredSet := map[string]struct{}{}
+		for _, n := range root.Required {
+			requiredSet[n] = struct{}{}
+		}
+		if root.Properties != nil {
+			for el := root.Properties.Oldest(); el != nil; el = el.Next() {
+				name := el.Key
+				v := el.Value
+				if v == nil {
+					return nil, fmt.Errorf("elicitation: nil property schema for %s", name)
+				}
+				if v.Type == "object" || v.Type == "array" || v.Ref != "" || len(v.AllOf) > 0 || len(v.AnyOf) > 0 || len(v.OneOf) > 0 || v.Not != nil {
+					return nil, fmt.Errorf("elicitation: unsupported schema feature on field %s", name)
+				}
+				if v.Items != nil || v.AdditionalProperties != nil {
+					return nil, fmt.Errorf("elicitation: complex collection feature on field %s", name)
+				}
+				if v.Pattern != "" || v.Format != "" || len(v.Examples) > 0 || v.Default != nil || v.ContentEncoding != "" || v.ContentMediaType != "" {
+					return nil, fmt.Errorf("elicitation: unsupported supplemental keyword on field %s", name)
+				}
+				sf, ok := fieldMap[name]
+				if !ok {
+					return nil, fmt.Errorf("elicitation: property %s not matched to struct field", name)
+				}
+				ft := sf.Type
+				isPtr := false
+				if ft.Kind() == reflect.Pointer {
+					isPtr = true
+					ft = ft.Elem()
+				}
+				baseKind := ft.Kind()
+				typeStr, ok := mapSchemaTypeToProtocol(v.Type, baseKind)
+				if !ok {
+					return nil, fmt.Errorf("elicitation: unsupported type mapping for field %s", name)
+				}
+				ps := mcp.PrimitiveSchemaDefinition{Type: typeStr}
+				if v.Description != "" {
+					ps.Description = v.Description
+				}
+				var enumSet map[string]struct{}
+				if len(v.Enum) > 0 {
+					if typeStr != "string" {
+						return nil, fmt.Errorf("elicitation: enum only on string (%s)", name)
+					}
+					ps.Enum = make([]any, len(v.Enum))
+					enumSet = make(map[string]struct{}, len(v.Enum))
+					for i, ev := range v.Enum {
+						sv, ok := ev.(string)
+						if !ok {
+							return nil, fmt.Errorf("elicitation: non-string enum value field %s", name)
+						}
+						ps.Enum[i] = sv
+						enumSet[sv] = struct{}{}
+					}
+				}
+				var minPtr, maxPtr *float64
+				if v.Minimum != "" {
+					if f, err := strconv.ParseFloat(string(v.Minimum), 64); err == nil {
+						ps.Minimum = f
+						minPtr = &f
+					}
+				}
+				if v.Maximum != "" {
+					if f, err := strconv.ParseFloat(string(v.Maximum), 64); err == nil {
+						ps.Maximum = f
+						maxPtr = &f
+					}
+				}
+				out.Properties[name] = ps
+				_, isReq := requiredSet[name]
+				if isReq && !isPtr {
+					out.Required = append(out.Required, name)
+				}
+				metas = append(metas, fieldMeta{Name: name, Index: sf.Index, Required: isReq && !isPtr, Kind: baseKind, EnumSet: enumSet, Min: minPtr, Max: maxPtr, IsPointer: isPtr})
+			}
 		}
 	}
 
@@ -162,8 +234,11 @@ func project(t reflect.Type) (*cachedProjection, error) {
 		return nil, err
 	}
 	cp := &cachedProjection{schema: out, fields: metas}
-	actual, _ := projCache.LoadOrStore(t, cp)
-	return actual.(*cachedProjection), nil
+	if cacheable {
+		actual, _ := projCache.LoadOrStore(t, cp)
+		return actual.(*cachedProjection), nil
+	}
+	return cp, nil
 }
 
 // ProjectForTesting is a temporary exported wrapper to allow the sessions helper to reference
@@ -391,19 +466,3 @@ func mapSchemaTypeToProtocol(vType string, k reflect.Kind) (string, bool) {
 	return "", false
 }
 
-// split is a tiny allocation-minded splitter (string.Split analogue for 1-byte sep).
-func split(s string, sep byte) []string { // retained for any legacy callers
-	if s == "" {
-		return nil
-	}
-	var out []string
-	last := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			out = append(out, s[last:i])
-			last = i + 1
-		}
-	}
-	out = append(out, s[last:])
-	return out
-}

@@ -44,8 +44,65 @@ type RootsCapability interface {
 	RegisterRootsListChangedListener(ctx context.Context, listener RootsListChangedListener) (supported bool, err error)
 }
 
-// ElicitationCapability when present, exposes the elicitation API for gathering
-// structured inputs from the client.
+// ElicitAction indicates the client's chosen action for an elicitation.
+// Exactly one action is returned. Server logic should usually proceed only
+// when Action == ElicitActionAccept and treat Decline / Cancel as a signal to
+// abort or provide alternative behavior.
+type ElicitAction string
+
+const (
+	ElicitActionAccept  ElicitAction = "accept"
+	ElicitActionDecline ElicitAction = "decline"
+	ElicitActionCancel  ElicitAction = "cancel"
+)
+
+// ElicitationCapability exposes a reflective elicitation API.
+//
+// Call pattern:
+//
+//	type Input struct { Name string `json:"name" jsonschema:"minLength=1,description=Your name"` }
+//	var in Input
+//	action, err := elicCap.Elicit(ctx, "Who are you?", &in)
+//	if err != nil { /* transport / validation error */ }
+//	if action != sessions.ElicitActionAccept { /* user declined/cancelled */ }
+//	// use in.Name
+//
+// Behavior:
+//  1. target MUST be a non-nil pointer to a struct; exported fields become schema properties.
+//  2. JSON + `jsonschema` struct tags (via invopop/jsonschema) are reflected into a flat object schema.
+//     Nested objects, arrays, refs and composition keywords are currently rejected to keep
+//     client implementation cost low.
+//  3. Pointer fields are treated as optional. Non-pointer fields present in the schema's
+//     required set are enforced.
+//  4. On success the target struct is populated in-place and the user action is returned.
+//  5. If decoding fails (type mismatch, enum violation, missing required), an error is returned.
+//
+// Concurrency: Implementations MUST be safe for concurrent use. Each call derives its schema
+// from type metadata and does not mutate the target until after a successful round-trip.
 type ElicitationCapability interface {
-	Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error)
+	// Elicit sends an elicitation request with the provided user-facing message text
+	// and decodes the response into target.
+	Elicit(ctx context.Context, text string, target any, opts ...ElicitOption) (ElicitAction, error)
+}
+
+// ElicitOption configures an elicitation invocation (functional options pattern).
+type ElicitOption func(*ElicitConfig)
+
+// ElicitConfig accumulates option settings for an elicitation invocation.
+// Fields are exported only so option helpers in other packages (if any) can
+// apply them; prefer the provided With* helpers for forward compatibility.
+type ElicitConfig struct {
+	Strict bool
+	RawDst *map[string]any
+}
+
+// WithStrictKeys enforces that the client returns no properties beyond those
+// defined in the derived schema. Without this option, unknown keys are
+// ignored to allow clients to evolve UI metadata without breaking servers.
+func WithStrictKeys() ElicitOption { return func(o *ElicitConfig) { o.Strict = true } }
+
+// WithRawCapture copies the raw returned content map into dst (if non-nil).
+// The map is shallow-copied so callers can safely mutate it.
+func WithRawCapture(dst *map[string]any) ElicitOption {
+	return func(o *ElicitConfig) { o.RawDst = dst }
 }
