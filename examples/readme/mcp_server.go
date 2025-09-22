@@ -74,7 +74,19 @@ func NewExampleServer() mcpservice.ServerCapabilities {
 		mcpservice.WithToolDescription("Translate text to a target language."),
 	)
 
-	tools := mcpservice.NewStaticTools(translate)
+	echo := mcpservice.NewTool(
+		"echo",
+		func(ctx context.Context, sess sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[struct {
+			Text string `json:"text" jsonschema:"minLength=1,description=Text to echo"`
+		}]) error {
+			a := r.Args()
+			_ = w.AppendText(a.Text)
+			return nil
+		},
+		mcpservice.WithToolDescription("Echo text back to the user."),
+	)
+
+	tools := mcpservice.NewStaticTools(translate, echo)
 
 	server := mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
