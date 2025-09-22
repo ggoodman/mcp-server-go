@@ -1,5 +1,6 @@
 name: Release Drafter
 
+# Run only on push to main (after merges) - no pull_request triggers
 on:
   push:
     branches:

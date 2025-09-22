@@ -1,9 +1,10 @@
 name: CI - Test
 
+# Run only on pull_request targeting main and push to main (post-merge)
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
 
 concurrency:
