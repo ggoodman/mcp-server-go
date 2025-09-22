@@ -622,46 +622,54 @@ func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) 
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	// Initialize with roots capability requested so session gains roots wrapper.
+	// Correctly target /mcp path (public endpoint includes /mcp).
 	initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("init"), Params: mustJSON(map[string]any{
 		"protocolVersion": "2025-06-18",
 		"capabilities":    map[string]any{"roots": map[string]any{}},
 		"clientInfo":      map[string]any{"name": "c", "version": "1"},
 	})}
-	initResp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
+	initResp, _ := mustPostMCPPath(t, srv, "/mcp", "Bearer test-token", "", initReq)
 	sessID := initResp.Header.Get("mcp-session-id")
 	if sessID == "" {
-		t.Fatalf("missing session id")
+		// Fallback check with canonical header name just in case.
+		sessID = initResp.Header.Get("Mcp-Session-Id")
+	}
+	if sessID == "" {
+		b, _ := io.ReadAll(initResp.Body)
+		initResp.Body.Close()
+		// Provide body for debugging.
+		t.Fatalf("missing session id; status=%d body=%s", initResp.StatusCode, string(b))
 	}
 	initResp.Body.Close()
 
-	// Send tools/list which will internally trigger a roots/list client call.
+	// Send tools/list which will internally trigger a roots/list client call, using /mcp.
 	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(mcp.ListToolsRequest{})}
-	resp, bodyEvt := mustPostMCP(t, srv, "Bearer test-token", sessID, listReq)
+	resp, bodyEvt := mustPostMCPPath(t, srv, "/mcp", "Bearer test-token", sessID, listReq)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		t.Fatalf("unexpected status %d", resp.StatusCode)
 	}
 
-	// First SSE event should be the server->client roots/list request.
 	var first jsonrpc.Request
 	if err := json.Unmarshal(bodyEvt.data, &first); err != nil {
+		resp.Body.Close()
 		t.Fatalf("decode first event: %v", err)
 	}
 	if first.Method != string(mcp.RootsListMethod) {
+		resp.Body.Close()
 		t.Fatalf("expected first method roots/list, got %s", first.Method)
 	}
 	rid := first.ID.String()
 	if rid == "" {
+		resp.Body.Close()
 		t.Fatalf("expected non-empty outbound request id")
 	}
 
-	// Respond as client with empty roots list.
+	// Respond as client.
 	rootsResp := &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, ID: first.ID, Result: mustJSON(mcp.ListRootsResult{Roots: []mcp.Root{}})}
-	// Marshal into AnyMessage (raw JSON decoded into jsonrpc.AnyMessage)
 	buf, _ := json.Marshal(rootsResp)
-	// Manually POST the response JSON (streaming handler accepts generic AnyMessage)
-	httpReq, err := http.NewRequest(http.MethodPost, srv.URL+"/", bytes.NewReader(buf))
+	httpReq, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", bytes.NewReader(buf))
 	if err != nil {
 		t.Fatalf("new post resp req: %v", err)
 	}
@@ -674,32 +682,32 @@ func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) 
 		t.Fatalf("post response: %v", err)
 	}
 	if httpResp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202 for response POST, got %d", httpResp.StatusCode)
-	}
-	if httpResp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202 for response POST, got %d", httpResp.StatusCode)
+		b, _ := io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		t.Fatalf("expected 202 for response POST, got %d body=%s", httpResp.StatusCode, string(b))
 	}
 	httpResp.Body.Close()
 
-	// Now read second SSE frame (final server response to tools/list)
-	// Re-use reader on the same response body after first event consumed by mustPostMCP.
-	// The helper returns only first event; we need to read next.
 	second, err := readOneSSE(resp.Body)
 	if err != nil {
+		resp.Body.Close()
 		t.Fatalf("reading second event: %v", err)
 	}
 	var rpcRes jsonrpc.Response
 	if err := json.Unmarshal(second.data, &rpcRes); err != nil {
+		resp.Body.Close()
 		t.Fatalf("decode second event: %v", err)
 	}
 	if rpcRes.Error != nil {
+		resp.Body.Close()
 		t.Fatalf("unexpected error in final response: %+v", rpcRes.Error)
 	}
 	if rpcRes.ID.String() != "1" {
+		resp.Body.Close()
 		t.Fatalf("expected final response id 1, got %s", rpcRes.ID.String())
 	}
-	// Ensure the outbound request id differed from tools/list id.
 	if rid == rpcRes.ID.String() {
+		resp.Body.Close()
 		t.Fatalf("expected different ids for outbound client call and server response")
 	}
 }
@@ -1065,6 +1073,58 @@ func mustPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID strin
 		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("body read error: %v", err)})}
 	}
 	return resp, sseEvent{data: body}
+}
+
+// Added helper that allows specifying a custom path (e.g. /mcp) for POSTing MCP messages.
+func mustPostMCPPath(t *testing.T, srv *httptest.Server, path string, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, sseEvent) {
+	// Reuse existing logic from mustPostMCP with path override
+	resp, err := doPostMCPPath(t, srv, path, authHeader, sessionID, req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp, sseEvent{}
+	}
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
+		evt, err := readOneSSE(resp.Body)
+		if err != nil {
+			return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("sse read error: %v", err)})}
+		}
+		return resp, evt
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("body read error: %v", err)})}
+	}
+	return resp, sseEvent{data: body}
+}
+
+func doPostMCPPath(t *testing.T, srv *httptest.Server, path string, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, error) {
+	// Mirror doPostMCP but allow custom path
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	url := srv.URL + path
+	if !strings.HasPrefix(path, "/") {
+		url = srv.URL + "/" + path
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Content-Type", "application/json")
+	if authHeader != "" {
+		httpReq.Header.Set("Authorization", authHeader)
+	}
+	if sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", sessionID)
+		if req.Method != string(mcp.InitializeMethod) {
+			httpReq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+		}
+	}
+	return http.DefaultClient.Do(httpReq)
 }
 
 func readOneSSE(r io.Reader) (sseEvent, error) {
