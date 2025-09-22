@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -192,22 +194,32 @@ func NewToolWithOutput[A, O any](name string, fn func(ctx context.Context, sessi
 // converts it to the simplified mcp.ToolInputSchema. Unknown field policy is
 // surfaced via the AdditionalProperties flag on the returned schema.
 func reflectToMCPInputSchema[A any](allowAdditional bool) mcp.ToolInputSchema {
+	// Fast-path: interface{} / any or struct{} (or *struct{}) => explicitly empty schema.
+	if isTriviallyEmpty[A]() {
+		return mcp.ToolInputSchema{Type: "object", Properties: map[string]mcp.SchemaProperty{}, AdditionalProperties: allowAdditional}
+	}
 	r := &jsonschema.Reflector{
 		DoNotReference:            true, // inline defs
 		ExpandedStruct:            true, // put struct at root
 		AllowAdditionalProperties: allowAdditional,
 	}
-	// Reflect from a zero value pointer to capture struct tags consistently
-	s := r.Reflect(new(A))
 
-	// Only object schemas map cleanly to MCP ToolInputSchema. If not an object,
-	// expose an empty object with the configured additionalProperties policy.
+	// Perform reflection in a panic-safe way; the upstream library currently
+	// panics for some anonymous inline generic struct types. If it panics we
+	// fall back to a minimal manual struct field inspection so that users can
+	// still use anonymous inline argument structs without crashing.
+	var s *jsonschema.Schema
+	func() {
+		defer func() { _ = recover() }() // swallow reflector panics
+		s = r.Reflect(new(A))
+	}()
+
 	if s == nil || s.Type != "object" {
-		return mcp.ToolInputSchema{
-			Type:                 "object",
-			Properties:           map[string]mcp.SchemaProperty{},
-			AdditionalProperties: allowAdditional,
+		// Try a manual reflect before giving up entirely.
+		if schema, ok := manualStructSchema[A](allowAdditional); ok {
+			return schema
 		}
+		return mcp.ToolInputSchema{Type: "object", Properties: map[string]mcp.SchemaProperty{}, AdditionalProperties: allowAdditional}
 	}
 
 	props := make(map[string]mcp.SchemaProperty)
@@ -223,22 +235,22 @@ func reflectToMCPInputSchema[A any](allowAdditional bool) mcp.ToolInputSchema {
 		required = append(required, s.Required...)
 	}
 
-	return mcp.ToolInputSchema{
-		Type:                 "object",
-		Properties:           props,
-		Required:             required,
-		AdditionalProperties: allowAdditional,
-	}
+	return mcp.ToolInputSchema{Type: "object", Properties: props, Required: required, AdditionalProperties: allowAdditional}
 }
 
 // reflectToMCPOutputSchema reflects a Go type O into a mcp.ToolOutputSchema.
 func reflectToMCPOutputSchema[O any]() mcp.ToolOutputSchema {
-	r := &jsonschema.Reflector{
-		DoNotReference: true,
-		ExpandedStruct: true,
-	}
-	s := r.Reflect(new(O))
+	r := &jsonschema.Reflector{DoNotReference: true, ExpandedStruct: true}
+	var s *jsonschema.Schema
+	func() {
+		defer func() { _ = recover() }() // swallow reflector panics
+		s = r.Reflect(new(O))
+	}()
 	if s == nil || s.Type != "object" {
+		// Attempt manual reflect (best-effort) mainly for anonymous inline struct output types.
+		if schema, ok := manualStructSchema[O](false); ok {
+			return mcp.ToolOutputSchema{Type: schema.Type, Properties: schema.Properties, Required: schema.Required}
+		}
 		return mcp.ToolOutputSchema{Type: "object", Properties: map[string]mcp.SchemaProperty{}}
 	}
 	props := make(map[string]mcp.SchemaProperty)
@@ -254,6 +266,103 @@ func reflectToMCPOutputSchema[O any]() mcp.ToolOutputSchema {
 		required = append(required, s.Required...)
 	}
 	return mcp.ToolOutputSchema{Type: "object", Properties: props, Required: required}
+}
+
+// manualStructSchema provides a minimal fallback schema for inline anonymous struct
+// types when jsonschema reflection panics. It only handles plain struct fields with
+// primitive kinds (string, bool, integer, number). Complex nested structs collapse
+// to empty object properties (still usable) to keep the implementation small.
+func manualStructSchema[A any](allowAdditional bool) (mcp.ToolInputSchema, bool) {
+	var zero A
+	t := reflect.TypeOf(zero)
+	// If generic type is pointer, dereference.
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return mcp.ToolInputSchema{}, false
+	}
+
+	props := make(map[string]mcp.SchemaProperty)
+	required := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		jsonTag := f.Tag.Get("json")
+		if jsonTag == "-" {
+			continue
+		}
+		name := f.Name
+		if jsonTag != "" {
+			parts := strings.Split(jsonTag, ",")
+			if parts[0] != "" {
+				name = parts[0]
+			}
+		}
+		// skip if name becomes "-" after tag parse
+		if name == "-" {
+			continue
+		}
+		prop := mcp.SchemaProperty{Type: goKindToJSONType(f.Type)}
+		// Parse minimal jsonschema tag attributes (description only for now)
+		if tag := f.Tag.Get("jsonschema"); tag != "" {
+			for _, seg := range strings.Split(tag, ",") {
+				kv := strings.SplitN(seg, "=", 2)
+				if len(kv) == 2 && strings.TrimSpace(kv[0]) == "description" {
+					prop.Description = kv[1]
+				}
+			}
+		}
+		props[name] = prop
+		// Treat all fields as required by default; this matches invopop when no omitempty
+		if !strings.Contains(jsonTag, "omitempty") {
+			required = append(required, name)
+		}
+	}
+	return mcp.ToolInputSchema{Type: "object", Properties: props, Required: required, AdditionalProperties: allowAdditional}, true
+}
+
+func goKindToJSONType(t reflect.Type) string {
+	// Dereference pointer
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return "string"
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "integer"
+	case reflect.Float32, reflect.Float64:
+		return "number"
+	case reflect.Slice, reflect.Array:
+		return "array"
+	case reflect.Struct:
+		return "object"
+	default:
+		return "string" // conservative fallback
+	}
+}
+
+// isTriviallyEmpty returns true when the generic type parameter A provides no
+// fields for a schema: interface{} / any, struct{}, *struct{} with zero fields.
+func isTriviallyEmpty[A any]() bool {
+	var zero A
+	t := reflect.TypeOf(zero)
+	if t == nil { // untyped nil interface{}
+		return true
+	}
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() == reflect.Struct && t.NumField() == 0 {
+		return true
+	}
+	return false
 }
 
 // toMCPProperty recursively maps a jsonschema.Schema to the simplified MCP SchemaProperty.
