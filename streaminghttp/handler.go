@@ -11,11 +11,13 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+	"github.com/ggoodman/mcp-server-go/internal/logctx"
 	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
 	"github.com/ggoodman/mcp-server-go/internal/wellknown"
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -391,43 +393,56 @@ func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // resources and any process-local ephemeral resources associated with the
 // session are cleaned up.
 func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("handleDeleteMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
-
-	ctx := r.Context()
+	start := time.Now()
+	baseCtx := r.Context()
+	reqID := logctx.NewRequestID()
+	ctx := logctx.WithRequestID(baseCtx, reqID)
+	r = r.WithContext(ctx)
+	logger := logctx.Enrich(ctx, h.log).With(
+		slog.String("transport", "streaminghttp"),
+		slog.String("op", "delete_session"),
+		slog.String("http_method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+	logger.InfoContext(ctx, "http.delete.start")
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
+		logger.InfoContext(ctx, "auth.fail")
 		return
 	}
+	ctx = logctx.WithUserID(ctx, userInfo.UserID())
+	logger = logctx.Enrich(ctx, logger)
+	logger.InfoContext(ctx, "auth.ok")
 
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
+		logger.WarnContext(ctx, "delete.missing_session_id")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	ctx = logctx.WithSessionID(ctx, sessID)
+	logger = logctx.Enrich(ctx, logger)
 
-	// Verify the session belongs to the authenticated user before deletion and
-	// capture its protocol version for response headers.
+	// Verify ownership & existence
 	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID(), "")
 	if err != nil {
-		// Regardless of validity, ensure any local ephemerals are torn down.
+		logger.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessID)
-		// Do not reveal existence; return 404 for invalid or non-owned sessions.
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	logger.InfoContext(ctx, "session.load.ok")
 	respProtoVersion := session.ProtocolVersion()
 
-	// Protocol version handling: if a session-bound protocol version exists, enforce
-	// that any provided header matches it. If the header is missing, allow the request
-	// (especially important when the session token doesn't encode a version, e.g., non-JWS).
 	if pv := r.Header.Get(mcpProtocolVersionHeader); respProtoVersion != "" && pv != "" && pv != respProtoVersion {
+		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", respProtoVersion), slog.String("client_version", pv))
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
 
-	// Revoke and cleanup persistent resources via the session manager.
 	if err := h.sessions.DeleteSession(ctx, sessID); err != nil {
+		logger.ErrorContext(ctx, "session.delete.fail", slog.String("err", err.Error()))
 		// Best-effort local teardown even on error.
 		h.teardownSession(sessID)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -444,120 +459,128 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 
 	// Success: no content.
 	w.WriteHeader(http.StatusNoContent)
+	logger.InfoContext(ctx, "http.delete.ok", slog.Duration("dur", time.Since(start)))
 }
 
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
-	// h.log.Debug("handlePostMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
-	// NOTE: We defer Accept negotiation (for text/event-stream) until we know
-	// we will actually produce an SSE response (i.e. a request with an ID).
-	// Earlier code enforced Accept universally which penalized simple
-	// notifications / initialize handshakes returning JSON.
+	start := time.Now()
+	baseCtx := r.Context()
+	reqID := logctx.NewRequestID()
+	ctx := logctx.WithRequestID(baseCtx, reqID)
+	r = r.WithContext(ctx)
+	logger := logctx.Enrich(ctx, h.log).With(
+		slog.String("transport", "streaminghttp"),
+		slog.String("op", "post_mcp"),
+		slog.String("http_method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+	logger.InfoContext(ctx, "http.post.start")
+
 	ctype, err := contenttype.GetMediaType(r)
 	if err != nil || !ctype.Matches(jsonMediaType) {
 		writeJSONError(w, http.StatusUnsupportedMediaType, "content-type must be application/json")
+		logger.WarnContext(ctx, "content_type.unsupported")
 		return
 	}
 
 	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
+		logger.ErrorContext(ctx, "flusher.missing")
 		return
 	}
 
-	ctx := r.Context()
+	ctx = r.Context()
 	wf := &lockedWriteFlusher{Writer: w, Flusher: f, ctx: ctx}
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
+		logger.InfoContext(ctx, "auth.fail")
 		return
 	}
+	ctx = logctx.WithUserID(ctx, userInfo.UserID())
+	logger = logctx.Enrich(ctx, logger)
+	logger.InfoContext(ctx, "auth.ok")
 
-	// Prevent JSON-RPC batch usage (spec forbids batching on streaming HTTP transport)
 	var raw json.RawMessage
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&raw); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		logger.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
 		return
 	}
-	if len(raw) > 0 && raw[0] == '[' { // rudimentary array detection
+	if len(raw) > 0 && raw[0] == '[' {
 		writeJSONError(w, http.StatusBadRequest, "JSON-RPC batch arrays are forbidden on streaming HTTP transport")
+		logger.WarnContext(ctx, "jsonrpc.batch.forbidden")
 		return
 	}
 
 	var msg jsonrpc.AnyMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON-RPC message: "+err.Error())
+		logger.WarnContext(ctx, "jsonrpc.message.invalid", slog.String("err", err.Error()))
 		return
 	}
 
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
-		// New session expected; must be initialize request.
 		if err := h.handleSessionInitialization(ctx, w, userInfo, msg); err != nil {
+			logger.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
 			return
 		}
+		logger.InfoContext(ctx, "session.initialize.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
+	ctx = logctx.WithSessionID(ctx, sessID)
+	logger = logctx.Enrich(ctx, logger)
 
 	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID(), "")
 	if err != nil {
-		// Session not found or mismatched user: treat as 404 per spec expectation
 		w.WriteHeader(http.StatusNotFound)
+		logger.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessID)
 		return
 	}
+	logger.InfoContext(ctx, "session.load.ok")
 
-	// Protocol version header enforcement for non-initialize requests.
-	// Future negotiation placeholder: when multi-version support lands, we'll parse the header, compare against supported set,
-	// and potentially perform downgrade/upgrade handshakes here.
 	if req := msg.AsRequest(); req != nil && req.Method == "initialize" {
-		// Second initialize against existing session disallowed.
 		writeJSONError(w, http.StatusConflict, "session already initialized")
+		logger.WarnContext(ctx, "session.initialize.redundant")
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
 	sessionPV := session.ProtocolVersion()
 	if clientPV != "" && sessionPV != "" && clientPV != sessionPV {
-		if h.log != nil {
-			h.log.Debug("protocol version mismatch", slog.String("session_id", sessID), slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
-		}
 		writeJSONError(w, http.StatusBadRequest, "protocol version mismatch")
+		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
 		return
 	}
-	// If clientPV empty, we fall back to the session-bound version (spec allows
-	// server to infer). No 400 in this case.
 
-	// We have a valid session now. Let's see what kind of message it is.
 	if req := msg.AsRequest(); req != nil {
 		if req.ID.IsNil() {
 			if err := h.handleNotification(ctx, session, userInfo, req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
+				logger.ErrorContext(ctx, "notification.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
 				return
 			}
-
-			// The notification was handled successfully.
 			if spv := session.ProtocolVersion(); spv != "" {
 				w.Header().Set(mcpProtocolVersionHeader, spv)
 			}
 			w.WriteHeader(http.StatusAccepted)
+			logger.InfoContext(ctx, "notification.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
 			return
 		}
 
-		// For request-with-ID we will stream a response (SSE). Now negotiate Accept.
 		acc := r.Header.Get("Accept")
-		if acc != "" { // only enforce if explicitly provided
+		if acc != "" {
 			if _, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes); err != nil {
-				if h.log != nil {
-					h.log.Debug("reject request: unacceptable explicit Accept for SSE", slog.String("session_id", sessID), slog.String("accept", acc))
-				}
 				w.WriteHeader(http.StatusUnsupportedMediaType)
+				logger.WarnContext(ctx, "accept.unsupported", slog.String("accept", acc))
 				return
 			}
 		}
-		// (If Accept missing, treat as implicit */* and allow.)
-		// Set the content type for the SSE response and advertise protocol version
 		if spv := session.ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
@@ -568,7 +591,6 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 
-		// Track inflight cancellable request by session+requestID
 		rid := req.ID.String()
 		sid := session.SessionID()
 		h.inflightMu.Lock()
@@ -578,23 +600,12 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		h.inflight[sid][rid] = cancel
 		h.inflightMu.Unlock()
 
-		// Inject a ProgressReporter bound to this request ID that writes notifications/progress
-		// back to the client via the session writer.
 		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: wf, requestID: rid})
 
-		// Install a direct writer on the concrete session handle (if applicable)
-		// so that outbound server->client requests emitted during this POST
-		// handling path (e.g. via client capability wrappers) are streamed
-		// directly on this SSE response. We intentionally stream-first and
-		// only fall back to durability on write failure to preserve original
-		// semantics of the removed sessionWithWriter wrapper.
-		sess := session
 		{
-			sh := session // already *sessioncore.SessionHandle
+			sh := session
 			restore := sh.SetDirectWriter(func(dwCtx context.Context, b []byte) error {
-				// Attempt direct SSE write; empty SSE id (not replayable) matches prior behavior.
 				if err := writeSSEEvent(wf, "", b); err != nil {
-					// Fallback to durable publish on error.
 					_, pubErr := h.sessionHost.PublishSession(dwCtx, sessID, b)
 					if pubErr != nil {
 						return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
@@ -605,9 +616,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			defer restore()
 		}
 
-		// This is a request with an ID, so we need to handle it as a request.
-		res, err := h.handleRequest(ctx, sess, userInfo, req)
-		// Remove inflight entry
+		res, err := h.handleRequest(ctx, session, userInfo, req)
 		h.inflightMu.Lock()
 		if m, ok := h.inflight[sid]; ok {
 			delete(m, rid)
@@ -617,116 +626,115 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		}
 		h.inflightMu.Unlock()
 		if err != nil {
-			res = &jsonrpc.Response{
-				JSONRPCVersion: jsonrpc.ProtocolVersion,
-				Error: &jsonrpc.Error{
-					Code:    jsonrpc.ErrorCodeInternalError,
-					Message: "internal server error",
-				},
-				ID: req.ID,
-			}
+			logger.ErrorContext(ctx, "rpc.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
+			res = &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, Error: &jsonrpc.Error{Code: jsonrpc.ErrorCodeInternalError, Message: "internal server error"}, ID: req.ID}
 		}
-
-		// TODO: The silliness of needing to write to the _SAME_ sse stream means that we
-		// we can't write to the session handle's broker. So here we're stuck with an empty
-		// message ID that can't be replayed or recovered :(.
 		b, mErr := json.Marshal(res)
 		if mErr != nil {
+			logger.ErrorContext(ctx, "rpc.response.marshal.fail", slog.String("err", mErr.Error()))
 			return
 		}
 		if err := writeSSEEvent(wf, "", b); err != nil {
-			// At this point headers are already written, so we can't change the status code
-			// TODO: Log the error
+			logger.ErrorContext(ctx, "sse.write.fail", slog.String("err", err.Error()))
 			return
 		}
-
+		logger.InfoContext(ctx, "rpc.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
 		return
 	}
 
 	if res := msg.AsResponse(); res != nil {
-		// Dispatch response to outbound rendezvous (stateful sessions manager) BEFORE local handling.
 		if h.sessions != nil {
 			_ = h.sessions.DeliverResponse(ctx, session.SessionID(), res)
 		}
-
 		if err := h.handleResponse(ctx, session, res); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
+			logger.ErrorContext(ctx, "response.handle.fail", slog.String("err", err.Error()))
 			return
 		}
 		if spv := session.ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.WriteHeader(http.StatusAccepted)
+		logger.InfoContext(ctx, "response.inbound.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
+	logger.WarnContext(ctx, "jsonrpc.message.unrecognized", slog.Duration("dur", time.Since(start)))
 }
 
 // handleGetMCP handles the GET /mcp endpoint, which is used to consume messages
 // from an established session.
 func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("handleGetMCP", slog.String("method", r.Method), slog.String("url", r.URL.String()))
+	start := time.Now()
+	baseCtx := r.Context()
+	reqID := logctx.NewRequestID()
+	ctx := logctx.WithRequestID(baseCtx, reqID)
+	r = r.WithContext(ctx)
+	logger := logctx.Enrich(ctx, h.log).With(
+		slog.String("transport", "streaminghttp"),
+		slog.String("op", "get_stream"),
+		slog.String("http_method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
+
 	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
 	if err != nil {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
+		logger.WarnContext(ctx, "http.get.unsupported_media_type")
 		return
 	}
 
 	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
+		logger.ErrorContext(ctx, "sse.flusher.missing")
 		return
 	}
 
-	// Tie SSE stream to the request context; client disconnect cancels ctx.
-	ctx := r.Context()
-	// Ensure SSE writes are serialized and skip writing after cancellation.
+	ctx = r.Context()
 	wf := &lockedWriteFlusher{Writer: w, Flusher: f, ctx: ctx}
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
+		logger.InfoContext(ctx, "auth.fail")
 		return
 	}
+	ctx = logctx.WithUserID(ctx, userInfo.UserID())
+	logger = logctx.Enrich(ctx, logger)
+	logger.InfoContext(ctx, "auth.ok")
 
 	sessionHeader := r.Header.Get(mcpSessionIDHeader)
 	if sessionHeader == "" {
 		w.WriteHeader(http.StatusBadRequest)
+		logger.WarnContext(ctx, "session.id.missing")
 		return
 	}
+	ctx = logctx.WithSessionID(ctx, sessionHeader)
+	logger = logctx.Enrich(ctx, logger)
 
 	session, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID(), "")
 	if err != nil {
-		// Treat any load failure as not found; best-effort cleanup of local resources.
 		w.WriteHeader(http.StatusNotFound)
+		logger.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessionHeader)
 		return
 	}
+	logger.InfoContext(ctx, "session.load.ok")
 
 	sessionID := session.SessionID()
 
-	// Protocol version handling for stream consumption: if header provided and
-	// session has a bound version, require match; otherwise allow.
 	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
 		if spv := session.ProtocolVersion(); spv != "" && pv != spv {
 			w.WriteHeader(http.StatusPreconditionFailed)
+			logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", spv), slog.String("client_version", pv))
 			return
 		}
 	}
 
 	lastEventID := r.Header.Get(lastEventIDHeader)
 
-	// Option B wiring for resources list_changed notifications:
-	// 1) Subscribe to internal fan-out topic and forward as JSON-RPC to the client.
-	// 2) Register a local publisher that publishes to the internal topic when the
-	//    process-local resources notifier ticks; registration is tied to this GET lifetime.
 	const resourcesListChangedTopic = string(mcp.ResourcesListChangedNotificationMethod)
-
-	// Subscribe before we register the publisher to avoid a race dropping first events.
 	unsub, subErr := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesListChangedTopic, func(evtCtx context.Context, payload []byte) error {
-		// payload is unused for list_changed; deliver JSON-RPC notification into the session.
-		n := &jsonrpc.Request{
-			JSONRPCVersion: jsonrpc.ProtocolVersion,
-			Method:         string(mcp.ResourcesListChangedNotificationMethod),
-		}
+		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
 		b, err := json.Marshal(n)
 		if err != nil {
 			return err
@@ -736,19 +744,14 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	})
 	if subErr != nil {
 		w.WriteHeader(http.StatusInternalServerError)
+		logger.ErrorContext(ctx, "subscribe.resources_list_changed.fail", slog.String("err", subErr.Error()))
 		return
 	}
 	defer unsub()
 
-	// Bridge resources/updated notifications via the internal bus as well.
 	const resourcesUpdatedTopic = string(mcp.ResourcesUpdatedNotificationMethod)
 	unsubUpdated, subUpdatedErr := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesUpdatedTopic, func(evtCtx context.Context, payload []byte) error {
-		// payload is JSON: {"uri": string}
-		n := &jsonrpc.Request{
-			JSONRPCVersion: jsonrpc.ProtocolVersion,
-			Method:         string(mcp.ResourcesUpdatedNotificationMethod),
-			Params:         payload,
-		}
+		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod), Params: payload}
 		b, err := json.Marshal(n)
 		if err != nil {
 			return err
@@ -758,18 +761,14 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	})
 	if subUpdatedErr != nil {
 		w.WriteHeader(http.StatusInternalServerError)
+		logger.ErrorContext(ctx, "subscribe.resources_updated.fail", slog.String("err", subUpdatedErr.Error()))
 		return
 	}
 	defer unsubUpdated()
 
-	// Also subscribe for tools list_changed to forward to the client
 	const toolsListChangedTopic = string(mcp.ToolsListChangedNotificationMethod)
 	unsubTools, subToolsErr := h.sessionHost.SubscribeEvents(ctx, sessionID, toolsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
-		n := &jsonrpc.Request{
-			JSONRPCVersion: jsonrpc.ProtocolVersion,
-			Method:         string(mcp.ToolsListChangedNotificationMethod),
-			Params:         nil,
-		}
+		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListChangedNotificationMethod)}
 		b, err := json.Marshal(n)
 		if err != nil {
 			return err
@@ -779,18 +778,14 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	})
 	if subToolsErr != nil {
 		w.WriteHeader(http.StatusInternalServerError)
+		logger.ErrorContext(ctx, "subscribe.tools_list_changed.fail", slog.String("err", subToolsErr.Error()))
 		return
 	}
 	defer unsubTools()
 
-	// Also subscribe for prompts list_changed to forward to the client
 	const promptsListChangedTopic = string(mcp.PromptsListChangedNotificationMethod)
 	unsubPrompts, subPromptsErr := h.sessionHost.SubscribeEvents(ctx, sessionID, promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
-		n := &jsonrpc.Request{
-			JSONRPCVersion: jsonrpc.ProtocolVersion,
-			Method:         string(mcp.PromptsListChangedNotificationMethod),
-			Params:         nil,
-		}
+		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListChangedNotificationMethod)}
 		b, err := json.Marshal(n)
 		if err != nil {
 			return err
@@ -800,27 +795,20 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	})
 	if subPromptsErr != nil {
 		w.WriteHeader(http.StatusInternalServerError)
+		logger.ErrorContext(ctx, "subscribe.prompts_list_changed.fail", slog.String("err", subPromptsErr.Error()))
 		return
 	}
 	defer unsubPrompts()
 
-	// Signal to server-internal listeners (e.g., tests) that the SSE stream
-	// has finished wiring its internal subscriptions and is ready to receive
-	// server-internal events. This event is not forwarded to clients.
 	_ = h.sessionHost.PublishEvent(ctx, sessionID, "streaminghttp/ready", nil)
 
-	// Discover resources capability and (optionally) listChanged capability
 	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, session); err == nil && ok {
 		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
-			// Register a local publisher tied to this GET context lifetime
 			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session, _ string) {
-				// best-effort publish to internal topic; no payload required
 				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, resourcesListChangedTopic, nil)
 			})
 		}
 	}
-
-	// Bridge tools/list_changed notifications via the internal bus as well.
 	if toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session); err == nil && ok {
 		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
 			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session) {
@@ -828,8 +816,6 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 			})
 		}
 	}
-
-	// Bridge prompts/list_changed notifications via the internal bus as well.
 	if promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session); err == nil && ok {
 		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
 			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session) {
@@ -838,9 +824,6 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// At this point we have a valid session and subscriptions are established.
-	// Proactively set SSE headers and advertise protocol version so the client observes the stream
-	// immediately, even if the first event arrives later.
 	if spv := session.ProtocolVersion(); spv != "" {
 		w.Header().Set(mcpProtocolVersionHeader, spv)
 	}
@@ -848,29 +831,26 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	wf.Flush()
+	logger.InfoContext(ctx, "sse.stream.start")
 
-	// TODO(feat/stateful-sessions): Rewire outbound dispatcher for stateful sessions (legacy ensureDispatcher removed).
-
-	// Requests to the GET /mcp endpoint MUST be in the context of an already
-	// established session. Session establishment can only happen in POST /mcp.
-	// As a result, we can respond with an error in the case of a missing session.
-	if err := h.sessionHost.SubscribeSession(ctx, sessionID, lastEventID, func(ctx context.Context, msgID string, bytes []byte) error {
+	if err := h.sessionHost.SubscribeSession(ctx, sessionID, lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
 		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
+			logger.ErrorContext(cbCtx, "sse.write.fail", slog.String("err", err.Error()))
 			return fmt.Errorf("failed to write session message to http response: %w", err)
 		}
+		logger.InfoContext(cbCtx, "sse.message.deliver")
 		return nil
 	}); err != nil {
-		// Headers have already been sent; simply return.
+		logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
 		return
 	}
 
-	// Stream ended (client closed, context canceled, or no further messages).
+	logger.InfoContext(ctx, "sse.stream.end", slog.Duration("dur", time.Since(start)))
 }
 
 // handleGetProtectedResourceMetadata serves the OAuth2 Protected Resource Metadata
 // document crafted when the StreamingHTTPHandler initialized.
 func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("handleGetProtectedResourceMetadata", slog.String("method", r.Method), slog.String("url", r.URL.String()))
 	// CORS: allow cross-origin browser fetches of the well-known metadata
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Vary", "Origin")
@@ -897,7 +877,6 @@ func (h *StreamingHTTPHandler) handleOptionsProtectedResourceMetadata(w http.Res
 // convenience to clients and tooling for discovery purposes. It does not
 // imply this process acts as an authorization server.
 func (h *StreamingHTTPHandler) handleGetAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
-	slog.Debug("handleGetAuthorizationServerMetadata", slog.String("method", r.Method), slog.String("url", r.URL.String()))
 	// CORS: allow cross-origin browser fetches of the well-known metadata
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Vary", "Origin")
@@ -924,7 +903,12 @@ func (h *StreamingHTTPHandler) handleOptionsAuthorizationServerMetadata(w http.R
 }
 
 func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
-	h.log.Debug("handleNotification", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
+	logger := logctx.Enrich(ctx, h.log).With(
+		slog.String("transport", "streaminghttp"),
+		slog.String("op", "notification"),
+		slog.String("method", req.Method),
+	)
+	logger.InfoContext(ctx, "notification.start")
 	// Intercept notifications/cancelled to cancel in-flight server-handled requests for this session.
 	if req.Method == string(mcp.CancelledNotificationMethod) && len(req.Params) > 0 {
 		var p struct {
@@ -948,8 +932,10 @@ func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session s
 	// Publish server-internal event for fan-out to interested listeners.
 	// Topic is the JSON-RPC method; payload is the raw params.
 	if err := h.sessionHost.PublishEvent(ctx, session.SessionID(), req.Method, req.Params); err != nil {
+		logger.WarnContext(ctx, "notification.publish.fail", slog.String("err", err.Error()))
 		return fmt.Errorf("publish internal event: %w", err)
 	}
+	logger.InfoContext(ctx, "notification.ok")
 	return nil
 }
 
@@ -1125,7 +1111,6 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 // (legacy logging and completions capability handlers removed during cleanup)
 
 func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
-	h.log.Debug("handleRequest", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
 
 	internalErr := func(id *jsonrpc.RequestID) *jsonrpc.Response {
 		return jsonrpc.NewErrorResponse(id, jsonrpc.ErrorCodeInternalError, "internal error", nil)
@@ -1567,7 +1552,6 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 }
 
 func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, res *jsonrpc.Response) error {
-	h.log.Debug("handleResponse", slog.String("session", session.SessionID()))
 	if res == nil || res.ID == nil || res.ID.IsNil() {
 		return fmt.Errorf("response missing id")
 	}

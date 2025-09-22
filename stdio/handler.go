@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ggoodman/mcp-server-go/internal/logctx"
+
 	internalelicitation "github.com/ggoodman/mcp-server-go/internal/elicitation"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -77,6 +79,13 @@ func NewHandler(srv mcpservice.ServerCapabilities, opts ...Option) *Handler {
 // specs; this function focuses on API shape. Implementation will be added in a
 // follow-up.
 func (h *Handler) Serve(ctx context.Context) error {
+	start := time.Now()
+	ctx = logctx.WithRequestID(ctx, logctx.NewRequestID())
+	logger := logctx.Enrich(ctx, h.l).With(
+		slog.String("transport", "stdio"),
+		slog.String("op", "serve"),
+	)
+	logger.InfoContext(ctx, "stdio.serve.start")
 	// Ensure forwarders are cleaned up on exit
 	defer h.cancelAllSubscriptions()
 	// IO setup
@@ -91,9 +100,13 @@ func (h *Handler) Serve(ctx context.Context) error {
 	// Identify user via provider
 	uid, err := h.userProvider.CurrentUserID()
 	if err != nil {
+		logger.ErrorContext(ctx, "auth.user.resolve.fail", slog.String("err", err.Error()))
 		disp.Close(err)
 		return err
 	}
+	ctx = logctx.WithUserID(ctx, uid)
+	logger = logctx.Enrich(ctx, logger)
+	logger.InfoContext(ctx, "auth.user.resolve.ok")
 
 	// Session state
 	var sess *stdioSession // established after initialize
@@ -113,7 +126,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 		line, rerr := reader.ReadBytes('\n')
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
-				// Graceful shutdown on EOF. Serialize Flush with writeMux to avoid races.
+				logger.InfoContext(ctx, "stdio.eof", slog.Duration("dur", time.Since(start)))
 				_ = wm.flush()
 				disp.Close(io.EOF)
 				return nil
@@ -133,8 +146,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 
 		var any jsonrpc.AnyMessage
 		if err := json.Unmarshal(line, &any); err != nil {
-			// Malformed JSON; per JSON-RPC, we can't reliably respond. Log and continue.
-			h.l.Debug("invalid JSON-RPC", slog.String("err", err.Error()))
+			logger.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
 			continue
 		}
 
@@ -142,8 +154,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 			// Expect initialize request
 			req := any.AsRequest()
 			if req == nil || req.Method != string(mcp.InitializeMethod) {
-				// Protocol violation: expect initialize. Ignore until we get one.
-				h.l.Debug("expected initialize first; ignoring message", slog.String("type", any.Type()), slog.String("method", any.Method))
+				logger.WarnContext(ctx, "protocol.initialize.expected", slog.String("type", any.Type()), slog.String("method", any.Method))
 				continue
 			}
 
@@ -272,6 +283,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 			}
 
 			initialized = true
+			logger.InfoContext(ctx, "session.initialize.ok", slog.String("protocol_version", negotiated))
 			continue
 		}
 
@@ -341,8 +353,14 @@ func (h *Handler) Serve(ctx context.Context) error {
 			if req == nil || req.ID == nil {
 				continue
 			}
+			reqStart := time.Now()
+			reqCtx := logctx.WithRequestID(ctx, req.ID.String())
+			reqLogger := logctx.Enrich(reqCtx, logger).With(
+				slog.String("rpc_method", req.Method),
+			)
+			reqLogger.InfoContext(reqCtx, "rpc.inbound.start")
 			// Create a per-request context that we can cancel if the client sends notifications/cancelled
-			reqCtx, cancel := context.WithCancel(ctx)
+			reqCtx, cancel := context.WithCancel(reqCtx)
 			// Track cancel by request ID string
 			rid := req.ID.String()
 			h.inFlightMu.Lock()
@@ -363,6 +381,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 			h.inFlightMu.Unlock()
 			cancel()
 			if err != nil {
+				reqLogger.ErrorContext(reqCtx, "rpc.inbound.fail", slog.String("err", err.Error()), slog.Duration("dur", time.Since(reqStart)))
 				// Map internal error
 				r := jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
 				if werr := wm.writeJSONRPC(r); werr != nil {
@@ -374,6 +393,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 				if werr := wm.writeJSONRPC(resp); werr != nil {
 					return werr
 				}
+				reqLogger.InfoContext(reqCtx, "rpc.inbound.ok", slog.Duration("dur", time.Since(reqStart)))
 			}
 		}
 	}

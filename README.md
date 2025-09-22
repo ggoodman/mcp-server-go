@@ -349,3 +349,38 @@ The earlier explicit request-building helper layer was removed in favor of the
 single reflective API above. If you need to hand-author a schema, you can still
 construct an `mcp.ElicitationSchema` directly and (in a future add-on) we may
 expose a low-level call, but the reflective path is the primary ergonomics story.
+
+## Structured logging (concise)
+
+We use Go's standard `log/slog` with stable, dot-delimited event names. Correlation fields:
+
+| Field       | When present                                   |
+|-------------|-------------------------------------------------|
+| `request_id`| Per inbound HTTP POST / GET stream / stdio req  |
+| `session_id`| After session create / load                     |
+| `user_id`   | After authentication succeeds                   |
+
+Event naming: `<domain>.<action>.<state>` where `state ∈ {start, ok, fail, miss, denied, cancel, end}`.
+
+| Transport | Event(s) | Meaning / Notes | Level |
+|-----------|----------|-----------------|-------|
+| HTTP | `http.post.start` | POST /mcp entry | info |
+| HTTP | `session.create.ok` | New session created | info |
+| HTTP | `session.load.ok` / `session.load.miss` | Load success / not found or unauthorized | info |
+| HTTP | `protocol.version.mismatch` | Client vs session protocol mismatch | warn |
+| HTTP | `rpc.inbound.start` / `rpc.inbound.ok` / `rpc.inbound.fail` | JSON-RPC (request with ID) lifecycle | info / error |
+| HTTP | `notification.inbound.ok` / `notification.inbound.fail` | Notification handling result | info / warn |
+| HTTP | `sse.stream.start` / `sse.stream.end` | GET /mcp SSE lifecycle | info |
+| HTTP | `sse.message.deliver` | Outbound JSON-RPC message delivered on SSE | info |
+| HTTP | `session.delete.ok` / `session.delete.fail` | DELETE /mcp lifecycle | info / error |
+| HTTP | `auth.ok` / `auth.fail` | Authentication result (`fail` is expected denial) | info |
+| stdio | `stdio.serve.start` | stdio loop start | info |
+| stdio | `session.initialize.ok` | initialize handshake succeeded | info |
+| stdio | `protocol.initialize.expected` | Non-initialize message before handshake | warn |
+| stdio | `json.decode.fail` | Malformed inbound line | warn |
+| stdio | `rpc.inbound.start` / `rpc.inbound.ok` / `rpc.inbound.fail` | Request lifecycle | info / error |
+| stdio | `stdio.eof` | Graceful EOF shutdown | info |
+
+Level guidelines: Info = normal lifecycle & auth denials; Warn = client/protocol misuse or malformed input; Error = internal failures / invariants.
+
+Provide a custom logger with `streaminghttp.WithLogger(*slog.Logger)` (or analogous options elsewhere); only `Info/Warn/Error` are invoked.
