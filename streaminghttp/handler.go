@@ -495,7 +495,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
 		// New session expected; must be initialize request.
-		if err := h.handleSessionInitialization(ctx, wf, w, userInfo, msg); err != nil {
+		if err := h.handleSessionInitialization(ctx, w, userInfo, msg); err != nil {
 			return
 		}
 		return
@@ -563,19 +563,10 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
 		w.WriteHeader(http.StatusOK)
+		wf.Flush()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-
-		// We want to wrap the session with a little wrapper type so that we can
-		// try to write that session's messages back to the client as part of
-		// handling this request. The wrapper will fall back to writing to
-		// the session backend if writing to the client fails.
-		fallback := func(ctx context.Context, b []byte) error {
-			_, err := h.sessionHost.PublishSession(ctx, sessID, b)
-			return err
-		}
-		sess := newSessionWithWriter(ctx, session, wf, fallback)
 
 		// Track inflight cancellable request by session+requestID
 		rid := req.ID.String()
@@ -589,8 +580,29 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 		// Inject a ProgressReporter bound to this request ID that writes notifications/progress
 		// back to the client via the session writer.
-		if mw, ok := any(sess).(messageWriter); ok {
-			ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: mw, requestID: rid})
+		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: wf, requestID: rid})
+
+		// Install a direct writer on the concrete session handle (if applicable)
+		// so that outbound server->client requests emitted during this POST
+		// handling path (e.g. via client capability wrappers) are streamed
+		// directly on this SSE response. We intentionally stream-first and
+		// only fall back to durability on write failure to preserve original
+		// semantics of the removed sessionWithWriter wrapper.
+		sess := session
+		{
+			sh := session // already *sessioncore.SessionHandle
+			restore := sh.SetDirectWriter(func(dwCtx context.Context, b []byte) error {
+				// Attempt direct SSE write; empty SSE id (not replayable) matches prior behavior.
+				if err := writeSSEEvent(wf, "", b); err != nil {
+					// Fallback to durable publish on error.
+					_, pubErr := h.sessionHost.PublishSession(dwCtx, sessID, b)
+					if pubErr != nil {
+						return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
+					}
+				}
+				return nil
+			})
+			defer restore()
 		}
 
 		// This is a request with an ID, so we need to handle it as a request.
@@ -632,9 +644,12 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	}
 
 	if res := msg.AsResponse(); res != nil {
-		// TODO: Dispatch the response to the communication mesh.
+		// Dispatch response to outbound rendezvous (stateful sessions manager) BEFORE local handling.
+		if h.sessions != nil {
+			_ = h.sessions.DeliverResponse(ctx, session.SessionID(), res)
+		}
 
-		if err := h.handleResponse(ctx, session, userInfo, res); err != nil {
+		if err := h.handleResponse(ctx, session, res); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -940,7 +955,7 @@ func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session s
 
 // handleSessionInitialization handles the initialization of a new MCP session
 // when no mcp-session-id header is present in the request.
-func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, wf *lockedWriteFlusher, w http.ResponseWriter, userInfo auth.UserInfo, msg jsonrpc.AnyMessage) error {
+func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, w http.ResponseWriter, userInfo auth.UserInfo, msg jsonrpc.AnyMessage) error {
 	req := msg.AsRequest()
 	if req == nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1107,14 +1122,14 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 	return nil
 }
 
-// mapHooksErrorToJSONRPCError maps specific hooks errors to appropriate JSON-RPC error responses
-func mapHooksErrorToJSONRPCError(requestID *jsonrpc.RequestID, err error) *jsonrpc.Response {
-	// Future: inspect error types to map to specific JSON-RPC codes.
-	return jsonrpc.NewErrorResponse(requestID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
-}
+// (legacy logging and completions capability handlers removed during cleanup)
 
 func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	h.log.Debug("handleRequest", slog.String("method", req.Method), slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
+
+	internalErr := func(id *jsonrpc.RequestID) *jsonrpc.Response {
+		return jsonrpc.NewErrorResponse(id, jsonrpc.ErrorCodeInternalError, "internal error", nil)
+	}
 
 	switch req.Method {
 	case string(mcp.PingMethod):
@@ -1141,7 +1156,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return &s
 		}())
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListToolsResult{
@@ -1171,7 +1186,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		result, err := toolsCap.CallTool(ctx, session, &callToolReq)
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, result)
@@ -1197,7 +1212,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return &s
 		}())
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourcesResult{
@@ -1227,7 +1242,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		contents, err := resourcesCap.ReadResource(ctx, session, readResourceReq.URI)
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ReadResourceResult{
@@ -1255,7 +1270,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return &s
 		}())
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourceTemplatesResult{
@@ -1292,7 +1307,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 		}
 
 		if err := subCap.Subscribe(ctx, session, subscribeReq.URI); err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		// Maintain a per-session, per-URI forwarder that listens for local update ticks
@@ -1378,7 +1393,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 		}
 
 		if err := subCap.Unsubscribe(ctx, session, subscribeReq.URI); err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		// Tear down the forwarder if present
@@ -1420,7 +1435,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			return &s
 		}())
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
@@ -1450,7 +1465,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, result)
@@ -1476,7 +1491,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 			if errors.Is(err, mcpservice.ErrInvalidLoggingLevel) {
 				return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
 			}
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, struct{}{})
@@ -1496,7 +1511,7 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 
 		result, err := completionsCap.Complete(ctx, session, &completeReq)
 		if err != nil {
-			return mapHooksErrorToJSONRPCError(req.ID, err), nil
+			return internalErr(req.ID), nil
 		}
 
 		return jsonrpc.NewResultResponse(req.ID, result)
@@ -1551,8 +1566,8 @@ func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessio
 	}, nil
 }
 
-func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, res *jsonrpc.Response) error {
-	h.log.Debug("handleResponse", slog.String("user", userInfo.UserID()), slog.String("session", session.SessionID()))
+func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, res *jsonrpc.Response) error {
+	h.log.Debug("handleResponse", slog.String("session", session.SessionID()))
 	if res == nil || res.ID == nil || res.ID.IsNil() {
 		return fmt.Errorf("response missing id")
 	}
@@ -1630,56 +1645,7 @@ func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
 	return nil
 }
 
-var _ sessions.Session = (*sessionWithWriter)(nil)
-
-func newSessionWithWriter(ctx context.Context, session sessions.Session, wf *lockedWriteFlusher, fallback func(context.Context, []byte) error) sessions.Session {
-	return &sessionWithWriter{
-		Session:  session,
-		reqCtx:   ctx,
-		wf:       wf,
-		mu:       sync.Mutex{},
-		fallback: fallback,
-	}
-}
-
-type sessionWithWriter struct {
-	sessions.Session
-	reqCtx   context.Context
-	wf       *lockedWriteFlusher
-	mu       sync.Mutex // Guards concurrent writes to wf
-	fallback func(context.Context, []byte) error
-}
-
-func (s *sessionWithWriter) WriteMessage(ctx context.Context, bytes []byte) error {
-	// Check the request context has been cancelled. If it has, we should not
-	// attempt to write to the response writer as it may be closed.
-	// Instead, we fall back to the original session's WriteMessage method.
-	// This can happen if the client disconnects while we're trying to write
-	// a message to the response.
-	if s.reqCtx.Err() != nil {
-		// The underlying write flusher should no longer be used so fall back to the original writer
-		if s.fallback != nil {
-			return s.fallback(ctx, bytes)
-		}
-		return fmt.Errorf("no fallback available for session WriteMessage")
-	}
-
-	s.mu.Lock()
-	err := writeSSEEvent(s.wf, "", bytes)
-	s.mu.Unlock()
-
-	if err != nil {
-		// TODO: Log error?
-
-		// We failed to write the message to the HTTP response. We'll fall back to the provided writer.
-		if s.fallback != nil {
-			return s.fallback(ctx, bytes)
-		}
-		return err
-	}
-
-	return nil
-}
+// (sessionWithWriter wrapper removed; superseded by SessionHandle.SetDirectWriter)
 
 // ensureSessionParentContext returns a per-session parent context that preserves
 // the values of parent (using context.WithoutCancel) but is not canceled with it.
@@ -1737,14 +1703,9 @@ func (h *StreamingHTTPHandler) teardownSession(sessionID string) {
 	// (outbound dispatcher removal: no-op)
 }
 
-// messageWriter is satisfied by sessionWithWriter; it provides the low-level message send primitive.
-type messageWriter interface {
-	WriteMessage(context.Context, []byte) error
-}
-
 // streamingProgressReporter emits notifications/progress for a given request over the session stream.
 type streamingProgressReporter struct {
-	mw        messageWriter
+	mw        io.Writer
 	requestID string
 }
 
@@ -1763,5 +1724,6 @@ func (p streamingProgressReporter) Report(ctx context.Context, progress, total f
 	if err != nil {
 		return err
 	}
-	return p.mw.WriteMessage(ctx, msg)
+	_, err = p.mw.Write(msg)
+	return err
 }
