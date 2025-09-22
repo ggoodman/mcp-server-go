@@ -17,7 +17,7 @@ type server struct {
 
 	// protocol version and instructions
 	staticProtocolVersion string
-	protocolProvider      func(ctx context.Context, session sessions.Session) (string, bool, error)
+	protocolProvider      func(ctx context.Context) (string, bool, error)
 	staticInstructions    *string
 	instructionsProvider  func(ctx context.Context, session sessions.Session) (string, bool, error)
 
@@ -69,7 +69,7 @@ func WithPreferredProtocolVersion(version string) ServerOption {
 }
 
 // WithPreferredProtocolVersionProvider sets a per-session provider for preferred protocol version.
-func WithPreferredProtocolVersionProvider(fn func(ctx context.Context, session sessions.Session) (string, bool, error)) ServerOption {
+func WithPreferredProtocolVersionProvider(fn func(ctx context.Context) (string, bool, error)) ServerOption {
 	return func(s *server) { s.protocolProvider = fn }
 }
 
@@ -161,9 +161,9 @@ func (s *server) GetServerInfo(ctx context.Context, session sessions.Session) (m
 }
 
 // GetPreferredProtocolVersion implements ServerCapabilities.
-func (s *server) GetPreferredProtocolVersion(ctx context.Context, session sessions.Session) (string, bool, error) {
+func (s *server) GetPreferredProtocolVersion(ctx context.Context) (string, bool, error) {
 	if s.protocolProvider != nil {
-		return s.protocolProvider(ctx, session)
+		return s.protocolProvider(ctx)
 	}
 	if s.staticProtocolVersion != "" {
 		return s.staticProtocolVersion, true, nil

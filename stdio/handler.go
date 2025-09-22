@@ -158,9 +158,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 			}
 
 			negotiated := initReq.ProtocolVersion
-			// Allow server to prefer a version.
-			bs := &bootstrapSession{userID: uid}
-			if v, ok, err := h.srv.GetPreferredProtocolVersion(ctx, bs); err == nil && ok && v != "" {
+			if v, ok, err := h.srv.GetPreferredProtocolVersion(ctx); err == nil && ok && v != "" {
 				negotiated = v
 			}
 
@@ -831,20 +829,6 @@ func (e *stdioElicitCap) Elicit(ctx context.Context, text string, target any, op
 	default:
 		return "", fmt.Errorf("elicitation: unknown action %q", out.Action)
 	}
-}
-
-// bootstrapSession is used only for version preference probe during initialize.
-type bootstrapSession struct{ userID string }
-
-func (b *bootstrapSession) SessionID() string       { return "" }
-func (b *bootstrapSession) UserID() string          { return b.userID }
-func (b *bootstrapSession) ProtocolVersion() string { return "" }
-func (b *bootstrapSession) GetSamplingCapability() (sessions.SamplingCapability, bool) {
-	return nil, false
-}
-func (b *bootstrapSession) GetRootsCapability() (sessions.RootsCapability, bool) { return nil, false }
-func (b *bootstrapSession) GetElicitationCapability() (sessions.ElicitationCapability, bool) {
-	return nil, false
 }
 
 // writeMux serializes writes and ensures newline framing.

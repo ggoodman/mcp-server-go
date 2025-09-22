@@ -131,7 +131,7 @@ type StreamingHTTPHandler struct {
 
 	auth        auth.Authenticator
 	mcp         mcpservice.ServerCapabilities
-	stateful    *sessioncore.Manager // stateful manager only
+	sessions    *sessioncore.Manager // stateful manager only
 	sessionHost sessions.SessionHost
 
 	// Per-session subscription bridges for resources/updated notifications.
@@ -191,23 +191,6 @@ func (l *lockedWriteFlusher) Flush() {
 	l.Flusher.Flush()
 }
 
-// bootstrapSession is a minimal sessions.Session used during initialize before a real
-// session handle exists. It only carries the user ID; capabilities are absent.
-type bootstrapSession struct {
-	userID string
-}
-
-func (b *bootstrapSession) SessionID() string       { return "" }
-func (b *bootstrapSession) UserID() string          { return b.userID }
-func (b *bootstrapSession) ProtocolVersion() string { return "" }
-func (b *bootstrapSession) GetSamplingCapability() (sessions.SamplingCapability, bool) {
-	return nil, false
-}
-func (b *bootstrapSession) GetRootsCapability() (sessions.RootsCapability, bool) { return nil, false }
-func (b *bootstrapSession) GetElicitationCapability() (sessions.ElicitationCapability, bool) {
-	return nil, false
-}
-
 // New constructs a StreamingHTTPHandler using required formal parameters and optional settings.
 //
 // Required:
@@ -258,15 +241,15 @@ func New(
 	if cfg.logger != nil {
 		log = cfg.logger
 	}
-	// TODO: integrate real stateful manager constructor once legacy removal complete.
-	statefulMgr := sessioncore.NewStatefulManager(host, sessioncore.ManagerConfig{})
+
+	sessions := &sessioncore.Manager{Host: host}
 
 	h := &StreamingHTTPHandler{
 		log:         log,
 		serverURL:   mcpURL,
 		auth:        authenticator,
 		mcp:         server,
-		stateful:    statefulMgr,
+		sessions:    sessions,
 		sessionHost: host,
 		subCancels:  make(map[string]map[string]context.CancelFunc),
 		sessParents: make(map[string]context.Context),
@@ -425,7 +408,7 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 
 	// Verify the session belongs to the authenticated user before deletion and
 	// capture its protocol version for response headers.
-	sh, err := h.stateful.LoadSession(ctx, sessID, userInfo.UserID(), "")
+	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID(), "")
 	if err != nil {
 		// Regardless of validity, ensure any local ephemerals are torn down.
 		h.teardownSession(sessID)
@@ -433,8 +416,7 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	sessPublic := sh.ToSession()
-	respProtoVersion := sessPublic.ProtocolVersion()
+	respProtoVersion := session.ProtocolVersion()
 
 	// Protocol version handling: if a session-bound protocol version exists, enforce
 	// that any provided header matches it. If the header is missing, allow the request
@@ -445,7 +427,7 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 	}
 
 	// Revoke and cleanup persistent resources via the session manager.
-	if err := h.stateful.DeleteSession(ctx, sessID); err != nil {
+	if err := h.sessions.DeleteSession(ctx, sessID); err != nil {
 		// Best-effort local teardown even on error.
 		h.teardownSession(sessID)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -519,14 +501,13 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	sh, err := h.stateful.LoadSession(ctx, sessID, userInfo.UserID(), "")
+	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID(), "")
 	if err != nil {
 		// Session not found or mismatched user: treat as 404 per spec expectation
 		w.WriteHeader(http.StatusNotFound)
 		h.teardownSession(sessID)
 		return
 	}
-	pubSession := sh.ToSession()
 
 	// Protocol version header enforcement for non-initialize requests.
 	// Future negotiation placeholder: when multi-version support lands, we'll parse the header, compare against supported set,
@@ -537,7 +518,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
-	sessionPV := pubSession.ProtocolVersion()
+	sessionPV := session.ProtocolVersion()
 	if clientPV != "" && sessionPV != "" && clientPV != sessionPV {
 		if h.log != nil {
 			h.log.Debug("protocol version mismatch", slog.String("session_id", sessID), slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
@@ -551,13 +532,13 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	// We have a valid session now. Let's see what kind of message it is.
 	if req := msg.AsRequest(); req != nil {
 		if req.ID.IsNil() {
-			if err := h.handleNotification(ctx, pubSession, userInfo, req); err != nil {
+			if err := h.handleNotification(ctx, session, userInfo, req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 
 			// The notification was handled successfully.
-			if spv := pubSession.ProtocolVersion(); spv != "" {
+			if spv := session.ProtocolVersion(); spv != "" {
 				w.Header().Set(mcpProtocolVersionHeader, spv)
 			}
 			w.WriteHeader(http.StatusAccepted)
@@ -577,7 +558,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		}
 		// (If Accept missing, treat as implicit */* and allow.)
 		// Set the content type for the SSE response and advertise protocol version
-		if spv := sh.ToSession().ProtocolVersion(); spv != "" {
+		if spv := session.ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
@@ -591,14 +572,14 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		// handling this request. The wrapper will fall back to writing to
 		// the session backend if writing to the client fails.
 		fallback := func(ctx context.Context, b []byte) error {
-			_, err := h.sessionHost.PublishSession(ctx, sh.ID(), b)
+			_, err := h.sessionHost.PublishSession(ctx, sessID, b)
 			return err
 		}
-		sess := newSessionWithWriter(ctx, pubSession, wf, fallback)
+		sess := newSessionWithWriter(ctx, session, wf, fallback)
 
 		// Track inflight cancellable request by session+requestID
 		rid := req.ID.String()
-		sid := sh.ID()
+		sid := session.SessionID()
 		h.inflightMu.Lock()
 		if _, ok := h.inflight[sid]; !ok {
 			h.inflight[sid] = make(map[string]context.CancelFunc)
@@ -653,11 +634,11 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	if res := msg.AsResponse(); res != nil {
 		// TODO: Dispatch the response to the communication mesh.
 
-		if err := h.handleResponse(ctx, pubSession, userInfo, res); err != nil {
+		if err := h.handleResponse(ctx, session, userInfo, res); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if spv := sh.ToSession().ProtocolVersion(); spv != "" {
+		if spv := session.ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -697,7 +678,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	sh, err := h.stateful.LoadSession(ctx, sessionHeader, userInfo.UserID(), "")
+	session, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID(), "")
 	if err != nil {
 		// Treat any load failure as not found; best-effort cleanup of local resources.
 		w.WriteHeader(http.StatusNotFound)
@@ -705,13 +686,12 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	sessionID := sh.ID()
-	pubSession := sh.ToSession()
+	sessionID := session.SessionID()
 
 	// Protocol version handling for stream consumption: if header provided and
 	// session has a bound version, require match; otherwise allow.
 	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
-		if spv := pubSession.ProtocolVersion(); spv != "" && pv != spv {
+		if spv := session.ProtocolVersion(); spv != "" && pv != spv {
 			w.WriteHeader(http.StatusPreconditionFailed)
 			return
 		}
@@ -815,10 +795,10 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	_ = h.sessionHost.PublishEvent(ctx, sessionID, "streaminghttp/ready", nil)
 
 	// Discover resources capability and (optionally) listChanged capability
-	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, pubSession); err == nil && ok {
-		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, pubSession); lErr == nil && hasLC {
+	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, session); err == nil && ok {
+		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
 			// Register a local publisher tied to this GET context lifetime
-			_, _ = lc.Register(ctx, pubSession, func(cbCtx context.Context, sess sessions.Session, _ string) {
+			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session, _ string) {
 				// best-effort publish to internal topic; no payload required
 				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, resourcesListChangedTopic, nil)
 			})
@@ -826,18 +806,18 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Bridge tools/list_changed notifications via the internal bus as well.
-	if toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, pubSession); err == nil && ok {
-		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, pubSession); lErr == nil && hasLC {
-			_, _ = lc.Register(ctx, pubSession, func(cbCtx context.Context, sess sessions.Session) {
+	if toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session); err == nil && ok {
+		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
+			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session) {
 				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, toolsListChangedTopic, nil)
 			})
 		}
 	}
 
 	// Bridge prompts/list_changed notifications via the internal bus as well.
-	if promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, pubSession); err == nil && ok {
-		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, pubSession); lErr == nil && hasLC {
-			_, _ = lc.Register(ctx, pubSession, func(cbCtx context.Context, sess sessions.Session) {
+	if promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session); err == nil && ok {
+		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
+			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session) {
 				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, promptsListChangedTopic, nil)
 			})
 		}
@@ -846,7 +826,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	// At this point we have a valid session and subscriptions are established.
 	// Proactively set SSE headers and advertise protocol version so the client observes the stream
 	// immediately, even if the first event arrives later.
-	if spv := pubSession.ProtocolVersion(); spv != "" {
+	if spv := session.ProtocolVersion(); spv != "" {
 		w.Header().Set(mcpProtocolVersionHeader, spv)
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -981,7 +961,7 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 	// Resolve protocol version preference BEFORE minting the session id so the
 	// negotiated version can be baked into the token.
 	negotiatedVersion := initializeReq.ProtocolVersion
-	if v, ok, err := h.mcp.GetPreferredProtocolVersion(ctx, &bootstrapSession{userID: userInfo.UserID()}); err != nil {
+	if v, ok, err := h.mcp.GetPreferredProtocolVersion(ctx); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return fmt.Errorf("failed to get preferred protocol version: %w", err)
 	} else if ok && v != "" {
@@ -1003,12 +983,11 @@ func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, 
 
 	clientName := initializeReq.ClientInfo.Name
 	clientVersion := initializeReq.ClientInfo.Version
-	stHandle, err := h.stateful.CreateSession(ctx, userInfo.UserID(), "", negotiatedVersion, capSet, sessions.MetadataClientInfo{Name: clientName, Version: clientVersion}, 0, 0)
+	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), negotiatedVersion, capSet, sessions.MetadataClientInfo{Name: clientName, Version: clientVersion})
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return fmt.Errorf("failed to create session: %w", err)
 	}
-	session := stHandle.ToSession()
 
 	serverInfo, err := h.mcp.GetServerInfo(ctx, session)
 	if err != nil {
