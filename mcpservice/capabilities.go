@@ -42,7 +42,7 @@ type ServerCapabilities interface {
 	// GetPreferredProtocolVersion returns the server's preferred MCP protocol version
 	// for this session. If ok is false, the handler should fall back to the client's
 	// requested version.
-	GetPreferredProtocolVersion(ctx context.Context, session sessions.Session) (version string, ok bool, err error)
+	GetPreferredProtocolVersion(ctx context.Context) (version string, ok bool, err error)
 
 	// GetInstructions returns optional human-readable instructions that should be
 	// surfaced to the client during initialization. If ok is false, no instructions

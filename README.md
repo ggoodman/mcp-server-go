@@ -72,11 +72,13 @@ func main() {
     ctx := context.Background()
 
     publicEndpoint := os.Getenv("MCP_PUBLIC_ENDPOINT") // e.g. https://mcp.example.com/mcp
-    issuer := os.Getenv("OIDC_ISSUER")                  // your OAuth/OIDC issuer URL
+    issuer := os.Getenv("OIDC_ISSUER")                 // your OAuth/OIDC issuer URL
 
     // 1) Session host for horizontal scale (Redis)
     host, err := redishost.New(os.Getenv("REDIS_ADDR"))
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
     defer host.Close()
 
     // 2) Typed tool with strict input schema by default
@@ -104,7 +106,11 @@ func main() {
         auth.WithExpectedAudience(publicEndpoint), // audience check (use your public MCP endpoint)
         auth.WithLeeway(2*time.Minute),
     )
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
+
+    log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
     // 5) Drop-in handler
     h, err := streaminghttp.New(
@@ -114,10 +120,12 @@ func main() {
         server,
         authenticator,
         streaminghttp.WithServerName("My MCP Server"),
-        streaminghttp.WithLogger(slog.NewTextHandler(os.Stdout, nil)),
+        streaminghttp.WithLogger(log),
         streaminghttp.WithAuthorizationServerDiscovery(issuer),
     )
-    if err != nil { panic(err) }
+    if err != nil {
+        panic(err)
+    }
 
     // 6) Serve
     http.ListenAndServe("127.0.0.1:8080", h)
@@ -253,3 +261,91 @@ server := mcpservice.NewServer(
 ## License
 
 MIT — see `LICENSE`.
+
+## Ergonomic helpers (optional)
+
+The core `mcp` package exposes only wire-level structs. For less boilerplate you can opt into the helper packages:
+
+- `mcp/sampling` – build `CreateMessageRequest` values and message/content blocks.
+- `mcp/elicitation` – build elicitation schemas via a small DSL and validate them.
+
+You can ignore these packages entirely; they never wrap or hide protocol data structures.
+
+### Sampling helpers
+
+Raw (manual struct literals):
+
+```go
+req := &mcp.CreateMessageRequest{
+    Messages: []mcp.SamplingMessage{
+        {Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "Translate to French: Hello"}},
+    },
+    SystemPrompt: "You translate only.",
+    MaxTokens:    80,
+}
+```
+
+With helpers:
+
+```go
+import "github.com/ggoodman/mcp-server-go/mcp/sampling"
+
+req := sampling.NewCreateMessage(
+    []mcp.SamplingMessage{
+        sampling.UserText("Translate to French: Hello"),
+    },
+    sampling.WithSystemPrompt("You translate only."),
+    sampling.WithMaxTokens(80),
+)
+
+if err := sampling.ValidateCreateMessage(req); err != nil { /* handle */ }
+resp, _ := sp.CreateMessage(ctx, req)
+```
+
+### Elicitation (reflective API)
+
+Elicitation lets the server request structured user input mid-flow. The
+`sessions.ElicitationCapability` turns a struct definition into a restricted
+schema (flat object; primitive properties) and decodes the response back into
+the same struct.
+
+```go
+type LanguageChoice struct {
+    Language string `json:"language" jsonschema:"description=Target language,minLength=1"`
+}
+
+el, ok := sess.GetElicitationCapability()
+if ok {
+    var lc LanguageChoice
+    action, err := el.Elicit(ctx, &lc, sessions.WithMessage("Which language should I translate to?"))
+    if err != nil { /* handle transport/validation error */ }
+    if action == sessions.ElicitActionAccept {
+        // use lc.Language
+    }
+}
+```
+
+Options:
+
+* `sessions.WithMessage(string)` – prompt shown to the user.
+* `sessions.WithStrictKeys()` – reject unknown keys (default: ignore extras).
+* `sessions.WithRawCapture(&map[string]any{})` – access the raw response map.
+
+Constraints (enforced server-side for now):
+
+* No nested objects / arrays / oneOf / anyOf / refs.
+* Enum only on string fields.
+* Pointer fields are optional; non-pointer fields are required if present in the reflected schema's required set.
+* Numeric min/max derived from jsonschema tags when supported by `invopop/jsonschema`.
+
+### Design goals
+
+1. Pure value builders: never introduce wrapper types.
+2. Everything is additive; raw structs remain first-class.
+3. Minimal API surface: helpers focus on reducing typos and repetition, not inventing new protocol concepts.
+4. Easy escape hatch: you can intermix manual and helper-constructed values freely.
+
+The earlier explicit request-building helper layer was removed in favor of the
+single reflective API above. If you need to hand-author a schema, you can still
+construct an `mcp.ElicitationSchema` directly and (in a future add-on) we may
+expose a low-level call, but the reflective path is the primary ergonomics story.

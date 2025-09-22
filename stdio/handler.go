@@ -10,9 +10,11 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"reflect"
 	"sync"
 	"time"
 
+	internalelicitation "github.com/ggoodman/mcp-server-go/internal/elicitation"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
@@ -156,9 +158,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 			}
 
 			negotiated := initReq.ProtocolVersion
-			// Allow server to prefer a version.
-			bs := &bootstrapSession{userID: uid}
-			if v, ok, err := h.srv.GetPreferredProtocolVersion(ctx, bs); err == nil && ok && v != "" {
+			if v, ok, err := h.srv.GetPreferredProtocolVersion(ctx); err == nil && ok && v != "" {
 				negotiated = v
 			}
 
@@ -780,33 +780,55 @@ func (r *stdioRootsCap) notifyListeners(ctx context.Context) {
 
 type stdioElicitCap struct{ d *outboundDispatcher }
 
-func (e *stdioElicitCap) Elicit(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-	if e == nil || e.d == nil || req == nil {
-		return nil, fmt.Errorf("invalid elicitation request")
+func (e *stdioElicitCap) Elicit(ctx context.Context, text string, target any, opts ...sessions.ElicitOption) (sessions.ElicitAction, error) {
+	if e == nil || e.d == nil {
+		return "", fmt.Errorf("elicitation capability unavailable")
 	}
+	if target == nil {
+		return "", fmt.Errorf("elicitation: target nil")
+	}
+	rv := reflect.ValueOf(target)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
+		return "", fmt.Errorf("elicitation: target must be pointer to struct")
+	}
+	var conf sessions.ElicitConfig
+	for _, opt := range opts {
+		opt(&conf)
+	}
+	t := rv.Elem().Type()
+	schema, cp, err := internalelicitation.ProjectSchema(t)
+	if err != nil {
+		return "", err
+	}
+	req := &mcp.ElicitRequest{Message: text, RequestedSchema: *schema}
 	resp, err := e.d.Call(ctx, string(mcp.ElicitationCreateMethod), req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	var out mcp.ElicitResult
 	if err := json.Unmarshal(resp.Result, &out); err != nil {
-		return nil, err
+		return "", err
 	}
-	return &out, nil
-}
-
-// bootstrapSession is used only for version preference probe during initialize.
-type bootstrapSession struct{ userID string }
-
-func (b *bootstrapSession) SessionID() string       { return "" }
-func (b *bootstrapSession) UserID() string          { return b.userID }
-func (b *bootstrapSession) ProtocolVersion() string { return "" }
-func (b *bootstrapSession) GetSamplingCapability() (sessions.SamplingCapability, bool) {
-	return nil, false
-}
-func (b *bootstrapSession) GetRootsCapability() (sessions.RootsCapability, bool) { return nil, false }
-func (b *bootstrapSession) GetElicitationCapability() (sessions.ElicitationCapability, bool) {
-	return nil, false
+	if err := internalelicitation.DecodeForTyped(cp, target, out.Content, conf.Strict); err != nil {
+		return "", err
+	}
+	if conf.RawDst != nil {
+		m := make(map[string]any, len(out.Content))
+		for k, v := range out.Content {
+			m[k] = v
+		}
+		*conf.RawDst = m
+	}
+	switch out.Action {
+	case string(sessions.ElicitActionAccept):
+		return sessions.ElicitActionAccept, nil
+	case string(sessions.ElicitActionDecline):
+		return sessions.ElicitActionDecline, nil
+	case string(sessions.ElicitActionCancel):
+		return sessions.ElicitActionCancel, nil
+	default:
+		return "", fmt.Errorf("elicitation: unknown action %q", out.Action)
+	}
 }
 
 // writeMux serializes writes and ensures newline framing.

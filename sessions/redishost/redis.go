@@ -2,6 +2,8 @@ package redishost
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -50,10 +52,13 @@ func (h *Host) Close() error { return h.client.Close() }
 
 // --- Key helpers ---
 
-func (h *Host) streamKey(sessionID string) string  { return h.keyPrefix + "stream:" + sessionID }
-func (h *Host) revokedKey(sessionID string) string { return h.keyPrefix + "revoked:" + sessionID }
-func (h *Host) epochKey(scope sessions.RevocationScope) string {
-	return h.keyPrefix + "epoch:" + scope.UserID + "|" + scope.ClientID + "|" + scope.TenantID
+func (h *Host) streamKey(sessionID string) string { return h.keyPrefix + "stream:" + sessionID }
+func (h *Host) metaKey(sessionID string) string   { return h.keyPrefix + "meta:" + sessionID }
+func (h *Host) dataKey(sessionID, key string) string {
+	return h.keyPrefix + "data:" + sessionID + ":" + key
+}
+func (h *Host) dataScanPattern(sessionID string) string {
+	return h.keyPrefix + "data:" + sessionID + ":*"
 }
 func (h *Host) eventChannel(sessionID, topic string) string {
 	return h.keyPrefix + "evt:" + sessionID + ":" + topic
@@ -112,66 +117,153 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 	}
 }
 
-func (h *Host) CleanupSession(ctx context.Context, sessionID string) error {
-	// Best-effort delete keys related to this session
+// DeleteSession removes all artifacts (idempotent best-effort).
+func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	c := context.WithoutCancel(ctx)
+	// delete metadata
+	_, _ = h.client.Del(c, h.metaKey(sessionID)).Result()
+	// delete stream
 	_, _ = h.client.Del(c, h.streamKey(sessionID)).Result()
-	// Best-effort: delete any pending awaits/replies for this session
-	// Note: SCAN is used to avoid blocking; ignore errors.
-	patA := h.keyPrefix + "await:" + sessionID + ":*"
-	patR := h.keyPrefix + "reply:" + sessionID + ":*"
-	_ = h.deleteByPattern(c, patA)
-	_ = h.deleteByPattern(c, patR)
-	// Do NOT delete the per-session revocation marker here; it's required to
-	// prevent token re-use after DeleteSession. It will expire via TTL.
+	// delete kv entries
+	_ = h.deleteByPattern(c, h.dataScanPattern(sessionID))
 	return nil
 }
 
-// --- Revocation ---
-
-func (h *Host) AddRevocation(ctx context.Context, sessionID string, ttl time.Duration) error {
-	key := h.revokedKey(sessionID)
-	if ttl <= 0 {
-		ttl = time.Hour
-	}
-	c := context.WithoutCancel(ctx)
-	if err := h.client.Set(c, key, "1", ttl).Err(); err != nil {
+// Metadata CRUD (stored as JSON blob for simplicity; could be hash later)
+func (h *Host) CreateSession(ctx context.Context, meta *sessions.SessionMetadata) error {
+	key := h.metaKey(meta.SessionID)
+	// NX to avoid overwrite
+	b, err := json.Marshal(meta)
+	if err != nil {
 		return err
 	}
+	ok, err := h.client.SetNX(ctx, key, b, meta.TTL).Result()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("session exists")
+	}
 	return nil
 }
 
-func (h *Host) IsRevoked(ctx context.Context, sessionID string) (bool, error) {
-	key := h.revokedKey(sessionID)
-	n, err := h.client.Exists(ctx, key).Result()
+func (h *Host) GetSession(ctx context.Context, sessionID string) (*sessions.SessionMetadata, error) {
+	val, err := h.client.Get(ctx, h.metaKey(sessionID)).Bytes()
 	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
-}
-
-func (h *Host) BumpEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {
-	c := context.WithoutCancel(ctx)
-	n, err := h.client.Incr(c, h.epochKey(scope)).Result()
-	if err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
-func (h *Host) GetEpoch(ctx context.Context, scope sessions.RevocationScope) (int64, error) {
-	cmd := h.client.Get(ctx, h.epochKey(scope))
-	if err := cmd.Err(); err != nil {
 		if err == redis.Nil {
-			return 0, nil
+			return nil, errors.New("not found")
 		}
-		return 0, err
+		return nil, err
 	}
-	n, err := cmd.Int64()
+	var m sessions.SessionMetadata
+	if err := json.Unmarshal(val, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*sessions.SessionMetadata) error) error {
+	key := h.metaKey(sessionID)
+	// Use WATCH to implement CAS loop
+	for i := 0; i < 5; i++ { // retry bound
+		err := h.client.Watch(ctx, func(tx *redis.Tx) error {
+			val, err := tx.Get(ctx, key).Bytes()
+			if err != nil {
+				if err == redis.Nil {
+					return errors.New("not found")
+				}
+				return err
+			}
+			var m sessions.SessionMetadata
+			if err := json.Unmarshal(val, &m); err != nil {
+				return err
+			}
+			if err := fn(&m); err != nil {
+				return err
+			}
+			m.UpdatedAt = time.Now().UTC()
+			b, err := json.Marshal(&m)
+			if err != nil {
+				return err
+			}
+			// pipeline set preserving TTL time remaining
+			p := tx.TxPipeline()
+			// fetch remaining TTL
+			ttl, err := tx.TTL(ctx, key).Result()
+			if err != nil {
+				return err
+			}
+			if ttl <= 0 {
+				ttl = m.TTL
+			} // fallback
+			p.Set(ctx, key, b, ttl)
+			_, err = p.Exec(ctx)
+			return err
+		}, key)
+		if err == redis.TxFailedErr {
+			continue
+		}
+		return err
+	}
+	return errors.New("mutation retries exceeded")
+}
+
+func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
+	key := h.metaKey(sessionID)
+	// Extend TTL by fetching existing metadata and re-setting value with new TTL (sliding window)
+	return h.client.Watch(ctx, func(tx *redis.Tx) error {
+		val, err := tx.Get(ctx, key).Bytes()
+		if err != nil {
+			return err
+		}
+		var m sessions.SessionMetadata
+		if err := json.Unmarshal(val, &m); err != nil {
+			return err
+		}
+		m.LastAccess = time.Now().UTC()
+		m.UpdatedAt = m.LastAccess
+		b, err := json.Marshal(&m)
+		if err != nil {
+			return err
+		}
+		// Preserve remaining TTL or use m.TTL if no TTL
+		ttl, err := tx.TTL(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+		if ttl <= 0 {
+			ttl = m.TTL
+		}
+		p := tx.TxPipeline()
+		p.Set(ctx, key, b, ttl)
+		_, err = p.Exec(ctx)
+		return err
+	}, key)
+}
+
+// KV storage
+func (h *Host) PutSessionData(ctx context.Context, sessionID, key string, value []byte) error {
+	rkey := h.dataKey(sessionID, key)
+	// Align TTL with metadata object (best-effort) by reading meta TTL.
+	ttl, _ := h.client.TTL(ctx, h.metaKey(sessionID)).Result()
+	if ttl < 0 {
+		ttl = time.Hour
+	} // fallback default
+	return h.client.Set(ctx, rkey, value, ttl).Err()
+}
+func (h *Host) GetSessionData(ctx context.Context, sessionID, key string) ([]byte, error) {
+	v, err := h.client.Get(ctx, h.dataKey(sessionID, key)).Bytes()
 	if err != nil {
-		return 0, err
+		if err == redis.Nil {
+			return nil, errors.New("not found")
+		}
+		return nil, err
 	}
-	return n, nil
+	return v, nil
+}
+func (h *Host) DeleteSessionData(ctx context.Context, sessionID, key string) error {
+	_, err := h.client.Del(ctx, h.dataKey(sessionID, key)).Result()
+	return err
 }
 
 // Interface compliance

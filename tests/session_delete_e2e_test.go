@@ -130,6 +130,8 @@ func TestDeleteSession_ClosesStreamsAndRevokes(t *testing.T) {
 	post.Header.Set("Content-Type", "application/json")
 	post.Header.Set("Accept", "text/event-stream")
 	post.Header.Set("mcp-session-id", sessID)
+	// Non-initialize requests now must include protocol version header
+	post.Header.Set("MCP-Protocol-Version", "2025-06-18")
 	pResp, err := http.DefaultClient.Do(post)
 	if err != nil {
 		t.Fatalf("post after delete: %v", err)

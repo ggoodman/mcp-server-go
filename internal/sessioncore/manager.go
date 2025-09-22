@@ -2,295 +2,248 @@ package sessioncore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
+	"sync/atomic"
 	"time"
 
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/sessions"
-	"github.com/google/uuid"
 )
 
-// --- Per-request rendezvous (distributed await/fulfill) ---
+// Manager owns lifecycle + outbound client RPC plumbing for stateful sessions.
+// It leverages SessionHost primitives only; no additional cross-node state is
+// required beyond the event topics used for rendezvous.
+type Manager struct {
+	Host sessions.SessionHost
 
-// Awaiter provides a one-shot receive for a specific (sessionID, correlationID)
-// tuple representing the outcome of a single in-flight request. At most one
-// awaiter may exist per key. It is concurrency-safe.
-//   - Recv blocks until fulfilled, canceled, or context done.
-//   - Cancel causes current/future Recv to return ErrAwaitCanceled.
-//   - Implementations must ensure BeginAwait happens-before outbound send.
-type Awaiter interface {
-	Recv(ctx context.Context) ([]byte, error)
-	Cancel(ctx context.Context) error
+	// config
+	ttl         time.Duration
+	maxLifetime time.Duration
+
+	// internal request id counter fallback (used only if random id generation fails)
+	fallbackCounter atomic.Uint64
 }
 
-var (
-	// ErrAwaitExists indicates there is already a waiter for the key.
-	ErrAwaitExists = errors.New("await already registered")
-	// ErrAwaitCanceled is returned from Recv when the await was canceled or the
-	// session cleaned up.
-	ErrAwaitCanceled = errors.New("await canceled")
-)
-
-// SessionManager creates, loads, and deletes MCP sessions, optionally issuing
-// signed session IDs and tracking revocation epochs.
-type SessionManager struct {
-	backend       sessions.SessionHost
-	jws           JWSSignerVerifier // optional; if nil, fall back to opaque UUID session IDs
-	revocationTTL time.Duration     // TTL for precise per-session revocation entries
-	issuer        string            // optional issuer binding for signed session IDs
-	logger        *slog.Logger
-}
-
-// ManagerOption configures optional behavior of the session manager.
-type ManagerOption func(*SessionManager)
-
-// WithJWSSigner enables JOSE/JWS-signed session IDs with rotating named keys.
-func WithJWSSigner(j JWSSignerVerifier) ManagerOption {
-	return func(sm *SessionManager) { sm.jws = j }
-}
-
-// WithRevocationTTL sets the TTL used for precise per-session revocation entries.
-func WithRevocationTTL(d time.Duration) ManagerOption {
-	return func(sm *SessionManager) { sm.revocationTTL = d }
-}
-
-// WithIssuer enforces that signed session IDs are bound to this issuer value.
-func WithIssuer(issuer string) ManagerOption {
-	return func(sm *SessionManager) { sm.issuer = issuer }
-}
-
-// NewManager constructs a SessionManager with sensible defaults.
-func NewManager(backend sessions.SessionHost, opts ...ManagerOption) *SessionManager {
-	sm := &SessionManager{
-		backend:       backend,
-		revocationTTL: 24 * time.Hour,
-		logger:        slog.Default(),
-	}
-	for _, o := range opts {
-		o(sm)
-	}
-	return sm
-}
-
-// SessionOption is a functional option for configuring a session created
-// by the SessionManager. These options can be used to enable or disable
-// specific capabilities for the session.
-// SessionOption mutates a SessionHandle during creation.
-type SessionOption func(*SessionHandle)
-
-// WithSamplingCapability enables sampling capability on the session.
-func WithSamplingCapability() SessionOption {
-	return func(s *SessionHandle) {
-		s.sampling = &samplingCapabilityImpl{sess: s}
-	}
-}
-
-// WithRootsCapability enables roots capability; optionally supports listChanged notifications.
-func WithRootsCapability(supportsListChanged bool) SessionOption {
-	return func(s *SessionHandle) {
-		s.roots = &rootsCapabilityImpl{sess: s, supportsListChanged: supportsListChanged}
-	}
-}
-
-// WithElicitationCapability enables the elicitation capability.
-func WithElicitationCapability() SessionOption {
-	return func(s *SessionHandle) {
-		s.elicitation = &elicitationCapabilityImpl{sess: s}
-	}
-}
-
-// WithProtocolVersion stores the negotiated protocol version on the session handle.
-// WithProtocolVersion stores the negotiated protocol version on the session handle.
-func WithProtocolVersion(version string) SessionOption {
-	return func(s *SessionHandle) {
-		s.protocolVersion = version
-	}
-}
-
-// CreateSession allocates a new session for the given user.
-func (sm *SessionManager) CreateSession(ctx context.Context, userID string, opts ...SessionOption) (*SessionHandle, error) {
-	// Snapshot current epoch if available for embed
-	var epoch int64
-	if sm.backend != nil {
-		if e, err := sm.backend.GetEpoch(ctx, sessions.RevocationScope{UserID: userID}); err == nil {
-			epoch = e
-		}
-	}
-
-	// Build handle and apply options (so proto can be baked into token if signer is enabled)
-	session := &SessionHandle{userID: userID, backend: sm.backend}
+// New constructs a Manager with the provided host. Options can adjust
+// defaults; if ttl is zero a 24h default is applied.
+func New(host sessions.SessionHost, opts ...ManagerOption) *Manager {
+	m := &Manager{Host: host, ttl: 24 * time.Hour}
 	for _, opt := range opts {
-		opt(session)
+		opt(m)
 	}
-
-	sid := sm.mintSessionID(session, epoch)
-	session.id = sid
-	return session, nil
+	if m.ttl <= 0 {
+		m.ttl = 24 * time.Hour
+	}
+	return m
 }
 
-// LoadSession validates and parses a supplied session ID, returning a handle.
-func (sm *SessionManager) LoadSession(ctx context.Context, sessID string, userID string) (*SessionHandle, error) {
-	// If the caller canceled the context, treat this as a failure immediately.
-	if err := ctx.Err(); err != nil {
+// ManagerOption configures a Manager.
+type ManagerOption func(*Manager)
+
+// WithTTL overrides the sliding TTL used for sessions.
+func WithTTL(d time.Duration) ManagerOption { return func(m *Manager) { m.ttl = d } }
+
+// WithMaxLifetime sets an absolute maximum lifetime horizon (0 = disabled).
+func WithMaxLifetime(d time.Duration) ManagerOption { return func(m *Manager) { m.maxLifetime = d } }
+
+// CreateSession creates and persists new session metadata and returns a handle.
+func (m *Manager) CreateSession(ctx context.Context, userID string, protocolVersion string, caps sessions.CapabilitySet, meta sessions.MetadataClientInfo) (*SessionHandle, error) {
+	if m == nil || m.Host == nil {
+		return nil, fmt.Errorf("session manager not initialized")
+	}
+	if userID == "" { // user scoping required for auth boundary
+		return nil, fmt.Errorf("user id required")
+	}
+	sid, err := newSessionID()
+	if err != nil { // extremely unlikely; fallback to counter-based id
+		n := m.fallbackCounter.Add(1)
+		sid = fmt.Sprintf("s-%d", n)
+	}
+	now := time.Now().UTC()
+	metaRec := &sessions.SessionMetadata{
+		MetaVersion:     1,
+		SessionID:       sid,
+		UserID:          userID,
+		ProtocolVersion: protocolVersion,
+		Client:          meta,
+		Capabilities:    caps,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastAccess:      now,
+		TTL:             m.ttl,
+		MaxLifetime:     m.maxLifetime,
+		Revoked:         false,
+	}
+	if err := m.Host.CreateSession(ctx, metaRec); err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+	return newHandle(m, metaRec), nil
+}
+
+// LoadSession loads an existing session (verifying ownership) and returns a handle.
+// unknown param retained for forward compatibility (placeholder for token-originated issuer, etc.).
+func (m *Manager) LoadSession(ctx context.Context, sessID string, userID string, _ string) (*SessionHandle, error) {
+	if m == nil || m.Host == nil {
+		return nil, fmt.Errorf("session manager not initialized")
+	}
+	metaRec, err := m.Host.GetSession(ctx, sessID)
+	if err != nil {
 		return nil, err
 	}
-	// Parse and (if applicable) verify a signed session token
-	tok, isSigned, err := sm.parseSessionID(sessID)
+	if metaRec.Revoked || metaRec.UserID == "" || metaRec.UserID != userID {
+		// Treat as not found to avoid oracle on existence.
+		return nil, errors.New("not found")
+	}
+	// Best-effort sliding TTL touch.
+	_ = m.Host.TouchSession(ctx, sessID)
+	return newHandle(m, metaRec), nil
+}
+
+// DeleteSession hard-deletes a session (idempotent best-effort).
+func (m *Manager) DeleteSession(ctx context.Context, sessID string) error {
+	if m == nil || m.Host == nil {
+		return fmt.Errorf("session manager not initialized")
+	}
+	return m.Host.DeleteSession(ctx, sessID)
+}
+
+// DeliverResponse publishes a JSON-RPC response (received via transport POST)
+// onto the server-internal event bus so any waiting outbound call can resume.
+// Safe for concurrent use; silently ignores nil or responses without ID.
+func (m *Manager) DeliverResponse(ctx context.Context, sessID string, resp *jsonrpc.Response) error {
+	if resp == nil || resp.ID == nil {
+		return nil
+	}
+	b, err := json.Marshal(resp)
 	if err != nil {
-		return nil, fmt.Errorf("invalid session id: %w", err)
+		return err
 	}
-	if isSigned {
-		if tok.UserID != userID {
-			return nil, fmt.Errorf("invalid session: user mismatch")
-		}
-		if sm.issuer != "" && tok.Issuer != sm.issuer {
-			return nil, fmt.Errorf("invalid session: issuer mismatch")
-		}
-		// Epoch check if host supports it
-		if sm.backend != nil {
-			if curr, err := sm.backend.GetEpoch(ctx, sessions.RevocationScope{UserID: userID}); err == nil {
-				if tok.Epoch < curr {
-					return nil, fmt.Errorf("invalid session: revoked by epoch")
-				}
-			}
-		}
-	}
-
-	// Precise revocation check if supported
-	if sm.backend != nil {
-		if revoked, err := sm.backend.IsRevoked(ctx, sessID); err == nil && revoked {
-			return nil, fmt.Errorf("invalid session: revoked")
-		}
-	}
-
-	// Construct the live session wrapper
-	s := &SessionHandle{id: sessID, userID: userID, backend: sm.backend}
-	if isSigned {
-		s.protocolVersion = tok.Proto
-		// Rehydrate client capability flags so other nodes observe the same surface.
-		if tok.Caps != nil {
-			if tok.Caps.Sampling {
-				s.sampling = &samplingCapabilityImpl{sess: s}
-			}
-			if tok.Caps.Roots {
-				s.roots = &rootsCapabilityImpl{sess: s, supportsListChanged: tok.Caps.RootsLC}
-			}
-			if tok.Caps.Elicitation {
-				s.elicitation = &elicitationCapabilityImpl{sess: s}
-			}
-		}
-	}
-	return s, nil
+	topic := rpcResponseTopic(resp.ID.String())
+	return m.Host.PublishEvent(ctx, sessID, topic, b)
 }
 
-func (sm *SessionManager) DeleteSession(ctx context.Context, sessID string) error {
-	// Best-effort precise revocation with bounded TTL
-	if sm.backend != nil {
-		if err := sm.backend.AddRevocation(ctx, sessID, sm.revocationTTL); err != nil && err != sessions.ErrRevocationUnsupported {
-			return fmt.Errorf("failed to revoke session: %w", err)
-		}
+// --- Outbound client RPC plumbing ---
+
+// clientCall emits a server->client JSON-RPC request and blocks for a response
+// or context cancellation. Result JSON is decoded into out if non-nil.
+func (m *Manager) clientCall(ctx context.Context, h *SessionHandle, method string, params any, out any) error {
+	// Build random request id (unguessable & unique). If entropy fails, fallback to incrementing counter.
+	var rid string
+	if id, err := randomID(); err == nil {
+		rid = id
+	} else {
+		rid = fmt.Sprintf("r-%d", m.fallbackCounter.Add(1))
 	}
 
-	// Optional: bump user epoch if the token is signed and reveals the user.
-	if tok, isSigned, err := sm.parseSessionID(sessID); err == nil && isSigned && sm.backend != nil {
-		if _, err := sm.backend.BumpEpoch(ctx, sessions.RevocationScope{UserID: tok.UserID}); err != nil && err != sessions.ErrRevocationUnsupported {
-			sm.logger.Warn("failed to bump epoch during session delete",
-				slog.String("session_id", sessID),
-				slog.String("user_id", tok.UserID),
-				slog.String("error", err.Error()),
-			)
-			// Log and continue; this is non-fatal
-			// Non-fatal; continue cleanup even if epoch bump fails
+	// Pre-subscribe to response topic.
+	topic := rpcResponseTopic(rid)
+	respCh := make(chan []byte, 1)
+	subCtx, cancel := context.WithCancel(ctx)
+	unsub, err := m.Host.SubscribeEvents(subCtx, h.id, topic, func(ctx context.Context, payload []byte) error {
+		select {
+		case respCh <- append([]byte(nil), payload...):
+		default:
 		}
-	}
-
-	// Cleanup delivery resources for this session
-	if sm.backend != nil {
-		if err := sm.backend.CleanupSession(ctx, sessID); err != nil {
-			return fmt.Errorf("failed to cleanup session: %w", err)
-		}
-	}
-	return nil
-}
-
-// --- Token minting/parsing helpers (JOSE/JWS backed) ---
-
-// sessionTokenV1 is a compact, signed, stateless description of a session handle.
-// This is intentionally minimal and signed as a compact JWS. Not a full JWT with exp.
-type sessionTokenV1 struct {
-	V      int     `json:"v"` // version = 1
-	UserID string  `json:"uid"`
-	JTI    string  `json:"jti"` // random id
-	IAT    int64   `json:"iat"` // unix seconds
-	Epoch  int64   `json:"gen,omitempty"`
-	Issuer string  `json:"iss,omitempty"`
-	Proto  string  `json:"proto,omitempty"`
-	Caps   *capsV1 `json:"caps,omitempty"`
-}
-
-// capsV1 is a compact summary of the client's declared capabilities
-// that were enabled for this session. It allows other nodes to
-// reconstruct the same surface without re-running initialize logic.
-type capsV1 struct {
-	Roots       bool `json:"roots,omitempty"`
-	RootsLC     bool `json:"rootsLC,omitempty"`
-	Sampling    bool `json:"sampling,omitempty"`
-	Elicitation bool `json:"elicitation,omitempty"`
-}
-
-func (sm *SessionManager) mintSessionID(s *SessionHandle, epoch int64) string {
-	// If no JWS signer is configured, fall back to an opaque UUID session id.
-	if sm.jws == nil {
-		return uuid.NewString()
-	}
-	// Summarize enabled client capabilities from the handle
-	var caps *capsV1
-	if s != nil {
-		c := capsV1{}
-		if s.roots != nil {
-			c.Roots = true
-			if rc, ok := s.roots.(*rootsCapabilityImpl); ok && rc.supportsListChanged {
-				c.RootsLC = true
-			}
-		}
-		if s.sampling != nil {
-			c.Sampling = true
-		}
-		if s.elicitation != nil {
-			c.Elicitation = true
-		}
-		if c.Roots || c.RootsLC || c.Sampling || c.Elicitation {
-			caps = &c
-		}
-	}
-
-	tok := sessionTokenV1{V: 1, UserID: s.userID, JTI: uuid.NewString(), IAT: time.Now().Unix(), Epoch: epoch, Issuer: sm.issuer, Proto: s.protocolVersion, Caps: caps}
-	payload, _ := json.Marshal(tok)
-	compact, err := sm.jws.Sign(payload)
+		return nil
+	})
 	if err != nil {
-		// If signing fails, avoid creating an unusable session; fall back to UUID.
-		return uuid.NewString()
+		cancel()
+		return fmt.Errorf("subscribe response: %w", err)
 	}
-	return compact
+	defer func() {
+		unsub()
+		cancel()
+	}()
+
+	// Marshal params
+	var paramsRaw json.RawMessage
+	if params != nil {
+		b, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("marshal params: %w", err)
+		}
+		paramsRaw = b
+	}
+	// Construct request (string id)
+	id := jsonrpc.NewRequestID(rid)
+	req := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: method, Params: paramsRaw, ID: id}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	// Opportunistic direct write (stream-first semantics). If a direct writer is
+	// installed and succeeds, we skip durable publish (original semantics). If it
+	// fails, fall back to durable publish so the client can still recover via GET.
+	if ok, derr := h.tryDirectWrite(ctx, rawReq); ok {
+		if derr != nil { // fallback to durability on error
+			if _, err := m.Host.PublishSession(ctx, h.id, rawReq); err != nil {
+				return fmt.Errorf("publish request after direct write failure: %w (direct error: %v)", err, derr)
+			}
+		}
+	} else { // no direct writer
+		if _, err := m.Host.PublishSession(ctx, h.id, rawReq); err != nil {
+			return fmt.Errorf("publish request: %w", err)
+		}
+	}
+
+	// Await response or cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case raw := <-respCh:
+		var resp jsonrpc.Response
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return fmt.Errorf("decode response: %w", err)
+		}
+		if resp.Error != nil {
+			return fmt.Errorf("client error (%d): %s", resp.Error.Code, resp.Error.Message)
+		}
+		if out != nil && resp.Result != nil {
+			if err := json.Unmarshal(resp.Result, out); err != nil {
+				return fmt.Errorf("decode result: %w", err)
+			}
+		}
+		return nil
+	}
 }
 
-func (sm *SessionManager) parseSessionID(sessID string) (sessionTokenV1, bool, error) {
-	var zero sessionTokenV1
-	if sm.jws == nil {
-		return zero, false, nil // opaque/legacy id
+// rpcResponseTopic returns the server-internal event topic used to rendezvous a response id.
+func rpcResponseTopic(id string) string { return "rpcresp:" + id }
+
+// randomID returns a hex-encoded 16-byte cryptographically random string.
+func randomID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
 	}
-	payloadB, _, err := sm.jws.Verify(sessID)
-	if err != nil {
-		return zero, true, fmt.Errorf("verify failed: %w", err)
-	}
-	var tok sessionTokenV1
-	if err := json.Unmarshal(payloadB, &tok); err != nil {
-		return zero, true, fmt.Errorf("invalid payload: %w", err)
-	}
-	if tok.V != 1 {
-		return zero, true, fmt.Errorf("unsupported version")
-	}
-	return tok, true, nil
+	return hex.EncodeToString(b[:]), nil
 }
+
+// newSessionID returns a cryptographically random session id with a prefix.
+func newSessionID() (string, error) {
+	id, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	return "sess-" + id, nil
+}
+
+// newHandle constructs a SessionHandle from metadata.
+func newHandle(m *Manager, meta *sessions.SessionMetadata) *SessionHandle {
+	h := &SessionHandle{
+		id:              meta.SessionID,
+		userID:          meta.UserID,
+		protocolVersion: meta.ProtocolVersion,
+		caps:            meta.Capabilities,
+		host:            m.Host,
+		mgr:             m,
+	}
+	// Lazy capability wrappers are created on-demand; nothing to do here.
+	return h
+}
+
+// (removed unused helper constants and sanitizeMethod)

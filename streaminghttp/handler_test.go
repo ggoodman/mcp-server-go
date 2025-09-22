@@ -24,6 +24,51 @@ import (
 	"github.com/ggoodman/mcp-server-go/streaminghttp"
 )
 
+// --- test-only capability & server implementations for direct writer test ---
+type testToolsCap struct{}
+
+func (c testToolsCap) ListTools(ctx context.Context, session sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
+	if rc, ok := session.GetRootsCapability(); ok {
+		_, _ = rc.ListRoots(ctx) // trigger clientCall; ignore errors
+	}
+	return mcpservice.NewPage([]mcp.Tool{{Name: "dummy", Description: "d"}}), nil
+}
+func (c testToolsCap) CallTool(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+	return &mcp.CallToolResult{Content: []mcp.ContentBlock{}}, nil
+}
+func (c testToolsCap) GetListChangedCapability(ctx context.Context, s sessions.Session) (mcpservice.ToolListChangedCapability, bool, error) {
+	return nil, false, nil
+}
+
+type testServer struct{ tools testToolsCap }
+
+var _ mcpservice.ServerCapabilities = (*testServer)(nil)
+
+func (ts *testServer) GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error) {
+	return mcp.ImplementationInfo{Name: "test", Version: "0.0.1"}, nil
+}
+func (ts *testServer) GetPreferredProtocolVersion(ctx context.Context) (string, bool, error) {
+	return "2025-06-18", true, nil
+}
+func (ts *testServer) GetInstructions(ctx context.Context, session sessions.Session) (string, bool, error) {
+	return "", false, nil
+}
+func (ts *testServer) GetResourcesCapability(ctx context.Context, session sessions.Session) (mcpservice.ResourcesCapability, bool, error) {
+	return nil, false, nil
+}
+func (ts *testServer) GetToolsCapability(ctx context.Context, session sessions.Session) (mcpservice.ToolsCapability, bool, error) {
+	return ts.tools, true, nil
+}
+func (ts *testServer) GetPromptsCapability(ctx context.Context, session sessions.Session) (mcpservice.PromptsCapability, bool, error) {
+	return nil, false, nil
+}
+func (ts *testServer) GetLoggingCapability(ctx context.Context, session sessions.Session) (mcpservice.LoggingCapability, bool, error) {
+	return nil, false, nil
+}
+func (ts *testServer) GetCompletionsCapability(ctx context.Context, session sessions.Session) (mcpservice.CompletionsCapability, bool, error) {
+	return nil, false, nil
+}
+
 func TestSingleInstance(t *testing.T) {
 	t.Run("Initialize returns session and capabilities", func(t *testing.T) {
 		// Explicit minimal server with empty static tools
@@ -561,6 +606,112 @@ func TestMultiInstance(t *testing.T) {
 
 }
 
+// --- Direct writer (Option B) test ---
+// Verifies that a server->client request emitted via a client capability while handling
+// a POST request with an ID is streamed on the same SSE response even when no GET stream
+// is active. We simulate this by implementing a custom ToolsCapability whose ListTools
+// triggers a client roots/list call if the client advertised roots capability.
+func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) {
+
+	host := memoryhost.New()
+	server := &testServer{}
+	h, err := streaminghttp.New(context.Background(), "http://example.com/mcp", host, server, &noAuth{wantToken: "test-token"}, streaminghttp.WithServerName("t"), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "https://issuer", JwksURI: "https://issuer/jwks"}))
+	if err != nil {
+		t.Fatalf("new handler: %v", err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Correctly target /mcp path (public endpoint includes /mcp).
+	initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("init"), Params: mustJSON(map[string]any{
+		"protocolVersion": "2025-06-18",
+		"capabilities":    map[string]any{"roots": map[string]any{}},
+		"clientInfo":      map[string]any{"name": "c", "version": "1"},
+	})}
+	initResp, _ := mustPostMCPPath(t, srv, "/mcp", "Bearer test-token", "", initReq)
+	sessID := initResp.Header.Get("mcp-session-id")
+	if sessID == "" {
+		// Fallback check with canonical header name just in case.
+		sessID = initResp.Header.Get("Mcp-Session-Id")
+	}
+	if sessID == "" {
+		b, _ := io.ReadAll(initResp.Body)
+		initResp.Body.Close()
+		// Provide body for debugging.
+		t.Fatalf("missing session id; status=%d body=%s", initResp.StatusCode, string(b))
+	}
+	initResp.Body.Close()
+
+	// Send tools/list which will internally trigger a roots/list client call, using /mcp.
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(mcp.ListToolsRequest{})}
+	resp, bodyEvt := mustPostMCPPath(t, srv, "/mcp", "Bearer test-token", sessID, listReq)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("unexpected status %d", resp.StatusCode)
+	}
+
+	var first jsonrpc.Request
+	if err := json.Unmarshal(bodyEvt.data, &first); err != nil {
+		resp.Body.Close()
+		t.Fatalf("decode first event: %v", err)
+	}
+	if first.Method != string(mcp.RootsListMethod) {
+		resp.Body.Close()
+		t.Fatalf("expected first method roots/list, got %s", first.Method)
+	}
+	rid := first.ID.String()
+	if rid == "" {
+		resp.Body.Close()
+		t.Fatalf("expected non-empty outbound request id")
+	}
+
+	// Respond as client.
+	rootsResp := &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, ID: first.ID, Result: mustJSON(mcp.ListRootsResult{Roots: []mcp.Root{}})}
+	buf, _ := json.Marshal(rootsResp)
+	httpReq, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp", bytes.NewReader(buf))
+	if err != nil {
+		t.Fatalf("new post resp req: %v", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer test-token")
+	httpReq.Header.Set("MCP-Session-Id", sessID)
+	httpReq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("post response: %v", err)
+	}
+	if httpResp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		t.Fatalf("expected 202 for response POST, got %d body=%s", httpResp.StatusCode, string(b))
+	}
+	httpResp.Body.Close()
+
+	second, err := readOneSSE(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		t.Fatalf("reading second event: %v", err)
+	}
+	var rpcRes jsonrpc.Response
+	if err := json.Unmarshal(second.data, &rpcRes); err != nil {
+		resp.Body.Close()
+		t.Fatalf("decode second event: %v", err)
+	}
+	if rpcRes.Error != nil {
+		resp.Body.Close()
+		t.Fatalf("unexpected error in final response: %+v", rpcRes.Error)
+	}
+	if rpcRes.ID.String() != "1" {
+		resp.Body.Close()
+		t.Fatalf("expected final response id 1, got %s", rpcRes.ID.String())
+	}
+	if rid == rpcRes.ID.String() {
+		resp.Body.Close()
+		t.Fatalf("expected different ids for outbound client call and server response")
+	}
+}
+
 // ============================================================================
 
 // logBridge is an implementation of slog.Handler that works
@@ -887,6 +1038,10 @@ func doPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID string,
 	}
 	if sessionID != "" {
 		httpReq.Header.Set("mcp-session-id", sessionID)
+		// All non-initialize requests must include protocol version header now.
+		if req.Method != string(mcp.InitializeMethod) {
+			httpReq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+		}
 	}
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
@@ -918,6 +1073,58 @@ func mustPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID strin
 		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("body read error: %v", err)})}
 	}
 	return resp, sseEvent{data: body}
+}
+
+// Added helper that allows specifying a custom path (e.g. /mcp) for POSTing MCP messages.
+func mustPostMCPPath(t *testing.T, srv *httptest.Server, path string, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, sseEvent) {
+	// Reuse existing logic from mustPostMCP with path override
+	resp, err := doPostMCPPath(t, srv, path, authHeader, sessionID, req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp, sseEvent{}
+	}
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
+		evt, err := readOneSSE(resp.Body)
+		if err != nil {
+			return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("sse read error: %v", err)})}
+		}
+		return resp, evt
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, sseEvent{data: mustJSON(map[string]any{"error": fmt.Sprintf("body read error: %v", err)})}
+	}
+	return resp, sseEvent{data: body}
+}
+
+func doPostMCPPath(t *testing.T, srv *httptest.Server, path string, authHeader, sessionID string, req *jsonrpc.Request) (*http.Response, error) {
+	// Mirror doPostMCP but allow custom path
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	url := srv.URL + path
+	if !strings.HasPrefix(path, "/") {
+		url = srv.URL + "/" + path
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Content-Type", "application/json")
+	if authHeader != "" {
+		httpReq.Header.Set("Authorization", authHeader)
+	}
+	if sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", sessionID)
+		if req.Method != string(mcp.InitializeMethod) {
+			httpReq.Header.Set("MCP-Protocol-Version", "2025-06-18")
+		}
+	}
+	return http.DefaultClient.Do(httpReq)
 }
 
 func readOneSSE(r io.Reader) (sseEvent, error) {

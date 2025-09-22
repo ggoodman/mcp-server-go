@@ -2,16 +2,13 @@ package sessionhosttest
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
@@ -20,45 +17,18 @@ type HostFactory func(t *testing.T) sessions.SessionHost
 
 // RunSessionHostTests runs the complete SessionHost test suite against the provided factory.
 func RunSessionHostTests(t *testing.T, factory HostFactory) {
-	t.Run("Messaging_PublishAndSubscribeFromBeginning", func(t *testing.T) {
-		testPublishAndSubscribeFromBeginning(t, factory)
-	})
-	t.Run("Messaging_PublishAndResumeFromLastEventID", func(t *testing.T) {
-		testPublishAndSubscribeFromLastEventID(t, factory)
-	})
-	t.Run("Messaging_IsolationBetweenSessions", func(t *testing.T) {
-		testSessionIsolation(t, factory)
-	})
-	t.Run("Messaging_SubscriptionContextCancellation", func(t *testing.T) {
-		testSubscriptionContextCancellation(t, factory)
-	})
-	t.Run("Messaging_HandlerErrorStopsSubscription", func(t *testing.T) {
-		testHandlerErrorStopsSubscription(t, factory)
-	})
-	t.Run("Messaging_CleanupSession", func(t *testing.T) {
-		testCleanupSession(t, factory)
-	})
-	t.Run("Messaging_ResumeFromNonExistentEventID", func(t *testing.T) {
-		testResumeFromNonExistentEventID(t, factory)
-	})
-
-	t.Run("Revocation_PreciseRevocationIfSupported", func(t *testing.T) {
-		testPreciseRevocationIfSupported(t, factory)
-	})
-	t.Run("Revocation_EpochBumpIfSupported", func(t *testing.T) {
-		testEpochBumpIfSupported(t, factory)
-	})
-
-	t.Run("ManagerIntegration_CreateLoadDeleteWithJWS", func(t *testing.T) {
-		testManagerIntegrationJWS(t, factory)
-	})
+	t.Run("Messaging_PublishAndSubscribeFromBeginning", func(t *testing.T) { testPublishAndSubscribeFromBeginning(t, factory) })
+	t.Run("Messaging_PublishAndResumeFromLastEventID", func(t *testing.T) { testPublishAndSubscribeFromLastEventID(t, factory) })
+	t.Run("Messaging_IsolationBetweenSessions", func(t *testing.T) { testSessionIsolation(t, factory) })
+	t.Run("Messaging_SubscriptionContextCancellation", func(t *testing.T) { testSubscriptionContextCancellation(t, factory) })
+	t.Run("Messaging_HandlerErrorStopsSubscription", func(t *testing.T) { testHandlerErrorStopsSubscription(t, factory) })
+	t.Run("Messaging_ResumeFromNonExistentEventID", func(t *testing.T) { testResumeFromNonExistentEventID(t, factory) })
 }
 
 // --- Messaging tests ---
 
 func testPublishAndSubscribeFromBeginning(t *testing.T, factory HostFactory) {
 	h := factory(t)
-	defer cleanupHost(t, h)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -129,7 +99,6 @@ func testPublishAndSubscribeFromBeginning(t *testing.T, factory HostFactory) {
 
 func testPublishAndSubscribeFromLastEventID(t *testing.T, factory HostFactory) {
 	h := factory(t)
-	defer cleanupHost(t, h)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -200,7 +169,6 @@ func testPublishAndSubscribeFromLastEventID(t *testing.T, factory HostFactory) {
 
 func testSessionIsolation(t *testing.T, factory HostFactory) {
 	h := factory(t)
-	defer cleanupHost(t, h)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -271,7 +239,6 @@ func testSessionIsolation(t *testing.T, factory HostFactory) {
 
 func testSubscriptionContextCancellation(t *testing.T, factory HostFactory) {
 	h := factory(t)
-	defer cleanupHost(t, h)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -294,7 +261,6 @@ func testSubscriptionContextCancellation(t *testing.T, factory HostFactory) {
 
 func testHandlerErrorStopsSubscription(t *testing.T, factory HostFactory) {
 	h := factory(t)
-	defer cleanupHost(t, h)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -302,11 +268,11 @@ func testHandlerErrorStopsSubscription(t *testing.T, factory HostFactory) {
 	sessionID := "sess-5"
 	req := &jsonrpc.Request{JSONRPCVersion: "2.0", Method: "test/m", ID: jsonrpc.NewRequestID(1)}
 	b, _ := json.Marshal(req)
-	expected := fmt.Errorf("handler error")
+	expectedErr := errors.New("handler error")
 
 	done := make(chan error, 1)
 	go func() {
-		done <- h.SubscribeSession(ctx, sessionID, "", func(ctx context.Context, id string, msg []byte) error { return expected })
+		done <- h.SubscribeSession(ctx, sessionID, "", func(ctx context.Context, id string, msg []byte) error { return expectedErr })
 	}()
 	time.Sleep(100 * time.Millisecond)
 	if _, err := h.PublishSession(ctx, sessionID, b); err != nil {
@@ -315,7 +281,7 @@ func testHandlerErrorStopsSubscription(t *testing.T, factory HostFactory) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, expected) {
+		if !errors.Is(err, expectedErr) {
 			t.Fatalf("expected handler error, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
@@ -323,36 +289,8 @@ func testHandlerErrorStopsSubscription(t *testing.T, factory HostFactory) {
 	}
 }
 
-func testCleanupSession(t *testing.T, factory HostFactory) {
-	h := factory(t)
-	defer cleanupHost(t, h)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	sessionID := "sess-6"
-	req := &jsonrpc.Request{JSONRPCVersion: "2.0", Method: "test/m", ID: jsonrpc.NewRequestID(1)}
-	b, _ := json.Marshal(req)
-
-	ev, err := h.PublishSession(ctx, sessionID, b)
-	if err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	if err := h.CleanupSession(ctx, sessionID); err != nil {
-		t.Fatalf("cleanup: %v", err)
-	}
-
-	subCtx, subCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer subCancel()
-	err = h.SubscribeSession(subCtx, sessionID, ev, func(ctx context.Context, id string, msg []byte) error { t.Fatal("should not receive"); return nil })
-	if err != nil && err != context.DeadlineExceeded {
-		t.Logf("acceptable subscribe error after cleanup: %v", err)
-	}
-}
-
 func testResumeFromNonExistentEventID(t *testing.T, factory HostFactory) {
 	h := factory(t)
-	defer cleanupHost(t, h)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -368,154 +306,8 @@ func testResumeFromNonExistentEventID(t *testing.T, factory HostFactory) {
 
 // --- Revocation tests (optional) ---
 
-func testPreciseRevocationIfSupported(t *testing.T, factory HostFactory) {
-	h := factory(t)
-	defer cleanupHost(t, h)
-	ctx := context.Background()
-
-	sessionID := "sess-8"
-	if err := h.AddRevocation(ctx, sessionID, 2*time.Minute); err != nil {
-		if errors.Is(err, sessions.ErrRevocationUnsupported) {
-			t.Skip("revocation unsupported by host")
-		}
-		t.Fatalf("AddRevocation: %v", err)
-	}
-	revoked, err := h.IsRevoked(ctx, sessionID)
-	if err != nil {
-		t.Fatalf("IsRevoked: %v", err)
-	}
-	if !revoked {
-		t.Fatalf("expected revoked=true")
-	}
-}
-
-func testEpochBumpIfSupported(t *testing.T, factory HostFactory) {
-	h := factory(t)
-	defer cleanupHost(t, h)
-	ctx := context.Background()
-
-	scope := sessions.RevocationScope{UserID: "user-1"}
-	before, err := h.GetEpoch(ctx, scope)
-	if err != nil {
-		if errors.Is(err, sessions.ErrRevocationUnsupported) {
-			t.Skip("epoch unsupported by host")
-			return
-		}
-		// Some hosts may return 0,nil for not-set; tolerate err==nil
-	}
-	after, err := h.BumpEpoch(ctx, scope)
-	if err != nil {
-		if errors.Is(err, sessions.ErrRevocationUnsupported) {
-			t.Skip("epoch unsupported by host")
-			return
-		} else {
-			t.Fatalf("BumpEpoch: %v", err)
-		}
-	}
-	curr, err := h.GetEpoch(ctx, scope)
-	if err != nil {
-		t.Fatalf("GetEpoch: %v", err)
-	}
-	if curr < after {
-		t.Fatalf("expected curr >= after, got curr=%d after=%d", curr, after)
-	}
-	if curr <= before {
-		t.Fatalf("expected curr > before, got curr=%d before=%d", curr, before)
-	}
-}
-
 // --- Manager integration tests ---
-
-func testManagerIntegrationJWS(t *testing.T, factory HostFactory) {
-	h := factory(t)
-	defer cleanupHost(t, h)
-
-	// Setup MemoryJWS with a single active Ed25519 key
-	j := sessioncore.NewMemoryJWS()
-	_, priv, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatalf("ed25519.GenerateKey: %v", err)
-	}
-	j.AddEd25519Key("k1", priv)
-	if err := j.SetActive("k1"); err != nil {
-		t.Fatalf("SetActive: %v", err)
-	}
-
-	issuer := "test-issuer"
-	mgr := sessioncore.NewManager(h, sessioncore.WithJWSSigner(j), sessioncore.WithIssuer(issuer), sessioncore.WithRevocationTTL(5*time.Minute))
-
-	// Create a session for a user; token should embed epoch if supported
-	ctx, cancel := context.WithCancel(context.Background())
-	s, err := mgr.CreateSession(ctx, "user-abc")
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if s.UserID() != "user-abc" {
-		t.Fatalf("unexpected user id: %s", s.UserID())
-	}
-	sid := s.SessionID()
-	if sid == "" {
-		t.Fatalf("empty session id")
-	}
-
-	// Load should validate issuer, epoch, and per-sid revocation if supported
-	s2, err := mgr.LoadSession(ctx, sid, "user-abc")
-	if err != nil {
-		t.Fatalf("LoadSession: %v", err)
-	}
-	if s2.SessionID() != sid {
-		t.Fatalf("sid mismatch")
-	}
-
-	// Messaging round-trip through Session wrapper
-	req := &jsonrpc.Request{JSONRPCVersion: "2.0", Method: "echo", ID: jsonrpc.NewRequestID(1)}
-	b, _ := json.Marshal(req)
-
-	recv := make(chan struct{}, 1)
-	go func() {
-		_ = s2.ConsumeMessages(ctx, "", func(ctx context.Context, id string, msg []byte) error {
-			var got jsonrpc.Request
-			_ = json.Unmarshal(msg, &got)
-			if got.Method == req.Method {
-				recv <- struct{}{}
-			}
-			return nil
-		})
-	}()
-	time.Sleep(50 * time.Millisecond)
-	if err := s2.WriteMessage(ctx, b); err != nil {
-		t.Fatalf("WriteMessage: %v", err)
-	}
-
-	select {
-	case <-recv:
-		cancel() // stop the subscription goroutine
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive message via Session")
-	}
-
-	// Delete should add per-sid revocation, bump epoch (if supported), and cleanup resources
-	if err := mgr.DeleteSession(ctx, sid); err != nil {
-		t.Fatalf("DeleteSession: %v", err)
-	}
-
-	// After delete, Load should fail either due to per-sid revocation or epoch bump
-	if _, err := mgr.LoadSession(ctx, sid, "user-abc"); err == nil {
-		t.Fatal("expected LoadSession to fail after DeleteSession")
-	}
-}
 
 // --- Helpers ---
 
-func cleanupHost(t *testing.T, h sessions.SessionHost) {
-	// Best-effort cleanup for known session IDs used in tests
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	ids := []string{"sess-1", "sess-2", "sess-3a", "sess-3b", "sess-4", "sess-5", "sess-6", "sess-7", "sess-8"}
-	for _, id := range ids {
-		_ = h.CleanupSession(ctx, id)
-	}
-	if closer, ok := h.(interface{ Close() error }); ok {
-		_ = closer.Close()
-	}
-}
+// NOTE: removed legacy cleanup/revocation/JWS manager integration tests as stateful sessions replaced them.
