@@ -60,8 +60,8 @@ func (h *Host) dataKey(sessionID, key string) string {
 func (h *Host) dataScanPattern(sessionID string) string {
 	return h.keyPrefix + "data:" + sessionID + ":*"
 }
-func (h *Host) eventChannel(sessionID, topic string) string {
-	return h.keyPrefix + "evt:" + sessionID + ":" + topic
+func (h *Host) eventStreamKey(sessionID, topic string) string {
+	return h.keyPrefix + "evtstream:" + sessionID + ":" + topic
 }
 
 // --- Messaging via Redis Streams ---
@@ -124,6 +124,8 @@ func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	_, _ = h.client.Del(c, h.metaKey(sessionID)).Result()
 	// delete stream
 	_, _ = h.client.Del(c, h.streamKey(sessionID)).Result()
+	// delete event streams
+	_ = h.deleteByPattern(c, h.keyPrefix+"evtstream:"+sessionID+":*")
 	// delete kv entries
 	_ = h.deleteByPattern(c, h.dataScanPattern(sessionID))
 	return nil
@@ -291,38 +293,60 @@ func (h *Host) deleteByPattern(ctx context.Context, pattern string) error {
 // --- Server-internal event pub/sub using Redis Pub/Sub ---
 
 func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
-	ch := h.eventChannel(sessionID, topic)
-	// PUBLISH returns number of subscribers; we ignore it for best-effort delivery
-	return h.client.Publish(ctx, ch, payload).Err()
+	key := h.eventStreamKey(sessionID, topic)
+	// minimal retention: rely on stream trimming (approximate) to cap size; we don't replay anyway.
+	// Use MAXLEN ~ 1000 (arbitrary) to avoid unbounded growth; config tweak later if needed.
+	// If trimming fails, still deliver event.
+	_, err := h.client.XAdd(ctx, &redis.XAddArgs{Stream: key, Values: map[string]any{"d": payload}, Approx: true, MaxLen: 1000}).Result()
+	return err
 }
 
-func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) (func(), error) {
-	ch := h.eventChannel(sessionID, topic)
-	sub := h.client.Subscribe(ctx, ch)
-	// Ensure subscription is active
-	if _, err := sub.Receive(ctx); err != nil {
-		_ = sub.Close()
-		return nil, err
-	}
-	// Consume messages
+func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) error {
+	key := h.eventStreamKey(sessionID, topic)
+	// First read uses the special "$" ID to mean "only entries added after this call".
+	// Subsequent reads use the last delivered entry ID for strict ordering.
+	started := make(chan struct{})
+	lastID := "$"
 	go func() {
-		defer func() {
-			_ = sub.Close()
-		}()
-		ch := sub.Channel()
+		close(started)
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case msg, ok := <-ch:
-				if !ok {
+			default:
+			}
+			res, err := h.client.XRead(ctx, &redis.XReadArgs{Streams: []string{key, lastID}, Block: 500 * time.Millisecond}).Result()
+			if err != nil {
+				if err == redis.Nil || errors.Is(err, context.DeadlineExceeded) {
+					continue
+				}
+				select {
+				case <-time.After(100 * time.Millisecond):
+				case <-ctx.Done():
 					return
 				}
-				// Best-effort handler; ignore errors to keep subscription alive
-				_ = handler(ctx, []byte(msg.Payload))
+				continue
+			}
+			if len(res) == 0 || len(res[0].Messages) == 0 {
+				continue
+			}
+			for _, m := range res[0].Messages {
+				lastID = m.ID
+				var payload []byte
+				switch v := m.Values["d"].(type) {
+				case string:
+					payload = []byte(v)
+				case []byte:
+					payload = v
+				default:
+					payload = []byte(fmt.Sprintf("%v", v))
+				}
+				if err := handler(ctx, payload); err != nil {
+					return
+				}
 			}
 		}
 	}()
-	unsubscribe := func() { _ = sub.Close() }
-	return unsubscribe, nil
+	<-started
+	return nil
 }

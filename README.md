@@ -164,7 +164,9 @@ defer host.Close()
 ```
 
 - Ordered per-session message delivery with resume from `Last-Event-ID`.
-- Cross-instance server-internal events for coordination when needed.
+- Cross-instance server-internal events for coordination: ordered, future-only
+    fan-out per (session, topic). All current subscribers observe every event
+    published after they subscribe (at-least-once). Minimal retention; no replay.
 - Epoch-based invalidation helpers and revocation markers.
 
 For single-process dev and tests, use the in-memory host:

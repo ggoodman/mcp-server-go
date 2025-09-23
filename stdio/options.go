@@ -42,16 +42,7 @@ func WithWriter(w io.Writer) Option {
 func WithLogger(l *slog.Logger) Option {
 	return func(h *Handler) {
 		if l != nil {
-			h.l = l
-		}
-	}
-}
-
-// WithUserProvider overrides the user provider used for authless identification.
-func WithUserProvider(up UserProvider) Option {
-	return func(h *Handler) {
-		if up != nil {
-			h.userProvider = up
+			h.log = l
 		}
 	}
 }

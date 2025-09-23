@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,12 @@ func RunSessionHostTests(t *testing.T, factory HostFactory) {
 	t.Run("Messaging_SubscriptionContextCancellation", func(t *testing.T) { testSubscriptionContextCancellation(t, factory) })
 	t.Run("Messaging_HandlerErrorStopsSubscription", func(t *testing.T) { testHandlerErrorStopsSubscription(t, factory) })
 	t.Run("Messaging_ResumeFromNonExistentEventID", func(t *testing.T) { testResumeFromNonExistentEventID(t, factory) })
+
+	// Event fan-out semantics
+	t.Run("Events_FanOut_AllSubscribersReceiveAllFuture", func(t *testing.T) { testEventsFanOutAllSubscribersReceiveAllFuture(t, factory) })
+	t.Run("Events_LateSubscriberOnlySeesLaterEvents", func(t *testing.T) { testEventsLateSubscriber(t, factory) })
+	t.Run("Events_HandlerErrorTerminatesOnlyThatSubscriber", func(t *testing.T) { testEventsHandlerError(t, factory) })
+	t.Run("Events_CancellationStopsSubscription", func(t *testing.T) { testEventsCancellation(t, factory) })
 }
 
 // --- Messaging tests ---
@@ -302,6 +309,183 @@ func testResumeFromNonExistentEventID(t *testing.T, factory HostFactory) {
 	if err == nil {
 		t.Logf("subscribe returned nil for non-existent event id; acceptable if no messages were delivered until deadline")
 	}
+}
+
+// --- Event tests ---
+
+func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sessionID := "ev-sess-1"
+	topic := "t1"
+
+	const n = 5
+	type rec struct {
+		mu     sync.Mutex
+		events [][]byte
+	}
+	var r1, r2 rec
+
+	subCtx1, cancel1 := context.WithCancel(ctx)
+	if err := h.SubscribeEvents(subCtx1, sessionID, topic, func(c context.Context, p []byte) error {
+		r1.mu.Lock()
+		r1.events = append(r1.events, append([]byte(nil), p...))
+		r1.mu.Unlock()
+		if len(r1.events) == n {
+			cancel1()
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe 1: %v", err)
+	}
+	defer cancel1()
+	subCtx2, cancel2 := context.WithCancel(ctx)
+	if err := h.SubscribeEvents(subCtx2, sessionID, topic, func(c context.Context, p []byte) error {
+		r2.mu.Lock()
+		r2.events = append(r2.events, append([]byte(nil), p...))
+		r2.mu.Unlock()
+		if len(r2.events) == n {
+			cancel2()
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe 2: %v", err)
+	}
+	defer cancel2()
+
+	// Publish immediately after subscriptions become active (implementation must ensure no missed events)
+	for i := 0; i < n; i++ {
+		if err := h.PublishEvent(ctx, sessionID, topic, []byte(strconv.Itoa(i))); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+
+	<-subCtx1.Done()
+	<-subCtx2.Done()
+
+	r1.mu.Lock()
+	c1 := len(r1.events)
+	r1.mu.Unlock()
+	r2.mu.Lock()
+	c2 := len(r2.events)
+	r2.mu.Unlock()
+	if c1 != n || c2 != n {
+		t.Fatalf("expected %d events each; got %d and %d", n, c1, c2)
+	}
+	// Ordering check
+	for i := 0; i < n; i++ {
+		exp := strconv.Itoa(i)
+		if string(r1.events[i]) != exp || string(r2.events[i]) != exp {
+			t.Fatalf("ordering mismatch at %d", i)
+		}
+	}
+}
+
+func testEventsLateSubscriber(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sessionID := "ev-sess-2"
+	topic := "t2"
+	const first = 3
+	const second = 4
+	type rec struct {
+		mu     sync.Mutex
+		events [][]byte
+	}
+	var rEarly, rLate rec
+
+	earlyCtx, earlyCancel := context.WithCancel(ctx)
+	if err := h.SubscribeEvents(earlyCtx, sessionID, topic, func(c context.Context, p []byte) error {
+		rEarly.mu.Lock()
+		rEarly.events = append(rEarly.events, append([]byte(nil), p...))
+		rEarly.mu.Unlock()
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe early: %v", err)
+	}
+	defer earlyCancel()
+
+	// Publish first batch (late subscriber should NOT get these)
+	for i := 0; i < first; i++ {
+		if err := h.PublishEvent(ctx, sessionID, topic, []byte("A"+strconv.Itoa(i))); err != nil {
+			t.Fatalf("publish pre %d: %v", i, err)
+		}
+	}
+
+	lateCtx, lateCancel := context.WithCancel(ctx)
+	if err := h.SubscribeEvents(lateCtx, sessionID, topic, func(c context.Context, p []byte) error {
+		rLate.mu.Lock()
+		rLate.events = append(rLate.events, append([]byte(nil), p...))
+		rLate.mu.Unlock()
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe late: %v", err)
+	}
+
+	for i := 0; i < second; i++ {
+		if err := h.PublishEvent(ctx, sessionID, topic, []byte("B"+strconv.Itoa(i))); err != nil {
+			t.Fatalf("publish post %d: %v", i, err)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	earlyCancel()
+	lateCancel()
+
+	rEarly.mu.Lock()
+	e1 := len(rEarly.events)
+	rEarly.mu.Unlock()
+	rLate.mu.Lock()
+	e2 := len(rLate.events)
+	rLate.mu.Unlock()
+	if e1 != first+second {
+		t.Fatalf("early expected %d events got %d", first+second, e1)
+	}
+	if e2 != second {
+		t.Fatalf("late expected %d events got %d", second, e2)
+	}
+}
+
+func testEventsHandlerError(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	sessionID := "ev-sess-3"
+	topic := "t3"
+	errSentinel := errors.New("handler boom")
+	var gotSecond bool
+	subCtx, subCancel := context.WithCancel(ctx)
+	defer subCancel()
+	if err := h.SubscribeEvents(subCtx, sessionID, topic, func(c context.Context, p []byte) error {
+		if string(p) == "1" {
+			gotSecond = true
+		}
+		return errSentinel
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	// First publish triggers error, second may or may not be delivered depending on timing but should not cause panic.
+	_ = h.PublishEvent(ctx, sessionID, topic, []byte("0"))
+	_ = h.PublishEvent(ctx, sessionID, topic, []byte("1"))
+	time.Sleep(100 * time.Millisecond)
+	if gotSecond {
+		t.Logf("second event delivered after handler error (acceptable at-least-once)")
+	}
+}
+
+func testEventsCancellation(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	sessionID := "ev-sess-4"
+	topic := "t4"
+	if err := h.SubscribeEvents(ctx, sessionID, topic, func(c context.Context, p []byte) error { return nil }); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	// Just wait for context deadline
+	<-ctx.Done()
 }
 
 // --- Revocation tests (optional) ---

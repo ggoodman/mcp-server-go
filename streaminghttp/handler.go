@@ -505,8 +505,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	logger.InfoContext(ctx, "auth.ok")
 
 	var raw json.RawMessage
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&raw); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		logger.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
 		return
@@ -733,7 +732,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	lastEventID := r.Header.Get(lastEventIDHeader)
 
 	const resourcesListChangedTopic = string(mcp.ResourcesListChangedNotificationMethod)
-	unsub, subErr := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+	if err := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesListChangedTopic, func(evtCtx context.Context, payload []byte) error {
 		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
 		b, err := json.Marshal(n)
 		if err != nil {
@@ -741,16 +740,14 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
 		return err
-	})
-	if subErr != nil {
+	}); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.resources_list_changed.fail", slog.String("err", subErr.Error()))
+		logger.ErrorContext(ctx, "subscribe.resources_list_changed.fail", slog.String("err", err.Error()))
 		return
 	}
-	defer unsub()
 
 	const resourcesUpdatedTopic = string(mcp.ResourcesUpdatedNotificationMethod)
-	unsubUpdated, subUpdatedErr := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesUpdatedTopic, func(evtCtx context.Context, payload []byte) error {
+	if err := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesUpdatedTopic, func(evtCtx context.Context, payload []byte) error {
 		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod), Params: payload}
 		b, err := json.Marshal(n)
 		if err != nil {
@@ -758,16 +755,14 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
 		return err
-	})
-	if subUpdatedErr != nil {
+	}); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.resources_updated.fail", slog.String("err", subUpdatedErr.Error()))
+		logger.ErrorContext(ctx, "subscribe.resources_updated.fail", slog.String("err", err.Error()))
 		return
 	}
-	defer unsubUpdated()
 
 	const toolsListChangedTopic = string(mcp.ToolsListChangedNotificationMethod)
-	unsubTools, subToolsErr := h.sessionHost.SubscribeEvents(ctx, sessionID, toolsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+	if err := h.sessionHost.SubscribeEvents(ctx, sessionID, toolsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
 		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListChangedNotificationMethod)}
 		b, err := json.Marshal(n)
 		if err != nil {
@@ -775,16 +770,14 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
 		return err
-	})
-	if subToolsErr != nil {
+	}); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.tools_list_changed.fail", slog.String("err", subToolsErr.Error()))
+		logger.ErrorContext(ctx, "subscribe.tools_list_changed.fail", slog.String("err", err.Error()))
 		return
 	}
-	defer unsubTools()
 
 	const promptsListChangedTopic = string(mcp.PromptsListChangedNotificationMethod)
-	unsubPrompts, subPromptsErr := h.sessionHost.SubscribeEvents(ctx, sessionID, promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
+	if err := h.sessionHost.SubscribeEvents(ctx, sessionID, promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
 		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListChangedNotificationMethod)}
 		b, err := json.Marshal(n)
 		if err != nil {
@@ -792,13 +785,11 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		}
 		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
 		return err
-	})
-	if subPromptsErr != nil {
+	}); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.prompts_list_changed.fail", slog.String("err", subPromptsErr.Error()))
+		logger.ErrorContext(ctx, "subscribe.prompts_list_changed.fail", slog.String("err", err.Error()))
 		return
 	}
-	defer unsubPrompts()
 
 	_ = h.sessionHost.PublishEvent(ctx, sessionID, "streaminghttp/ready", nil)
 

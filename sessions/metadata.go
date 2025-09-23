@@ -39,9 +39,8 @@ type MetadataClientInfo struct {
 }
 
 // SessionMetadata is the authoritative persisted representation of an MCP
-// session. It intentionally excludes any revocation epochs or embedded JWS
-// fields from the legacy design; invalidation and lifetime are handled via
-// stored flags + TTL semantics in the host.
+// session. Invalidation and lifetime are handled via stored flags + TTL
+// semantics in the host.
 //
 // Fields marked immutable must not be changed after creation (enforced at the
 // manager layer when the refactor lands). Timestamps are wall-clock times in

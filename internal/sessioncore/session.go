@@ -156,7 +156,7 @@ func (r *rootsCap) RegisterRootsListChangedListener(ctx context.Context, listene
 	if !r.subscribed {
 		topic := string(mcp.RootsListChangedNotificationMethod)
 		subCtx, cancel := context.WithCancel(context.Background()) // detached parent; stored for later explicit cancellation
-		_, err := r.h.host.SubscribeEvents(subCtx, r.h.id, topic, func(c context.Context, _ []byte) error {
+		err := r.h.host.SubscribeEvents(subCtx, r.h.id, topic, func(c context.Context, _ []byte) error {
 			r.notifyListeners(context.Background())
 			return nil
 		})

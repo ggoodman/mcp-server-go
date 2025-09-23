@@ -416,15 +416,14 @@ func TestMultiInstance(t *testing.T) {
 		// Step 3: Coordinate on server-side readiness, then publish once
 		ctx := t.Context()
 		readyCh := make(chan struct{}, 1)
-		unsub, err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+		if err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
 			select {
 			case readyCh <- struct{}{}:
 			default:
 			}
 			return nil
-		})
-		if err == nil && unsub != nil {
-			defer unsub()
+		}); err != nil {
+			t.Fatalf("subscribe ready: %v", err)
 		}
 		select {
 		case <-readyCh:

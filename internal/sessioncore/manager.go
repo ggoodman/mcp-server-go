@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
 
-	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
@@ -31,9 +29,9 @@ type Manager struct {
 	fallbackCounter atomic.Uint64
 }
 
-// New constructs a Manager with the provided host. Options can adjust
+// NewManager constructs a Manager with the provided host. Options can adjust
 // defaults; if ttl is zero a 24h default is applied.
-func New(host sessions.SessionHost, opts ...ManagerOption) *Manager {
+func NewManager(host sessions.SessionHost, opts ...ManagerOption) *Manager {
 	m := &Manager{Host: host, ttl: 24 * time.Hour, Logger: slog.Default()}
 	for _, opt := range opts {
 		opt(m)
@@ -113,8 +111,7 @@ func (m *Manager) CreateSession(ctx context.Context, userID string, protocolVers
 }
 
 // LoadSession loads an existing session (verifying ownership) and returns a handle.
-// unknown param retained for forward compatibility (placeholder for token-originated issuer, etc.).
-func (m *Manager) LoadSession(ctx context.Context, sessID string, userID string, _ string) (*SessionHandle, error) {
+func (m *Manager) LoadSession(ctx context.Context, sessID string, userID string) (*SessionHandle, error) {
 	if m == nil || m.Host == nil {
 		return nil, fmt.Errorf("session manager not initialized")
 	}
@@ -157,128 +154,6 @@ func (m *Manager) DeleteSession(ctx context.Context, sessID string) error {
 		m.Logger.InfoContext(ctx, "session.delete.ok", slog.String("session_id", sessID), slog.Duration("dur", time.Since(start)))
 	}
 	return nil
-}
-
-// DeliverResponse publishes a JSON-RPC response (received via transport POST)
-// onto the server-internal event bus so any waiting outbound call can resume.
-// Safe for concurrent use; silently ignores nil or responses without ID.
-func (m *Manager) DeliverResponse(ctx context.Context, sessID string, resp *jsonrpc.Response) error {
-	if resp == nil || resp.ID == nil {
-		return nil
-	}
-	if m.Logger != nil {
-		m.Logger.InfoContext(ctx, "rpc.deliver_response", slog.String("session_id", sessID), slog.String("request_id", resp.ID.String()))
-	}
-	b, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	topic := rpcResponseTopic(resp.ID.String())
-	return m.Host.PublishEvent(ctx, sessID, topic, b)
-}
-
-// --- Outbound client RPC plumbing ---
-
-// clientCall emits a server->client JSON-RPC request and blocks for a response
-// or context cancellation. Result JSON is decoded into out if non-nil.
-func (m *Manager) clientCall(ctx context.Context, h *SessionHandle, method string, params any, out any) error {
-	// Build random request id (unguessable & unique). If entropy fails, fallback to incrementing counter.
-	var rid string
-	if id, err := randomID(); err == nil {
-		rid = id
-	} else {
-		rid = fmt.Sprintf("r-%d", m.fallbackCounter.Add(1))
-	}
-	start := time.Now()
-	if m.Logger != nil {
-		m.Logger.InfoContext(ctx, "rpc.outbound.start", slog.String("session_id", h.id), slog.String("request_id", rid), slog.String("method", method))
-	}
-
-	// Pre-subscribe to response topic.
-	topic := rpcResponseTopic(rid)
-	respCh := make(chan []byte, 1)
-	subCtx, cancel := context.WithCancel(ctx)
-	unsub, err := m.Host.SubscribeEvents(subCtx, h.id, topic, func(ctx context.Context, payload []byte) error {
-		select {
-		case respCh <- append([]byte(nil), payload...):
-		default:
-		}
-		return nil
-	})
-	if err != nil {
-		cancel()
-		return fmt.Errorf("subscribe response: %w", err)
-	}
-	defer func() {
-		unsub()
-		cancel()
-	}()
-
-	// Marshal params
-	var paramsRaw json.RawMessage
-	if params != nil {
-		b, err := json.Marshal(params)
-		if err != nil {
-			return fmt.Errorf("marshal params: %w", err)
-		}
-		paramsRaw = b
-	}
-	// Construct request (string id)
-	id := jsonrpc.NewRequestID(rid)
-	req := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: method, Params: paramsRaw, ID: id}
-	rawReq, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
-	}
-	// Opportunistic direct write (stream-first semantics). If a direct writer is
-	// installed and succeeds, we skip durable publish (original semantics). If it
-	// fails, fall back to durable publish so the client can still recover via GET.
-	if ok, derr := h.tryDirectWrite(ctx, rawReq); ok {
-		if derr != nil { // fallback to durability on error
-			if _, err := m.Host.PublishSession(ctx, h.id, rawReq); err != nil {
-				return fmt.Errorf("publish request after direct write failure: %w (direct error: %v)", err, derr)
-			}
-		}
-	} else { // no direct writer
-		if _, err := m.Host.PublishSession(ctx, h.id, rawReq); err != nil {
-			return fmt.Errorf("publish request: %w", err)
-		}
-	}
-
-	// Await response or cancellation
-	select {
-	case <-ctx.Done():
-		if m.Logger != nil {
-			m.Logger.InfoContext(ctx, "rpc.outbound.cancel", slog.String("session_id", h.id), slog.String("request_id", rid), slog.String("method", method))
-		}
-		return ctx.Err()
-	case raw := <-respCh:
-		var resp jsonrpc.Response
-		if err := json.Unmarshal(raw, &resp); err != nil {
-			if m.Logger != nil {
-				m.Logger.ErrorContext(ctx, "rpc.outbound.decode_error", slog.String("session_id", h.id), slog.String("request_id", rid), slog.String("method", method), slog.String("err", err.Error()))
-			}
-			return fmt.Errorf("decode response: %w", err)
-		}
-		if resp.Error != nil {
-			if m.Logger != nil {
-				m.Logger.InfoContext(ctx, "rpc.outbound.error", slog.String("session_id", h.id), slog.String("request_id", rid), slog.String("method", method), slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message), slog.Duration("dur", time.Since(start)))
-			}
-			return fmt.Errorf("client error (%d): %s", resp.Error.Code, resp.Error.Message)
-		}
-		if out != nil && resp.Result != nil {
-			if err := json.Unmarshal(resp.Result, out); err != nil {
-				if m.Logger != nil {
-					m.Logger.ErrorContext(ctx, "rpc.outbound.result_decode_error", slog.String("session_id", h.id), slog.String("request_id", rid), slog.String("method", method), slog.String("err", err.Error()))
-				}
-				return fmt.Errorf("decode result: %w", err)
-			}
-		}
-		if m.Logger != nil {
-			m.Logger.InfoContext(ctx, "rpc.outbound.ok", slog.String("session_id", h.id), slog.String("request_id", rid), slog.String("method", method), slog.Duration("dur", time.Since(start)))
-		}
-		return nil
-	}
 }
 
 // rpcResponseTopic returns the server-internal event topic used to rendezvous a response id.
