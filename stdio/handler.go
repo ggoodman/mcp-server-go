@@ -146,6 +146,7 @@ func (h *Handler) Serve(ctx context.Context) error {
 				continue
 			}
 
+			// Handle the notification asynchronously to allow concurrent processing
 			go func() {
 				err := h.eng.HandleNotification(ctx, sessID, userID, req)
 				if err != nil {

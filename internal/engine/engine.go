@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
@@ -21,6 +22,7 @@ const defaultSessionTTL = 1 * time.Hour
 const defaultSessionMaxLifetime = 24 * time.Hour
 
 var (
+	ErrCancelled       = errors.New("operation cancelled")
 	ErrSessionNotFound = errors.New("session not found")
 	ErrInvalidUserID   = errors.New("invalid user id")
 	ErrInternal        = errors.New("internal error")
@@ -38,6 +40,15 @@ type Engine struct {
 	// session config
 	sessionTTL         time.Duration
 	sessionMaxLifetime time.Duration
+
+	// tool call tracking
+	toolCtxMu      sync.Mutex
+	toolCtxCancels map[string]context.CancelFunc // reqID -> cancel func
+
+	// rendez-vous tracking
+	rdvMu      sync.Mutex
+	rdvChans   map[string]chan []byte // reqID -> response channel
+	rdvClosers map[string]func()      // reqID -> close function
 }
 
 func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opts ...EngineOption) *Engine {
@@ -71,42 +82,125 @@ func WithLogger(l *slog.Logger) EngineOption {
 	}
 }
 
-func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *jsonrpc.Request) (*jsonrpc.Response, error) {
-	start := time.Now()
-	sess, err := e.loadSession(ctx, sessID, userID)
+func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *jsonrpc.Request, requestScopedWriter MessageWriter) (*jsonrpc.Response, error) {
+	sess, err := e.loadSession(ctx, sessID, userID, requestScopedWriter, NewMessageWriterFunc(
+		func(ctx context.Context, msg jsonrpc.Message) error {
+			_, err := e.host.PublishSession(ctx, sessID, msg)
+			return err
+		},
+	))
 	if err != nil {
 		return nil, err
 	}
 
-	log := logctx.Enrich(ctx, e.log.With(
-		slog.String("session_id", sess.SessionID()),
-		slog.String("user_id", sess.userID),
-		slog.String("method", req.Method),
-	))
+	ctx = logctx.WithSessionID(ctx, sess.SessionID())
+	ctx = logctx.WithUserID(ctx, sess.userID)
 
 	switch req.Method {
 	case string(mcp.LoggingSetLevelMethod):
-		var params mcp.SetLevelRequest
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
-		}
-
-		switch params.Level {
-		case mcp.LoggingLevelDebug, mcp.LoggingLevelInfo, mcp.LoggingLevelNotice,
-			mcp.LoggingLevelWarning, mcp.LoggingLevelError, mcp.LoggingLevelCritical,
-			mcp.LoggingLevelAlert, mcp.LoggingLevelEmergency:
-			sess.logLevel = params.Level
-			log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
-			return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
-		default:
-			log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
-		}
-
+		return e.handleSetLoggingLevel(ctx, sess, req)
+	case string(mcp.ToolsCallMethod):
+		return e.handleToolCall(ctx, sess, req, requestScopedWriter)
 	}
 
 	return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "not implemented", nil), nil
+}
+
+func (e *Engine) handleSetLoggingLevel(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+	var params mcp.SetLevelRequest
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	cap, ok, err := e.srv.GetLoggingCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging level not supported", nil), nil
+	}
+	if cap == nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", "nil capability"))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	if err := cap.SetLevel(ctx, sess, params.Level); err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+}
+
+func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request, writer MessageWriter) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.CallToolRequestReceived
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	cap, ok, err := e.srv.GetToolsCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging level not supported", nil), nil
+	}
+	if cap == nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", "nil capability"))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	// Before delegating to the tools capability, we need to set up up some local tracking state.
+	// Any instance may receive a cancellation notification that will get routed through the
+	// host's internal event system. We need to set up a rendez-vous so that when the consumer loop
+	// sees a cancellation, it can find the right context to cancel.
+
+	reqID := req.ID.String()
+	if reqID == "" {
+		// This should never happen; the JSON-RPC library should enforce this.
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", "missing request ID"))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidRequest, "missing request ID", nil), nil
+	}
+
+	toolCtx, toolCancel := context.WithCancel(ctx)
+	defer toolCancel()
+
+	e.toolCtxMu.Lock()
+	if _, exists := e.toolCtxCancels[reqID]; exists {
+		// This should never happen; request IDs are unique per session.
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", "duplicate request ID"))
+		e.toolCtxMu.Unlock()
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	e.toolCtxCancels[reqID] = toolCancel
+	e.toolCtxMu.Unlock()
+
+	defer func() {
+		e.toolCtxMu.Lock()
+		delete(e.toolCtxCancels, reqID)
+		e.toolCtxMu.Unlock()
+	}()
+
+	res, err := cap.CallTool(toolCtx, sess, &params)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+
+	return jsonrpc.NewResultResponse(req.ID, res)
 }
 
 // HandleNotification processes an incoming JSON-RPC notification from a client.
@@ -114,7 +208,7 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 // actually handling the notification itself. The actual handling is done in the consumer loop
 // for these messages.
 func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, note *jsonrpc.Request) error {
-	sess, err := e.loadSession(ctx, sessID, userID)
+	sess, err := e.loadSession(ctx, sessID, userID, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -184,13 +278,19 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 		// TODO: Wire up roots capability here.
 	}
 	if metaRec.Capabilities.Elicitation {
+
 		// TODO: Wire up elicitation capability here.
 	}
 
 	return NewSessionHandle(e.host, metaRec, opts...), nil
 }
 
-func (e *Engine) loadSession(ctx context.Context, sessID, userID string) (*SessionHandle, error) {
+// loadSession retrieves and validates session metadata, returning a handle.
+// It verifies the session belongs to the specified user and is not revoked.
+// It also performs a best-effort TTL touch. If a writers are provided, it sets
+// up capabilities according to the session's negotiated capabilities and
+// leverages the relevant writers for outbound messages.
+func (e *Engine) loadSession(ctx context.Context, sessID, userID string, requestScopedWriter MessageWriter, sessionScopedWriter MessageWriter) (*SessionHandle, error) {
 	start := time.Now()
 	metaRec, err := e.host.GetSession(ctx, sessID)
 	if err != nil {
@@ -207,17 +307,68 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string) (*Sessi
 	e.log.InfoContext(ctx, "engine.load_session.ok", slog.String("session_id", sessID), slog.String("user_id", userID), slog.Duration("dur", time.Since(start)))
 
 	opts := []SessionHandleOption{}
-	if metaRec.Capabilities.Sampling {
-		// TODO: Wire up sampling capability here.
-	}
-	if metaRec.Capabilities.Roots {
-		// TODO: Wire up roots capability here.
-	}
-	if metaRec.Capabilities.Elicitation {
-		// TODO: Wire up elicitation capability here.
+
+	if requestScopedWriter != nil && sessionScopedWriter != nil {
+		if metaRec.Capabilities.Sampling {
+			opts = append(opts, WithSamplingCapability(&samplingCapabilty{
+				eng:                 e,
+				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "sampling")),
+				sessID:              sessID,
+				userID:              userID,
+				requestScopedWriter: requestScopedWriter,
+				sessionScopedWriter: sessionScopedWriter,
+			}))
+		}
+		if metaRec.Capabilities.Roots {
+			// TODO: Wire up roots capability here.
+		}
+		if metaRec.Capabilities.Elicitation {
+			// TODO: Wire up elicitation capability here.
+		}
 	}
 
 	return NewSessionHandle(e.host, metaRec, opts...), nil
+}
+
+func (e *Engine) cancelToolCall(reqID string) {
+	e.toolCtxMu.Lock()
+	cancel, exists := e.toolCtxCancels[reqID]
+	e.toolCtxMu.Unlock()
+	if exists && cancel != nil {
+		cancel()
+	}
+}
+
+// createRendezVous creates a rendez-vous channel for a given request ID. The
+// returned channel will receive a single message (the response) and then be closed.
+// The returned close function MUST be called to clean up resources associated
+// with the rendez-vous once it is no longer needed.
+func (e *Engine) createRendezVous(reqID string) (<-chan []byte, func()) {
+	recvCh := make(chan []byte)
+	closeCh := func() {
+		close(recvCh)
+	}
+
+	e.rdvMu.Lock()
+	if e.rdvChans == nil {
+		e.rdvChans = make(map[string]chan []byte)
+	}
+	if e.rdvClosers == nil {
+		e.rdvClosers = make(map[string]func())
+	}
+	e.rdvChans[reqID] = recvCh
+	e.rdvClosers[reqID] = closeCh
+	e.rdvMu.Unlock()
+
+	return recvCh, func() {
+		e.rdvMu.Lock()
+		if closer, exists := e.rdvClosers[reqID]; exists && closer != nil {
+			delete(e.rdvClosers, reqID)
+			closer()
+		}
+		delete(e.rdvChans, reqID)
+		e.rdvMu.Unlock()
+	}
 }
 
 func topicForSessionFanout(sessID string) string {
@@ -240,4 +391,13 @@ func newSessionID() (string, error) {
 		return "", err
 	}
 	return "sess-" + id, nil
+}
+
+// newClientMessageID returns a cryptographically random client message id with a prefix.
+func newClientMessageID() (string, error) {
+	id, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	return "req-" + id, nil
 }
