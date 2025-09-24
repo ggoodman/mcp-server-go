@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -100,6 +102,27 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 		t.Fatalf("missing session id")
 	}
 
+	// Per MCP lifecycle, after successful initialization the client MUST send
+	// a notifications/initialized before beginning normal operations.
+	initNote := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  string(mcp.InitializedNotificationMethod),
+	}
+	nb, _ := json.Marshal(initNote)
+	nreq, _ := http.NewRequestWithContext(ctx, http.MethodPost, srvA.URL+"/", bytes.NewReader(nb))
+	nreq.Header.Set("Authorization", "Bearer x")
+	nreq.Header.Set("Content-Type", "application/json")
+	nreq.Header.Set("mcp-session-id", sessID)
+	nresp, err := http.DefaultClient.Do(nreq)
+	if err != nil {
+		t.Fatalf("initialized A: %v", err)
+	}
+	// Expect 202 Accepted for notifications
+	if nresp.StatusCode != http.StatusAccepted {
+		t.Fatalf("initialized status: %d", nresp.StatusCode)
+	}
+	nresp.Body.Close()
+
 	// Attach GET stream to B (demonstrates cross-node delivery)
 	respCh := make(chan *http.Response, 1)
 	errCh := make(chan error, 1)
@@ -138,41 +161,64 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe A: %v", err)
 	}
-	sresp.Body.Close()
+	// Read one SSE frame (the JSON-RPC response) as a readiness barrier
+	if err := readOneSSEResponse(ctx, sresp.Body); err != nil {
+		t.Fatalf("subscribe response read: %v", err)
+	}
 
-	// Trigger update on A
-	static.ReplaceAllContents(ctx, map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v2"}}})
-
-	// Expect resources/updated on B
+	// Start a reader goroutine to decode SSE data events from B
 	scanner := bufio.NewScanner(getResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	var gotUpdated bool
-	for !gotUpdated {
-		select {
-		case <-deadline.C:
-			getResp.Body.Close()
-			t.Fatalf("timeout waiting for updated on B")
-		default:
+	events := make(chan map[string]any, 16)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(events)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+			var m map[string]any
+			if err := json.Unmarshal([]byte(payload), &m); err == nil {
+				select {
+				case events <- m:
+				default:
+					// drop if buffer full
+				}
+			}
 		}
-		if !scanner.Scan() {
-			time.Sleep(10 * time.Millisecond)
-			continue
+		if err := scanner.Err(); err != nil {
+			errs <- err
 		}
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		var m map[string]any
-		if err := json.Unmarshal([]byte(payload), &m); err != nil {
-			continue
-		}
-		if method, _ := m["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
-			gotUpdated = true
+	}()
+
+	// Trigger update on A and expect resources/updated on B within a reasonable bound
+	static.ReplaceAllContents(ctx, map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v2"}}})
+	{
+		timeout := time.NewTimer(2 * time.Second)
+		defer timeout.Stop()
+		for {
+			select {
+			case <-timeout.C:
+				getResp.Body.Close()
+				t.Fatalf("timeout waiting for updated on B")
+			case err := <-errs:
+				if err != nil {
+					t.Fatalf("stream error: %v", err)
+				}
+			case ev, ok := <-events:
+				if !ok {
+					// stream closed unexpectedly
+					t.Fatalf("stream closed")
+				}
+				if method, _ := ev["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
+					goto afterFirstUpdate
+				}
+			}
 		}
 	}
+afterFirstUpdate:
 
 	// Unsubscribe via POST to B
 	unsubBody := map[string]any{"jsonrpc": "2.0", "id": "3", "method": string(mcp.ResourcesUnsubscribeMethod), "params": map[string]any{"uri": "res://x"}}
@@ -185,32 +231,73 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unsubscribe B: %v", err)
 	}
-	uresp.Body.Close()
+	// Read one SSE frame (the JSON-RPC response) as the deterministic unsubscribe barrier
+	if err := readOneSSEResponse(ctx, uresp.Body); err != nil {
+		t.Fatalf("unsubscribe response read: %v", err)
+	}
 
-	// Trigger another update on A and ensure no more updates are received on B shortly thereafter
+	// Unsubscribe propagation is deterministic via fences; trigger another update
+	// and assert that no resources/updated arrives within a short bound.
 	static.ReplaceAllContents(ctx, map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v3"}}})
-	short := time.NewTimer(250 * time.Millisecond)
-	defer short.Stop()
-	for {
-		select {
-		case <-short.C:
-			getResp.Body.Close()
-			return
-		default:
-		}
-		if !scanner.Scan() {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		if line := scanner.Text(); strings.HasPrefix(line, "data: ") {
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-			var m map[string]any
-			if err := json.Unmarshal([]byte(payload), &m); err == nil {
-				if method, _ := m["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
+	{
+		timeout := time.NewTimer(250 * time.Millisecond)
+		defer timeout.Stop()
+		for {
+			select {
+			case <-timeout.C:
+				getResp.Body.Close()
+				return
+			case err := <-errs:
+				if err != nil {
+					t.Fatalf("stream error: %v", err)
+				}
+			case ev, ok := <-events:
+				if !ok {
+					getResp.Body.Close()
+					return
+				}
+				if method, _ := ev["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
 					getResp.Body.Close()
 					t.Fatalf("received updated after unsubscribe on B")
 				}
 			}
+		}
+	}
+}
+
+// readOneSSEResponse reads a single SSE "data:" frame and returns when a JSON
+// object is decoded. It closes the body.
+func readOneSSEResponse(ctx context.Context, body io.ReadCloser) error {
+	defer body.Close()
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timeout waiting for SSE response")
+		default:
+		}
+		if !scanner.Scan() {
+			// small yield
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		var m map[string]any
+		if err := json.Unmarshal([]byte(payload), &m); err == nil {
+			// minimal validation
+			if _, hasErr := m["error"]; hasErr {
+				return fmt.Errorf("rpc error: %s", payload)
+			}
+			return nil
 		}
 	}
 }

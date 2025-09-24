@@ -8,6 +8,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 var _ sessions.SamplingCapability = (*samplingCapabilty)(nil)
@@ -23,11 +24,7 @@ type samplingCapabilty struct {
 
 // CreateMessage implements sessions.SamplingCapability.
 func (s *samplingCapabilty) CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
-	reqID, err := newClientMessageID()
-	if err != nil {
-		s.log.Error("sampling.create_message.err", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
-		return nil, ErrInternal
-	}
+	reqID := uuid.NewString()
 
 	params, err := json.Marshal(req)
 	if err != nil {

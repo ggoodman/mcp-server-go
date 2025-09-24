@@ -10,6 +10,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 var _ sessions.ElicitationCapability = (*elicitationCapability)(nil)
@@ -42,12 +43,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, target 
 	}
 
 	// Build client request
-	reqID, err := newClientMessageID()
-	if err != nil {
-		c.log.Error("elicitation.create.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
-		return sessions.ElicitActionCancel, ErrInternal
-	}
-
+	reqID := uuid.NewString()
 	params, err := json.Marshal(mcp.ElicitRequest{Message: text, RequestedSchema: *schema})
 	if err != nil {
 		c.log.Error("elicitation.create.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))

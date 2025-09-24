@@ -9,10 +9,10 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-jose/go-jose/v4 v4.0.5
 	github.com/golang-jwt/jwt/v5 v5.3.0
+	github.com/google/uuid v1.6.0
 	github.com/invopop/jsonschema v0.13.0
 	github.com/modelcontextprotocol/go-sdk v0.3.0
 	github.com/redis/go-redis/v9 v9.13.0
-	golang.org/x/sync v0.17.0
 )
 
 require (

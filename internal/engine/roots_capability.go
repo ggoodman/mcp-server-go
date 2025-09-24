@@ -8,6 +8,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 // Ensure interface compliance
@@ -23,11 +24,7 @@ type rootsCapability struct {
 }
 
 func (r *rootsCapability) ListRoots(ctx context.Context) (*mcp.ListRootsResult, error) {
-	reqID, err := newClientMessageID()
-	if err != nil {
-		r.log.Error("roots.list.err", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", err.Error()))
-		return nil, ErrInternal
-	}
+	reqID := uuid.NewString()
 
 	clientReq := jsonrpc.Request{
 		JSONRPCVersion: jsonrpc.ProtocolVersion,

@@ -2,8 +2,6 @@ package engine
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +14,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 const (
@@ -45,6 +44,7 @@ type Engine struct {
 	host sessions.SessionHost
 	srv  mcpservice.ServerCapabilities
 	log  *slog.Logger
+	id   string // process-unique engine ID for coordination
 
 	// session config
 	sessionTTL         time.Duration
@@ -74,6 +74,7 @@ func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opt
 		host:               host,
 		srv:                srv,
 		log:                slog.Default(),
+		id:                 uuid.NewString(),
 		sessionTTL:         defaultSessionTTL,
 		sessionMaxLifetime: defaultSessionMaxLifetime,
 		handshakeTTL:       30 * time.Second,
@@ -106,6 +107,8 @@ func WithHandshakeTTL(d time.Duration) EngineOption {
 		}
 	}
 }
+
+// (Removed) internal unsubscribe ACK deadline option: waits are governed solely by the request context.
 
 // WithLogger sets a custom logger for the Engine.
 func WithLogger(l *slog.Logger) EngineOption {
@@ -380,8 +383,30 @@ func (e *Engine) handleResourcesSubscribe(ctx context.Context, sess *SessionHand
 	}
 	e.subMu.Unlock()
 
-	// Build emit closure: publishes notifications/resources/updated
+	// Create a unique subscription token and store it in the shared KV. This acts as a
+	// deterministic fence across nodes: emits must match the token to be delivered.
+	localTok, err := e.rotateResourceSubToken(context.Background(), sess.SessionID(), params.URI)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.resources.subscribe.token_write_fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	// Build emit closure: publishes notifications/resources/updated only if the
+	// current shared token matches this subscription's token, ensuring deterministic
+	// fencing across nodes after unsubscribe.
 	emit := func(cbCtx context.Context, uri string) {
+		// Drop if token rotated (i.e., an unsubscribe occurred), or if the
+		// local mapping is gone (best-effort local guard).
+		// Use a non-canceled context for KV read to avoid transient cancellation.
+		if cur := e.getResourceSubToken(context.Background(), sess.SessionID(), uri); cur == "" || cur != localTok {
+			return
+		}
+		e.subMu.Lock()
+		_, still := e.subCancels[sess.SessionID()][uri]
+		e.subMu.Unlock()
+		if !still {
+			return
+		}
 		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod)}
 		// attach params
 		b, _ := json.Marshal(mcp.ResourceUpdatedNotification{URI: uri})
@@ -407,6 +432,9 @@ func (e *Engine) handleResourcesSubscribe(ctx context.Context, sess *SessionHand
 	e.subCancels[sess.SessionID()][params.URI] = cancel
 	e.subMu.Unlock()
 
+	// Record owner for deterministic unsubscribe coordination
+	_ = e.setResourceSubOwner(context.Background(), sess.SessionID(), params.URI, e.id)
+
 	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
 }
@@ -422,6 +450,16 @@ func (e *Engine) handleResourcesUnsubscribe(ctx context.Context, sess *SessionHa
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
 	}
 
+	// Rotate shared subscription token first to fence subsequent emits across nodes.
+	if _, err := e.rotateResourceSubToken(context.Background(), sess.SessionID(), params.URI); err != nil {
+		// If rotation fails, we cannot provide deterministic fencing; report error.
+		log.ErrorContext(ctx, "engine.resources.unsubscribe.token_write_fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	// Capture current owner (best-effort)
+	owner := e.getResourceSubOwner(context.Background(), sess.SessionID(), params.URI)
+
 	// Best-effort local cancel
 	e.subMu.Lock()
 	if m := e.subCancels[sess.SessionID()]; len(m) > 0 {
@@ -435,19 +473,119 @@ func (e *Engine) handleResourcesUnsubscribe(ctx context.Context, sess *SessionHa
 	}
 	e.subMu.Unlock()
 
-	// Broadcast cross-instance unsubscribe message by publishing an internal request
-	// onto the fanout topic that will be handled in handleSessionEvent.
-	note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUnsubscribeMethod)}
-	b, _ := json.Marshal(params)
-	note.Params = b
-	bytes, _ := json.Marshal(note)
-	outer := fanoutMessage{SessionID: sess.SessionID(), UserID: sess.UserID(), Msg: bytes}
-	if payload, err := json.Marshal(outer); err == nil {
-		_ = e.host.PublishEvent(context.Background(), sessionFanoutTopic, payload)
+	// Best-effort broadcast with ACK rendezvous to prompt owner to cancel deterministically.
+	fanReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUnsubscribeMethod)}
+	fanReq.ID = jsonrpc.NewRequestID(uuid.NewString())
+	if b, err := json.Marshal(params); err == nil {
+		fanReq.Params = b
+	}
+	var ackCh <-chan []byte
+	var closeAck func()
+	if bytes, err := json.Marshal(fanReq); err == nil {
+		if payload, err := json.Marshal(fanoutMessage{SessionID: sess.SessionID(), UserID: sess.UserID(), Msg: bytes}); err == nil {
+			ackCh, closeAck = e.createRendezVous(fanReq.ID.String())
+			defer closeAck()
+			_ = e.host.PublishEvent(context.Background(), sessionFanoutTopic, payload)
+		}
+	}
+
+	// Deterministic barrier with no internal deadlines:
+	// Wait until either (a) ACK is received, or (b) the recorded owner clears.
+	// Both waits are governed solely by ctx. If we are the owner, clear immediately.
+	ownerCleared := make(chan struct{}, 1)
+	// If we're the owner, clear now and signal; else poll for owner change/clear.
+	if owner == e.id {
+		_ = e.clearResourceSubOwner(context.Background(), sess.SessionID(), params.URI)
+		ownerCleared <- struct{}{}
+	} else {
+		go func(sessID, uri, origOwner string) {
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				cur := e.getResourceSubOwner(context.Background(), sessID, uri)
+				if cur == "" || cur != origOwner {
+					select {
+					case ownerCleared <- struct{}{}:
+					default:
+					}
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}(sess.SessionID(), params.URI, owner)
+	}
+
+	// If we have an ACK rendezvous, wait for either ACK or owner-clear.
+	if ackCh != nil {
+		select {
+		case <-ctx.Done():
+		case <-ackCh:
+		case <-ownerCleared:
+		}
+	} else {
+		// No rendezvous: rely solely on owner-clear barrier or ctx.
+		select {
+		case <-ctx.Done():
+		case <-ownerCleared:
+		}
 	}
 
 	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+}
+
+// getResourceSubToken returns the current subscription token for the given
+// session URI, stored in the SessionHost KV. Missing keys return empty string.
+func (e *Engine) getResourceSubToken(ctx context.Context, sessID, uri string) string {
+	key := "res_subtok:" + uri
+	b, err := e.host.GetSessionData(ctx, sessID, key)
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	return string(b)
+}
+
+// rotateResourceSubToken generates and writes a new random token for the given session URI
+// and returns it. This is used on subscribe (to initialize) and on unsubscribe (to rotate).
+func (e *Engine) rotateResourceSubToken(ctx context.Context, sessID, uri string) (string, error) {
+	tok := uuid.NewString()
+	key := "res_subtok:" + uri
+	// Try a few times in case of transient backend issues
+	var err error
+	for i := 0; i < 3; i++ {
+		err = e.host.PutSessionData(ctx, sessID, key, []byte(tok))
+		if err == nil {
+			return tok, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return "", err
+}
+
+// Subscription owner KV helpers
+func (e *Engine) ownerKey(uri string) string { return "res_subown:" + uri }
+
+func (e *Engine) setResourceSubOwner(ctx context.Context, sessID, uri, owner string) error {
+	if owner == "" {
+		return nil
+	}
+	return e.host.PutSessionData(ctx, sessID, e.ownerKey(uri), []byte(owner))
+}
+
+func (e *Engine) getResourceSubOwner(ctx context.Context, sessID, uri string) string {
+	b, err := e.host.GetSessionData(ctx, sessID, e.ownerKey(uri))
+	if err != nil || len(b) == 0 {
+		return ""
+	}
+	return string(b)
+}
+
+func (e *Engine) clearResourceSubOwner(ctx context.Context, sessID, uri string) error {
+	return e.host.DeleteSessionData(ctx, sessID, e.ownerKey(uri))
 }
 
 func (e *Engine) handleToolsList(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
@@ -879,11 +1017,7 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 		return nil, ErrInvalidUserID
 	}
 	start := time.Now()
-	sid, err := newSessionID()
-	if err != nil { // extremely unlikely; fallback to counter-based id
-		e.log.ErrorContext(ctx, "engine.create_session.fail", slog.String("user_id", userID), slog.String("err", err.Error()))
-		return nil, ErrInternal
-	}
+	sid := uuid.NewString()
 	now := time.Now().UTC()
 	metaRec := &sessions.SessionMetadata{
 		MetaVersion:     1,
@@ -1164,18 +1298,26 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 				e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
 				return nil
 			}
-			// Best-effort local cancel only. No response expected here.
+			// Best-effort local cancel; only the node that actually cancels should ACK.
+			var removed bool
 			e.subMu.Lock()
 			if m := e.subCancels[fanout.SessionID]; len(m) > 0 {
 				if cancel, ok := m[params.URI]; ok && cancel != nil {
 					_ = cancel(context.Background())
 					delete(m, params.URI)
+					removed = true
 				}
 				if len(m) == 0 {
 					delete(e.subCancels, fanout.SessionID)
 				}
 			}
 			e.subMu.Unlock()
+			// Clear owner if we held it to signal barrier completion.
+			if removed {
+				if owner := e.getResourceSubOwner(context.Background(), fanout.SessionID, params.URI); owner == e.id {
+					_ = e.clearResourceSubOwner(context.Background(), fanout.SessionID, params.URI)
+				}
+			}
 			return nil
 		default:
 			// Unknown request; ignore.
@@ -1369,31 +1511,4 @@ func (e *Engine) cancelAllSubscriptionsForSession(sessID string) {
 		delete(e.subCancels, sessID)
 	}
 	e.subMu.Unlock()
-}
-
-// randomID returns a hex-encoded 16-byte cryptographically random string.
-func randomID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
-}
-
-// newSessionID returns a cryptographically random session id with a prefix.
-func newSessionID() (string, error) {
-	id, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	return "sess-" + id, nil
-}
-
-// newClientMessageID returns a cryptographically random client message id with a prefix.
-func newClientMessageID() (string, error) {
-	id, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	return "req-" + id, nil
 }

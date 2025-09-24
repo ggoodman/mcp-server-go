@@ -215,7 +215,7 @@ func (r resourceSubscriptionFromContainer) Subscribe(ctx context.Context, sessio
 	_ = r.sr.Subscribe(ctx, sid, uri)
 
 	// Create a long-lived goroutine that forwards per-URI updates via emit.
-	fwdCtx, stop := context.WithCancel(context.Background())
+	fwdCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	ch := r.sr.SubscriberForURI(uri)
 	go func() {
 		for {
@@ -225,6 +225,12 @@ func (r resourceSubscriptionFromContainer) Subscribe(ctx context.Context, sessio
 			case _, ok := <-ch:
 				if !ok {
 					return
+				}
+				// Re-check context after tick to avoid emitting after cancellation
+				select {
+				case <-fwdCtx.Done():
+					return
+				default:
 				}
 				if emit != nil {
 					emit(context.Background(), uri)
