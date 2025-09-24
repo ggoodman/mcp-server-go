@@ -848,6 +848,100 @@ func (e *Engine) createRendezVous(reqID string) (<-chan []byte, func()) {
 	}
 }
 
+// StreamSession validates the session ownership and subscribes the caller to the
+// per-session client-facing stream starting after lastEventID. It is a thin
+// wrapper over the host that centralizes auth/ownership checks in the Engine.
+func (e *Engine) StreamSession(ctx context.Context, sessID, userID, lastEventID string, handler sessions.MessageHandlerFunction) error {
+	meta, err := e.host.GetSession(ctx, sessID)
+	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
+		return ErrSessionNotFound
+	}
+	// Best-effort TTL touch; ignore error
+	_ = e.host.TouchSession(ctx, sessID)
+	return e.host.SubscribeSession(ctx, sessID, lastEventID, handler)
+}
+
+// HandleClientResponse validates the session ownership and forwards a client
+// JSON-RPC response into the Engine rendezvous via the inter-instance fanout.
+// This allows any node to satisfy the waiting request, regardless of where the
+// response was received.
+func (e *Engine) HandleClientResponse(ctx context.Context, sessID, userID string, res *jsonrpc.Response) error {
+	if res == nil || res.ID == nil || res.ID.IsNil() {
+		return fmt.Errorf("invalid response: missing id")
+	}
+	meta, err := e.host.GetSession(ctx, sessID)
+	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
+		return ErrSessionNotFound
+	}
+
+	payload, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("marshal response: %w", err)
+	}
+	env, err := json.Marshal(fanoutMessage{SessionID: sessID, UserID: userID, Msg: payload})
+	if err != nil {
+		return fmt.Errorf("marshal envelope: %w", err)
+	}
+	if err := e.host.PublishEvent(ctx, sessionFanoutTopic, env); err != nil {
+		return fmt.Errorf("publish fanout: %w", err)
+	}
+	return nil
+}
+
+// GetSessionProtocolVersion validates ownership and returns the negotiated
+// protocol version for the session. Returns ErrSessionNotFound if not owned or
+// missing.
+func (e *Engine) GetSessionProtocolVersion(ctx context.Context, sessID, userID string) (string, error) {
+	meta, err := e.host.GetSession(ctx, sessID)
+	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
+		return "", ErrSessionNotFound
+	}
+	// Best-effort TTL touch
+	_ = e.host.TouchSession(ctx, sessID)
+	return meta.ProtocolVersion, nil
+}
+
+// DeleteSession validates ownership, returns the session protocol version for
+// convenience, and deletes the session from the host. Idempotent at the host
+// layer; returns ErrSessionNotFound if not owned or already gone.
+func (e *Engine) DeleteSession(ctx context.Context, sessID, userID string) (string, error) {
+	meta, err := e.host.GetSession(ctx, sessID)
+	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
+		return "", ErrSessionNotFound
+	}
+	pv := meta.ProtocolVersion
+	if err := e.host.DeleteSession(ctx, sessID); err != nil {
+		return "", fmt.Errorf("delete session: %w", err)
+	}
+	return pv, nil
+}
+
+// PublishToSession validates ownership and appends a JSON-RPC message to the
+// per-session client-facing stream. Returns the assigned event ID.
+func (e *Engine) PublishToSession(ctx context.Context, sessID, userID string, msg jsonrpc.Message) (string, error) {
+	meta, err := e.host.GetSession(ctx, sessID)
+	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
+		return "", ErrSessionNotFound
+	}
+	// Accept either already-encoded []byte or a struct implementing Message
+	var bytes []byte
+	switch v := any(msg).(type) {
+	case []byte:
+		bytes = v
+	default:
+		b, mErr := json.Marshal(msg)
+		if mErr != nil {
+			return "", fmt.Errorf("marshal message: %w", mErr)
+		}
+		bytes = b
+	}
+	evtID, err := e.host.PublishSession(ctx, sessID, bytes)
+	if err != nil {
+		return "", fmt.Errorf("publish session: %w", err)
+	}
+	return evtID, nil
+}
+
 // randomID returns a hex-encoded 16-byte cryptographically random string.
 func randomID() (string, error) {
 	var b [16]byte
