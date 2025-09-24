@@ -40,35 +40,6 @@ func (c testToolsCap) GetListChangedCapability(ctx context.Context, s sessions.S
 	return nil, false, nil
 }
 
-type testServer struct{ tools testToolsCap }
-
-var _ mcpservice.ServerCapabilities = (*testServer)(nil)
-
-func (ts *testServer) GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error) {
-	return mcp.ImplementationInfo{Name: "test", Version: "0.0.1"}, nil
-}
-func (ts *testServer) GetPreferredProtocolVersion(ctx context.Context) (string, bool, error) {
-	return "2025-06-18", true, nil
-}
-func (ts *testServer) GetInstructions(ctx context.Context, session sessions.Session) (string, bool, error) {
-	return "", false, nil
-}
-func (ts *testServer) GetResourcesCapability(ctx context.Context, session sessions.Session) (mcpservice.ResourcesCapability, bool, error) {
-	return nil, false, nil
-}
-func (ts *testServer) GetToolsCapability(ctx context.Context, session sessions.Session) (mcpservice.ToolsCapability, bool, error) {
-	return ts.tools, true, nil
-}
-func (ts *testServer) GetPromptsCapability(ctx context.Context, session sessions.Session) (mcpservice.PromptsCapability, bool, error) {
-	return nil, false, nil
-}
-func (ts *testServer) GetLoggingCapability(ctx context.Context, session sessions.Session) (mcpservice.LoggingCapability, bool, error) {
-	return nil, false, nil
-}
-func (ts *testServer) GetCompletionsCapability(ctx context.Context, session sessions.Session) (mcpservice.CompletionsCapability, bool, error) {
-	return nil, false, nil
-}
-
 func TestSingleInstance(t *testing.T) {
 	t.Run("Initialize returns session and capabilities", func(t *testing.T) {
 		// Explicit minimal server with empty static tools
@@ -148,6 +119,15 @@ func TestSingleInstance(t *testing.T) {
 		sessID := resp.Header.Get("mcp-session-id")
 		resp.Body.Close()
 
+		// Open the session before making requests
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			// Provide context if it fails
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		respInit.Body.Close()
+
 		// List resource templates
 		listReq := &jsonrpc.Request{
 			JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -195,6 +175,14 @@ func TestSingleInstance(t *testing.T) {
 		resp, _ := mustPostMCP(t, srv, "Bearer test-token", "", initReq)
 		sessID := resp.Header.Get("mcp-session-id")
 		resp.Body.Close()
+
+		// Open the session before making requests
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		respInit.Body.Close()
 
 		// List tools
 		listReq := &jsonrpc.Request{
@@ -277,6 +265,14 @@ func TestSingleInstance(t *testing.T) {
 			t.Fatalf("missing session id")
 		}
 
+		// Send initialized before logging requests
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		respInit.Body.Close()
+
 		// Now send logging/setLevel to debug
 		setReq := &jsonrpc.Request{
 			JSONRPCVersion: jsonrpc.ProtocolVersion,
@@ -317,6 +313,15 @@ func TestSingleInstance(t *testing.T) {
 		}
 		sessID := resp.Header.Get("MCP-Session-ID")
 		resp.Body.Close()
+
+		// Send initialized before logging requests
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, evtInit := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		_ = evtInit // not used
+		respInit.Body.Close()
 
 		// Invalid level
 		setReq := &jsonrpc.Request{
@@ -367,12 +372,14 @@ func TestMultiInstance(t *testing.T) {
 		// Shared in-memory session host to simulate distributed coordination
 		sharedHost := memoryhost.New()
 
-		// Distinct server instances per handler: each gets its own static resources container
+		// Shared static resources container across handler instances
+		sharedSR := mcpservice.NewStaticResources(nil, nil, nil)
+
+		// Distinct server instances per handler: share the static resources container
 		mcpFactory := func() mcpservice.ServerCapabilities {
-			sr := mcpservice.NewStaticResources(nil, nil, nil)
 			return mcpservice.NewServer(
 				mcpservice.WithResourcesOptions(
-					mcpservice.WithStaticResourceContainer(sr),
+					mcpservice.WithStaticResourceContainer(sharedSR),
 				),
 			)
 		}
@@ -409,31 +416,22 @@ func TestMultiInstance(t *testing.T) {
 			t.Fatalf("missing session id")
 		}
 
-		// Step 2: Start GET stream on instance 0 and read next SSE event asynchronously
+		// Step 2: Send notifications/initialized to open the session
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		respInit.Body.Close()
+
+		// Step 3: Start GET stream on instance 0 and read next SSE event asynchronously
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Step 3: Coordinate on server-side readiness, then publish once
-		ctx := t.Context()
-		readyCh := make(chan struct{}, 1)
-		if err := sharedHost.SubscribeEvents(ctx, "streaminghttp/ready", func(context.Context, []byte) error {
-			select {
-			case readyCh <- struct{}{}:
-			default:
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("subscribe ready: %v", err)
-		}
-		select {
-		case <-readyCh:
-			// stream ready
-		case <-time.After(3 * time.Second):
-			// proceed anyway; worst case the publish below races (rare on CI), the SSE reader still loops
-		}
-		_ = sharedHost.PublishEvent(ctx, string(mcp.ResourcesListChangedNotificationMethod), nil)
+		// Step 4: Trigger a resources list change via the shared container
+		sharedSR.ReplaceResources(context.Background(), sharedSR.SnapshotResources())
 
-		// Step 4: Wait for notification
+		// Step 5: Wait for notification
 		select {
 		case evt := <-eventsCh:
 			var msg jsonrpc.AnyMessage
@@ -450,12 +448,14 @@ func TestMultiInstance(t *testing.T) {
 		// Shared in-memory session host to simulate distributed coordination
 		sharedHost := memoryhost.New()
 
-		// Distinct server instances per handler: each gets its own static tools container
+		// Shared static tools container across instances
+		sharedTools := mcpservice.NewStaticTools()
+
+		// Distinct server instances per handler: share tools container
 		mcpFactory := func() mcpservice.ServerCapabilities {
-			st := mcpservice.NewStaticTools()
 			return mcpservice.NewServer(
 				mcpservice.WithToolsOptions(
-					mcpservice.WithStaticToolsContainer(st),
+					mcpservice.WithStaticToolsContainer(sharedTools),
 				),
 			)
 		}
@@ -492,32 +492,22 @@ func TestMultiInstance(t *testing.T) {
 			t.Fatalf("missing session id")
 		}
 
-		// Step 2: Start GET stream on instance 0 and read next SSE event asynchronously
+		// Step 2: Send notifications/initialized to open the session
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		respInit.Body.Close()
+
+		// Step 3: Start GET stream on instance 0 and read next SSE event asynchronously
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Step 3: Coordinate on server-side readiness, then publish once
-		ctx := t.Context()
-		readyCh := make(chan struct{}, 1)
-		err := sharedHost.SubscribeEvents(ctx, "streaminghttp/ready", func(context.Context, []byte) error {
-			select {
-			case readyCh <- struct{}{}:
-			default:
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("subscribe ready: %v", err)
-		}
-		select {
-		case <-readyCh:
-			// stream ready
-		case <-time.After(3 * time.Second):
-			// proceed anyway
-		}
-		_ = sharedHost.PublishEvent(ctx, string(mcp.ToolsListChangedNotificationMethod), nil)
+		// Step 4: Trigger a tools list change via the shared container
+		sharedTools.Replace(context.Background())
 
-		// Step 4: Wait for notification
+		// Step 5: Wait for notification
 		select {
 		case evt := <-eventsCh:
 			var msg jsonrpc.AnyMessage
@@ -532,11 +522,11 @@ func TestMultiInstance(t *testing.T) {
 
 	t.Run("Prompts list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
 		sharedHost := memoryhost.New()
+		sharedPrompts := mcpservice.NewStaticPrompts()
 		mcpFactory := func() mcpservice.ServerCapabilities {
-			sp := mcpservice.NewStaticPrompts()
 			return mcpservice.NewServer(
 				mcpservice.WithPromptsOptions(
-					mcpservice.WithStaticPromptsContainer(sp),
+					mcpservice.WithStaticPromptsContainer(sharedPrompts),
 				),
 			)
 		}
@@ -569,27 +559,19 @@ func TestMultiInstance(t *testing.T) {
 			t.Fatalf("missing session id")
 		}
 
+		// Send notifications/initialized to open session
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+		respInit, _ := mustPostMCP(t, srv, "Bearer test-token", sessID, note)
+		if respInit.StatusCode != http.StatusAccepted {
+			t.Fatalf("initialized note status: %d", respInit.StatusCode)
+		}
+		respInit.Body.Close()
+
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Coordinate on server readiness before publishing
-		ctx := t.Context()
-		readyCh := make(chan struct{}, 1)
-		err := sharedHost.SubscribeEvents(ctx, "streaminghttp/ready", func(context.Context, []byte) error {
-			select {
-			case readyCh <- struct{}{}:
-			default:
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("subscribe ready: %v", err)
-		}
-		select {
-		case <-readyCh:
-		case <-time.After(3 * time.Second):
-		}
-		_ = sharedHost.PublishEvent(ctx, string(mcp.PromptsListChangedNotificationMethod), nil)
+		// Trigger prompts list change via shared container
+		sharedPrompts.Replace(context.Background())
 
 		select {
 		case evt := <-eventsCh:
@@ -613,7 +595,14 @@ func TestMultiInstance(t *testing.T) {
 func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) {
 
 	host := memoryhost.New()
-	server := &testServer{}
+	// Use the real mcpservice.NewServer to align with production wiring.
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsCapability(testToolsCap{}),
+		// Provide a preferred protocol version to match test expectations.
+		mcpservice.WithPreferredProtocolVersion("2025-06-18"),
+		// Keep server info minimal; not essential to this test.
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "test", Version: "0.0.1"}),
+	)
 	h, err := streaminghttp.New(context.Background(), "http://example.com/mcp", host, server, &noAuth{wantToken: "test-token"}, streaminghttp.WithServerName("t"), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "https://issuer", JwksURI: "https://issuer/jwks"}))
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
@@ -640,6 +629,16 @@ func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) 
 		t.Fatalf("missing session id; status=%d body=%s", initResp.StatusCode, string(b))
 	}
 	initResp.Body.Close()
+
+	// Mark session initialized before issuing tools/list
+	note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+	respInit, _ := mustPostMCPPath(t, srv, "/mcp", "Bearer test-token", sessID, note)
+	if respInit.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(respInit.Body)
+		respInit.Body.Close()
+		t.Fatalf("initialized note status: %d body=%s", respInit.StatusCode, string(b))
+	}
+	respInit.Body.Close()
 
 	// Send tools/list which will internally trigger a roots/list client call, using /mcp.
 	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(mcp.ListToolsRequest{})}

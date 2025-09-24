@@ -16,7 +16,6 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -110,13 +109,18 @@ func WithLogger(l *slog.Logger) EngineOption {
 }
 
 func (e *Engine) Run(ctx context.Context) error {
-	g, ctx := errgroup.WithContext(ctx)
+	// Subscribe to the cross-instance fanout topic and keep the subscription
+	// alive for the lifetime of ctx. The host's SubscribeEvents typically
+	// returns immediately after spawning its own processing goroutine, so we
+	// must not exit here or the derived context would be canceled, tearing down
+	// the subscription prematurely.
+	if err := e.host.SubscribeEvents(ctx, sessionFanoutTopic, e.handleSessionEvent); err != nil {
+		return err
+	}
 
-	g.Go(func() error {
-		return e.host.SubscribeEvents(ctx, sessionFanoutTopic, e.handleSessionEvent)
-	})
-
-	return g.Wait()
+	// Block until shutdown.
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 // InitializeSession handles the MCP initialize handshake, creating a session record,
@@ -267,6 +271,8 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 	switch req.Method {
 	case string(mcp.ToolsListMethod):
 		return e.handleToolsList(ctx, sess, req)
+	case string(mcp.ResourcesTemplatesListMethod):
+		return e.handleResourcesTemplatesList(ctx, sess, req)
 	case string(mcp.LoggingSetLevelMethod):
 		return e.handleSetLoggingLevel(ctx, sess, req)
 	case string(mcp.ToolsCallMethod):
@@ -429,6 +435,48 @@ func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *j
 
 	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 
+	return jsonrpc.NewResultResponse(req.ID, res)
+}
+
+func (e *Engine) handleResourcesTemplatesList(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.ListResourceTemplatesRequest
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+		}
+	}
+
+	cap, ok, err := e.srv.GetResourcesCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok || cap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+	}
+
+	var cursor *string
+	if params.Cursor != "" {
+		s := params.Cursor
+		cursor = &s
+	}
+
+	page, err := cap.ListResourceTemplates(ctx, sess, cursor)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	res := &mcp.ListResourceTemplatesResult{ResourceTemplates: page.Items}
+	if page.NextCursor != nil {
+		res.NextCursor = *page.NextCursor
+	}
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()), slog.Int("template_count", len(page.Items)))
 	return jsonrpc.NewResultResponse(req.ID, res)
 }
 
@@ -598,6 +646,9 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 	e.wired[sid] = true
 	e.wireMu.Unlock()
 
+	// Use a background context for long-lived emitter wiring so it outlives a single HTTP request.
+	bg := context.Background()
+
 	// helper to publish a no-param notification
 	publishNote := func(method mcp.Method) {
 		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(method)}
@@ -606,15 +657,15 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 			e.log.Error("engine.emitter.encode.fail", slog.String("session_id", sid), slog.String("user_id", uid), slog.String("method", string(method)), slog.String("err", err.Error()))
 			return
 		}
-		if _, err := e.host.PublishSession(ctx, sid, bytes); err != nil {
+		if _, err := e.host.PublishSession(bg, sid, bytes); err != nil {
 			e.log.Error("engine.emitter.publish.fail", slog.String("session_id", sid), slog.String("user_id", uid), slog.String("method", string(method)), slog.String("err", err.Error()))
 		}
 	}
 
 	// Resources listChanged
-	if resCap, ok, err := e.srv.GetResourcesCapability(ctx, sess); err == nil && ok && resCap != nil {
-		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, sess); lErr == nil && hasLC && lc != nil {
-			_, _ = lc.Register(ctx, sess, func(cbCtx context.Context, s sessions.Session, uri string) {
+	if resCap, ok, err := e.srv.GetResourcesCapability(bg, sess); err == nil && ok && resCap != nil {
+		if lc, hasLC, lErr := resCap.GetListChangedCapability(bg, sess); lErr == nil && hasLC && lc != nil {
+			_, _ = lc.Register(bg, sess, func(cbCtx context.Context, s sessions.Session, uri string) {
 				_ = uri // we emit generic listChanged per spec
 				publishNote(mcp.ResourcesListChangedNotificationMethod)
 			})
@@ -622,18 +673,18 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 	}
 
 	// Tools listChanged
-	if toolsCap, ok, err := e.srv.GetToolsCapability(ctx, sess); err == nil && ok && toolsCap != nil {
-		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, sess); lErr == nil && hasLC && lc != nil {
-			_, _ = lc.Register(ctx, sess, func(cbCtx context.Context, s sessions.Session) {
+	if toolsCap, ok, err := e.srv.GetToolsCapability(bg, sess); err == nil && ok && toolsCap != nil {
+		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(bg, sess); lErr == nil && hasLC && lc != nil {
+			_, _ = lc.Register(bg, sess, func(cbCtx context.Context, s sessions.Session) {
 				publishNote(mcp.ToolsListChangedNotificationMethod)
 			})
 		}
 	}
 
 	// Prompts listChanged
-	if promptsCap, ok, err := e.srv.GetPromptsCapability(ctx, sess); err == nil && ok && promptsCap != nil {
-		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, sess); lErr == nil && hasLC && lc != nil {
-			_, _ = lc.Register(ctx, sess, func(cbCtx context.Context, s sessions.Session) {
+	if promptsCap, ok, err := e.srv.GetPromptsCapability(bg, sess); err == nil && ok && promptsCap != nil {
+		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(bg, sess); lErr == nil && hasLC && lc != nil {
+			_, _ = lc.Register(bg, sess, func(cbCtx context.Context, s sessions.Session) {
 				publishNote(mcp.PromptsListChangedNotificationMethod)
 			})
 		}
@@ -670,6 +721,16 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 			opts = append(opts, WithSamplingCapability(&samplingCapabilty{
 				eng:                 e,
 				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "sampling")),
+				sessID:              sessID,
+				userID:              userID,
+				requestScopedWriter: requestScopedWriter,
+				sessionScopedWriter: sessionScopedWriter,
+			}))
+		}
+		if metaRec.Capabilities.Roots {
+			opts = append(opts, WithRootsCapability(&rootsCapability{
+				eng:                 e,
+				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "roots")),
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,
