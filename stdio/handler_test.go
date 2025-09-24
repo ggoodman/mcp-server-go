@@ -567,45 +567,79 @@ func TestResources_ListReadSubscribe(t *testing.T) {
 
 	// list
 	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListMethod), ID: jsonrpc.NewRequestID("1")}
-	if err := th.send(listReq); err != nil { t.Fatal(err) }
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
 	res, err := th.expectResponse(1 * time.Second)
-	if err != nil { t.Fatal(err) }
-	if res.Error != nil { t.Fatalf("list error: %+v", res.Error) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("list error: %+v", res.Error)
+	}
 	var lres mcp.ListResourcesResult
-	if err := json.Unmarshal(res.Result, &lres); err != nil { t.Fatal(err) }
-	if len(lres.Resources) != 1 || lres.Resources[0].URI != uri { t.Fatalf("unexpected list: %+v", lres.Resources) }
+	if err := json.Unmarshal(res.Result, &lres); err != nil {
+		t.Fatal(err)
+	}
+	if len(lres.Resources) != 1 || lres.Resources[0].URI != uri {
+		t.Fatalf("unexpected list: %+v", lres.Resources)
+	}
 
 	// read
 	readReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesReadMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.ReadResourceRequest{URI: uri})}
-	if err := th.send(readReq); err != nil { t.Fatal(err) }
+	if err := th.send(readReq); err != nil {
+		t.Fatal(err)
+	}
 	res, err = th.expectResponse(1 * time.Second)
-	if err != nil { t.Fatal(err) }
-	if res.Error != nil { t.Fatalf("read error: %+v", res.Error) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("read error: %+v", res.Error)
+	}
 	var rres mcp.ReadResourceResult
-	if err := json.Unmarshal(res.Result, &rres); err != nil { t.Fatal(err) }
-	if len(rres.Contents) == 0 || rres.Contents[0].Text != "v1" { t.Fatalf("unexpected contents: %+v", rres.Contents) }
+	if err := json.Unmarshal(res.Result, &rres); err != nil {
+		t.Fatal(err)
+	}
+	if len(rres.Contents) == 0 || rres.Contents[0].Text != "v1" {
+		t.Fatalf("unexpected contents: %+v", rres.Contents)
+	}
 
 	// subscribe
 	subReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesSubscribeMethod), ID: jsonrpc.NewRequestID("3"), Params: mustJSON(t, mcp.SubscribeRequest{URI: uri})}
-	if err := th.send(subReq); err != nil { t.Fatal(err) }
+	if err := th.send(subReq); err != nil {
+		t.Fatal(err)
+	}
 	if res, err = th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
-		if err != nil { t.Fatal(err) }
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Fatalf("subscribe error: %+v", res.Error)
 	}
 
 	// mutate contents -> expect notifications/resources/updated
 	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v2"}}})
 	note, ok := th.drainUntilMethod(string(mcp.ResourcesUpdatedNotificationMethod), 2*time.Second)
-	if !ok { t.Fatalf("expected %s after content change", mcp.ResourcesUpdatedNotificationMethod) }
+	if !ok {
+		t.Fatalf("expected %s after content change", mcp.ResourcesUpdatedNotificationMethod)
+	}
 	var upd mcp.ResourceUpdatedNotification
-	if err := json.Unmarshal(note.Params, &upd); err != nil { t.Fatalf("decode updated: %v", err) }
-	if upd.URI != uri { t.Fatalf("updated for wrong uri: %+v", upd) }
+	if err := json.Unmarshal(note.Params, &upd); err != nil {
+		t.Fatalf("decode updated: %v", err)
+	}
+	if upd.URI != uri {
+		t.Fatalf("updated for wrong uri: %+v", upd)
+	}
 
 	// unsubscribe then change again -> should not see another update quickly
 	unsubReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUnsubscribeMethod), ID: jsonrpc.NewRequestID("4"), Params: mustJSON(t, mcp.UnsubscribeRequest{URI: uri})}
-	if err := th.send(unsubReq); err != nil { t.Fatal(err) }
+	if err := th.send(unsubReq); err != nil {
+		t.Fatal(err)
+	}
 	if res, err = th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
-		if err != nil { t.Fatal(err) }
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Fatalf("unsubscribe error: %+v", res.Error)
 	}
 	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v3"}}})
@@ -630,23 +664,43 @@ func TestPrompts_ListAndGet(t *testing.T) {
 
 	// list
 	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListMethod), ID: jsonrpc.NewRequestID("1")}
-	if err := th.send(listReq); err != nil { t.Fatal(err) }
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
 	res, err := th.expectResponse(1 * time.Second)
-	if err != nil { t.Fatal(err) }
-	if res.Error != nil { t.Fatalf("list prompts error: %+v", res.Error) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("list prompts error: %+v", res.Error)
+	}
 	var lp mcp.ListPromptsResult
-	if err := json.Unmarshal(res.Result, &lp); err != nil { t.Fatal(err) }
-	if len(lp.Prompts) != 1 || lp.Prompts[0].Name != "hello" { t.Fatalf("unexpected prompts: %+v", lp.Prompts) }
+	if err := json.Unmarshal(res.Result, &lp); err != nil {
+		t.Fatal(err)
+	}
+	if len(lp.Prompts) != 1 || lp.Prompts[0].Name != "hello" {
+		t.Fatalf("unexpected prompts: %+v", lp.Prompts)
+	}
 
 	// get
 	getReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsGetMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.GetPromptRequest{Name: "hello"})}
-	if err := th.send(getReq); err != nil { t.Fatal(err) }
+	if err := th.send(getReq); err != nil {
+		t.Fatal(err)
+	}
 	res, err = th.expectResponse(1 * time.Second)
-	if err != nil { t.Fatal(err) }
-	if res.Error != nil { t.Fatalf("get prompt error: %+v", res.Error) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("get prompt error: %+v", res.Error)
+	}
 	var gp mcp.GetPromptResult
-	if err := json.Unmarshal(res.Result, &gp); err != nil { t.Fatal(err) }
-	if len(gp.Messages) == 0 { t.Fatalf("missing prompt messages") }
+	if err := json.Unmarshal(res.Result, &gp); err != nil {
+		t.Fatal(err)
+	}
+	if len(gp.Messages) == 0 {
+		t.Fatalf("missing prompt messages")
+	}
 
 	// change -> expect prompts/list_changed
 	sp.Add(t.Context(), mcpservice.StaticPrompt{Descriptor: mcp.Prompt{Name: "bye"}})
@@ -662,23 +716,37 @@ func TestRoots_ListAndListChanged(t *testing.T) {
 
 	// client advertises roots capability so the engine wires a roots client bridge
 	init := defaultInitializeRequest()
-	init.Capabilities.Roots = &struct{ ListChanged bool `json:"listChanged"` }{}
+	init.Capabilities.Roots = &struct {
+		ListChanged bool `json:"listChanged"`
+	}{}
 	_ = th.initialize(t, "init-1", init)
 	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
 
 	// Issue tools/list -> expect a client roots/list request first
 	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1")}
-	if err := th.send(listReq); err != nil { t.Fatal(err) }
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
 	first, err := th.expectRequest(2 * time.Second)
-	if err != nil { t.Fatal(err) }
-	if first.Method != string(mcp.RootsListMethod) { t.Fatalf("expected first outbound %s, got %s", mcp.RootsListMethod, first.Method) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Method != string(mcp.RootsListMethod) {
+		t.Fatalf("expected first outbound %s, got %s", mcp.RootsListMethod, first.Method)
+	}
 	// respond as client
-	if first.ID == nil || first.ID.IsNil() { t.Fatalf("missing id on roots/list request") }
+	if first.ID == nil || first.ID.IsNil() {
+		t.Fatalf("missing id on roots/list request")
+	}
 	rootsResp := &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, ID: first.ID, Result: mustJSON(t, mcp.ListRootsResult{Roots: []mcp.Root{}})}
-	if err := th.send(rootsResp); err != nil { t.Fatal(err) }
+	if err := th.send(rootsResp); err != nil {
+		t.Fatal(err)
+	}
 
 	// then the final response to tools/list
-	if _, err := th.expectResponse(2 * time.Second); err != nil { t.Fatal(err) }
+	if _, err := th.expectResponse(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCompletion_Complete(t *testing.T) {
@@ -690,13 +758,23 @@ func TestCompletion_Complete(t *testing.T) {
 	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
 
 	req := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CompletionCompleteMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(t, mcp.CompleteRequest{Ref: mcp.ResourceReference{Type: "file", URI: "mem://a"}, Argument: mcp.CompleteArgument{Name: "path", Value: ""}})}
-	if err := th.send(req); err != nil { t.Fatal(err) }
+	if err := th.send(req); err != nil {
+		t.Fatal(err)
+	}
 	res, err := th.expectResponse(1 * time.Second)
-	if err != nil { t.Fatal(err) }
-	if res.Error != nil { t.Fatalf("complete error: %+v", res.Error) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("complete error: %+v", res.Error)
+	}
 	var cres mcp.CompleteResult
-	if err := json.Unmarshal(res.Result, &cres); err != nil { t.Fatal(err) }
-	if len(cres.Completion.Values) != 2 { t.Fatalf("unexpected completion: %+v", cres.Completion) }
+	if err := json.Unmarshal(res.Result, &cres); err != nil {
+		t.Fatal(err)
+	}
+	if len(cres.Completion.Values) != 2 {
+		t.Fatalf("unexpected completion: %+v", cres.Completion)
+	}
 }
 
 func TestLogging_SetLevelAndMessages(t *testing.T) {
@@ -716,9 +794,13 @@ func TestLogging_SetLevelAndMessages(t *testing.T) {
 
 	// Set to debug
 	setReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.LoggingSetLevelMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(t, mcp.SetLevelRequest{Level: mcp.LoggingLevelDebug})}
-	if err := th.send(setReq); err != nil { t.Fatal(err) }
+	if err := th.send(setReq); err != nil {
+		t.Fatal(err)
+	}
 	if res, err := th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
-		if err != nil { t.Fatal(err) }
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Fatalf("setLevel error: %+v", res.Error)
 	}
 	if !logger.Enabled(th.ctx, slog.LevelDebug) {
@@ -727,9 +809,13 @@ func TestLogging_SetLevelAndMessages(t *testing.T) {
 
 	// Invalid level should return InvalidParams
 	badReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.LoggingSetLevelMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.SetLevelRequest{Level: "bogus"})}
-	if err := th.send(badReq); err != nil { t.Fatal(err) }
+	if err := th.send(badReq); err != nil {
+		t.Fatal(err)
+	}
 	res, err := th.expectResponse(1 * time.Second)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if res.Error == nil || res.Error.Code != jsonrpc.ErrorCodeInvalidParams {
 		t.Fatalf("expected invalid params for bad level, got: %+v", res.Error)
 	}
