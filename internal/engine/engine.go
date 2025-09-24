@@ -16,10 +16,17 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"golang.org/x/sync/errgroup"
 )
 
-const defaultSessionTTL = 1 * time.Hour
-const defaultSessionMaxLifetime = 24 * time.Hour
+const (
+	defaultSessionTTL         = 1 * time.Hour
+	defaultSessionMaxLifetime = 24 * time.Hour
+)
+
+const (
+	sessionFanoutTopic = "session:events"
+)
 
 var (
 	ErrCancelled       = errors.New("operation cancelled")
@@ -43,7 +50,7 @@ type Engine struct {
 
 	// tool call tracking
 	toolCtxMu      sync.Mutex
-	toolCtxCancels map[string]context.CancelFunc // reqID -> cancel func
+	toolCtxCancels map[string]context.CancelCauseFunc // reqID -> cancel func
 
 	// rendez-vous tracking
 	rdvMu      sync.Mutex
@@ -80,6 +87,16 @@ func WithLogger(l *slog.Logger) EngineOption {
 			m.log = l
 		}
 	}
+}
+
+func (e *Engine) Run(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		return e.host.SubscribeEvents(ctx, sessionFanoutTopic, e.handleSessionEvent)
+	})
+
+	return g.Wait()
 }
 
 func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *jsonrpc.Request, requestScopedWriter MessageWriter) (*jsonrpc.Response, error) {
@@ -173,8 +190,8 @@ func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *j
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidRequest, "missing request ID", nil), nil
 	}
 
-	toolCtx, toolCancel := context.WithCancel(ctx)
-	defer toolCancel()
+	toolCtx, toolCancel := context.WithCancelCause(ctx)
+	defer toolCancel(context.Canceled)
 
 	e.toolCtxMu.Lock()
 	if _, exists := e.toolCtxCancels[reqID]; exists {
@@ -208,21 +225,30 @@ func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *j
 // actually handling the notification itself. The actual handling is done in the consumer loop
 // for these messages.
 func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, note *jsonrpc.Request) error {
-	sess, err := e.loadSession(ctx, sessID, userID, nil, nil)
+	_, err := e.loadSession(ctx, sessID, userID, nil, nil)
 	if err != nil {
 		return err
-	}
-
-	bytes, err := json.Marshal(note)
-	if err != nil {
-		e.log.Error("failed to marshal notification", "error", err)
-		return fmt.Errorf("failed to marshal notification: %w", err)
 	}
 
 	// We got a notification from a transport. We don't directly handle notifications in the engine. Instead
 	// we dispatch it across the session host so that all instances can see it. The actual handling of
 	// notifications is done in the consumer loop for these messages.
-	if err := e.host.PublishEvent(ctx, sess.SessionID(), topicForSessionFanout(sess.SessionID()), bytes); err != nil {
+	noteBytes, err := json.Marshal(note)
+	if err != nil {
+		e.log.Error("engine.handle_notification.err", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
+		return err
+	}
+	msg, err := json.Marshal(fanoutMessage{
+		SessionID: sessID,
+		UserID:    userID,
+		Msg:       noteBytes,
+	})
+	if err != nil {
+		e.log.Error("engine.handle_notification.err", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
+		return err
+	}
+
+	if err := e.host.PublishEvent(ctx, sessionFanoutTopic, msg); err != nil {
 		e.log.Error("failed to publish notification", "error", err)
 		return fmt.Errorf("failed to publish notification: %w", err)
 	}
@@ -330,13 +356,75 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 	return NewSessionHandle(e.host, metaRec, opts...), nil
 }
 
-func (e *Engine) cancelToolCall(reqID string) {
+func (e *Engine) cancelToolCall(reqID string, reason string) {
 	e.toolCtxMu.Lock()
 	cancel, exists := e.toolCtxCancels[reqID]
 	e.toolCtxMu.Unlock()
 	if exists && cancel != nil {
-		cancel()
+		cancel(errors.New(reason))
 	}
+}
+
+// handleSessionEvent processes a session-related event message received over
+// the inter-instance message bus.
+func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
+	var fanout fanoutMessage
+	if err := json.Unmarshal(msg, &fanout); err != nil {
+		e.log.Error("engine.handle_session_event.err", slog.String("err", err.Error()))
+		return nil // ignore malformed messages
+	}
+
+	var jsonMsg jsonrpc.AnyMessage
+	if err := json.Unmarshal(fanout.Msg, &jsonMsg); err != nil {
+		e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+		return nil // ignore malformed messages
+	}
+
+	req := jsonMsg.AsRequest()
+	if req != nil {
+		switch req.Method {
+		case string(mcp.CancelledNotificationMethod):
+			var params mcp.CancelledNotification
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+				return nil // ignore malformed messages
+			}
+
+			e.cancelToolCall(params.RequestID, params.Reason)
+			return nil
+		default:
+			// Unknown request; ignore.
+			e.log.Info("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("method", req.Method))
+			return nil
+		}
+	}
+
+	res := jsonMsg.AsResponse()
+	if res != nil {
+		// Responses will typically satisfy a rendez-vous channel.
+		reqID := res.ID.String()
+		if reqID == "" {
+			e.log.Error("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", "empty request ID"))
+			return nil // ignore malformed messages
+		}
+
+		e.rdvMu.Lock()
+		rdvCh, exists := e.rdvChans[reqID]
+		e.rdvMu.Unlock()
+		if exists && rdvCh != nil {
+			// Best-effort send; if the channel is blocked or closed, just drop the message.
+			select {
+			case rdvCh <- fanout.Msg:
+			case <-ctx.Done():
+			}
+			return nil
+		} else {
+			e.log.Info("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", reqID))
+			return nil
+		}
+	}
+
+	return nil
 }
 
 // createRendezVous creates a rendez-vous channel for a given request ID. The
@@ -369,10 +457,6 @@ func (e *Engine) createRendezVous(reqID string) (<-chan []byte, func()) {
 		delete(e.rdvChans, reqID)
 		e.rdvMu.Unlock()
 	}
-}
-
-func topicForSessionFanout(sessID string) string {
-	return fmt.Sprintf("session:%s:events", sessID)
 }
 
 // randomID returns a hex-encoded 16-byte cryptographically random string.

@@ -1,6 +1,6 @@
 module github.com/ggoodman/mcp-server-go
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/MicahParks/keyfunc/v3 v3.6.1
@@ -12,6 +12,7 @@ require (
 	github.com/invopop/jsonschema v0.13.0
 	github.com/modelcontextprotocol/go-sdk v0.3.0
 	github.com/redis/go-redis/v9 v9.13.0
+	golang.org/x/sync v0.17.0
 )
 
 require (
