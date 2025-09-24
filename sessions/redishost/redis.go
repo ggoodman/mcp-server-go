@@ -402,15 +402,21 @@ func (h *Host) SubscribeEvents(ctx context.Context, topic string, handler sessio
 	key := h.eventStreamKey(topic)
 	// First read uses the special "$" ID to mean "only entries added after this call".
 	// Subsequent reads use the last delivered entry ID for strict ordering.
-	started := make(chan struct{})
 	lastID := "$"
-	go func() {
-		close(started)
+	ready := make(chan struct{})
+	go func(start chan struct{}) {
+		first := true
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+			}
+			if first {
+				// Signal armed just before issuing the first blocking read
+				first = false
+				close(start)
+				start = nil // drop reference to allow GC
 			}
 			res, err := h.client.XRead(ctx, &redis.XReadArgs{Streams: []string{key, lastID}, Block: 500 * time.Millisecond}).Result()
 			if err != nil {
@@ -443,7 +449,14 @@ func (h *Host) SubscribeEvents(ctx context.Context, topic string, handler sessio
 				}
 			}
 		}
-	}()
-	<-started
+	}(ready)
+	// Wait until the reader goroutine has armed its first blocking read,
+	// but don't block forever if the context is canceled early.
+	select {
+	case <-ready:
+		// armed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	return nil
 }

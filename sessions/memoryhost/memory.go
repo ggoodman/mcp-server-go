@@ -26,11 +26,13 @@ type Host struct {
 
 // sessionStream stores ordered messages for a session plus waiters for new data.
 type sessionStream struct {
-	mu       sync.Mutex
-	messages []message
-	nextID   int64
-	waiters  []chan struct{}
-	closed   bool
+	mu        sync.Mutex
+	messages  []message
+	nextID    int64
+	waiters   []chan struct{}
+	closed    bool
+	delivered map[string]bool // messages acked (handler returned nil)
+	inflight  map[string]bool // messages currently being processed
 }
 
 type message struct {
@@ -63,7 +65,7 @@ func (h *Host) getOrCreateStream(sessionID string) *sessionStream {
 	if s, ok := h.streams[sessionID]; ok {
 		return s
 	}
-	s := &sessionStream{}
+	s := &sessionStream{delivered: make(map[string]bool), inflight: make(map[string]bool)}
 	h.streams[sessionID] = s
 	return s
 }
@@ -81,16 +83,14 @@ func (h *Host) PublishSession(ctx context.Context, sessionID string, data []byte
 	// copy payload to avoid caller mutation
 	cp := append([]byte(nil), data...)
 	s.messages = append(s.messages, message{id: id, data: cp})
-	// wake waiters
-	if len(s.waiters) > 0 {
-		for _, ch := range s.waiters {
-			select { // non-blocking signal
-			case ch <- struct{}{}:
-			default:
-			}
+	// wake waiters (broadcast; claim under lock ensures single delivery)
+	for _, ch := range s.waiters {
+		select { // non-blocking signal
+		case ch <- struct{}{}:
+		default:
 		}
-		s.waiters = nil
 	}
+	s.waiters = nil
 	s.mu.Unlock()
 	return id, nil
 }
@@ -100,30 +100,21 @@ func (h *Host) PublishSession(ctx context.Context, sessionID string, data []byte
 func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEventID string, handler sessions.MessageHandlerFunction) error {
 	s := h.getOrCreateStream(sessionID)
 
-	// Determine starting index
+	// Local cursor to start-after semantics, tracked as index not string to avoid lexicographic issues
 	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return errors.New("session closed")
-	}
-	startIdx := 0
-	if lastEventID == "" { // only future messages
-		startIdx = len(s.messages)
-	} else {
-		// find lastEventID
-		found := -1
+	lastIdx := -1
+	if lastEventID != "" {
 		for i := range s.messages {
 			if s.messages[i].id == lastEventID {
-				found = i
+				lastIdx = i
 				break
 			}
 		}
-		if found >= 0 {
-			startIdx = found + 1
-		} else {
-			// Treat unknown ID as requesting only future messages (acceptable per test contract)
-			startIdx = len(s.messages)
+		if lastIdx < 0 {
+			lastIdx = len(s.messages) - 1 // future only
 		}
+	} else {
+		lastIdx = len(s.messages) - 1 // future only
 	}
 	s.mu.Unlock()
 
@@ -131,32 +122,63 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Fast path: drain any pending messages >= startIdx
+
+		// Try to claim the next available message strictly after lastIdx
+		var claimed *message
 		s.mu.Lock()
 		if s.closed {
 			s.mu.Unlock()
 			return errors.New("session closed")
 		}
-		if startIdx < len(s.messages) {
-			msg := s.messages[startIdx]
-			startIdx++
-			s.mu.Unlock()
-			if err := handler(ctx, msg.id, append([]byte(nil), msg.data...)); err != nil {
-				return err
+		for i := range s.messages {
+			if i <= lastIdx {
+				continue
 			}
-			continue
+			id := s.messages[i].id
+			if s.delivered[id] || s.inflight[id] {
+				continue
+			}
+			s.inflight[id] = true
+			claimed = &s.messages[i]
+			break
 		}
-		// No messages; register waiter then wait on context or signal
-		waiter := make(chan struct{}, 1)
-		s.waiters = append(s.waiters, waiter)
+		if claimed == nil {
+			// register waiter and wait for new messages
+			waiter := make(chan struct{}, 1)
+			s.waiters = append(s.waiters, waiter)
+			s.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waiter:
+				// loop and attempt to claim again
+				continue
+			}
+		}
 		s.mu.Unlock()
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-waiter:
-			// loop; new message available
+		// Process outside lock
+		msgID := claimed.id
+		data := append([]byte(nil), claimed.data...)
+		if err := handler(ctx, msgID, data); err != nil {
+			// release claim for redelivery
+			s.mu.Lock()
+			delete(s.inflight, msgID)
+			s.mu.Unlock()
+			return err
 		}
+		// ack delivery and advance local cursor
+		s.mu.Lock()
+		delete(s.inflight, msgID)
+		s.delivered[msgID] = true
+		// advance lastIdx to this message index
+		for i := range s.messages {
+			if s.messages[i].id == msgID {
+				lastIdx = i
+				break
+			}
+		}
+		s.mu.Unlock()
 	}
 }
 
