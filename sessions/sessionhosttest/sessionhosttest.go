@@ -24,6 +24,7 @@ func RunSessionHostTests(t *testing.T, factory HostFactory) {
 	t.Run("Messaging_SubscriptionContextCancellation", func(t *testing.T) { testSubscriptionContextCancellation(t, factory) })
 	t.Run("Messaging_HandlerErrorStopsSubscription", func(t *testing.T) { testHandlerErrorStopsSubscription(t, factory) })
 	t.Run("Messaging_ResumeFromNonExistentEventID", func(t *testing.T) { testResumeFromNonExistentEventID(t, factory) })
+	t.Run("Messaging_CompetingConsumers_NoDuplicates", func(t *testing.T) { testCompetingConsumersNoDuplicates(t, factory) })
 
 	// Event fan-out semantics
 	t.Run("Events_FanOut_AllSubscribersReceiveAllFuture", func(t *testing.T) { testEventsFanOutAllSubscribersReceiveAllFuture(t, factory) })
@@ -308,6 +309,93 @@ func testResumeFromNonExistentEventID(t *testing.T, factory HostFactory) {
 	// Implementations may either return an error immediately, or block until deadline with no delivery.
 	if err == nil {
 		t.Logf("subscribe returned nil for non-existent event id; acceptable if no messages were delivered until deadline")
+	}
+}
+
+// Competing consumption: two subscribers to the same session should not both receive the same message.
+// Total deliveries across subscribers should equal the number of published messages (at-least-once, no duplicates under normal operation).
+func testCompetingConsumersNoDuplicates(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sessionID := "sess-cc-1"
+	const n = 10
+
+	type rec struct {
+		mu   sync.Mutex
+		ids  []string
+		done chan error
+	}
+	sub := func(r *rec) {
+		r.done <- h.SubscribeSession(ctx, sessionID, "", func(c context.Context, id string, msg []byte) error {
+			r.mu.Lock()
+			r.ids = append(r.ids, id)
+			r.mu.Unlock()
+			return nil
+		})
+	}
+
+	var r1, r2 rec
+	r1.done = make(chan error, 1)
+	r2.done = make(chan error, 1)
+	go sub(&r1)
+	go sub(&r2)
+
+	// Give subscribers a moment to attach
+	time.Sleep(100 * time.Millisecond)
+
+	// Publish n messages
+	for i := 0; i < n; i++ {
+		req := &jsonrpc.Request{JSONRPCVersion: "2.0", Method: "cc/" + strconv.Itoa(i), ID: jsonrpc.NewRequestID(i + 1)}
+		b, _ := json.Marshal(req)
+		if _, err := h.PublishSession(ctx, sessionID, b); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+	}
+
+	// Wait for all messages to be delivered or timeout
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r1.mu.Lock()
+		c1 := len(r1.ids)
+		r1.mu.Unlock()
+		r2.mu.Lock()
+		c2 := len(r2.ids)
+		r2.mu.Unlock()
+		if c1+c2 >= n {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// cancel to stop subscribers
+	cancel()
+	<-r1.done
+	<-r2.done
+
+	r1.mu.Lock()
+	ids1 := append([]string(nil), r1.ids...)
+	r1.mu.Unlock()
+	r2.mu.Lock()
+	ids2 := append([]string(nil), r2.ids...)
+	r2.mu.Unlock()
+	total := len(ids1) + len(ids2)
+	if total != n {
+		t.Fatalf("expected %d total deliveries, got %d (s1=%d, s2=%d)", n, total, len(ids1), len(ids2))
+	}
+	// ensure no duplicates across subscribers
+	seen := make(map[string]bool, n)
+	for _, id := range ids1 {
+		if seen[id] {
+			t.Fatalf("duplicate delivery for id %s", id)
+		}
+		seen[id] = true
+	}
+	for _, id := range ids2 {
+		if seen[id] {
+			t.Fatalf("duplicate delivery for id %s", id)
+		}
+		seen[id] = true
 	}
 }
 
