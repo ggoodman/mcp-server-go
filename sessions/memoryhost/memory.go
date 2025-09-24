@@ -214,10 +214,12 @@ func (h *Host) PublishEvent(ctx context.Context, topic string, payload []byte) e
 	for _, ch := range chans {
 		// copy payload for each subscriber (independent delivery)
 		cp := append([]byte(nil), payload...)
+		// Non-blocking send: drop if subscriber is slow or has unsubscribed.
+		// This avoids races with subscriber teardown and prevents publisher stalls.
 		select {
 		case ch <- cp:
-		case <-ctx.Done():
-			return ctx.Err()
+		default:
+			// drop
 		}
 	}
 	return nil
@@ -237,7 +239,6 @@ func (h *Host) SubscribeEvents(ctx context.Context, topic string, handler sessio
 		defer func() {
 			es.mu.Lock()
 			delete(es.subs, id)
-			close(ch)
 			es.mu.Unlock()
 		}()
 		for {
