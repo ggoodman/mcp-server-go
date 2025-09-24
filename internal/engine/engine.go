@@ -27,6 +27,9 @@ const (
 	sessionFanoutTopic = "session:events"
 )
 
+// internal fanout-only method name for session deletion notifications.
+const internalSessionDeletedMethod = "internal/session/deleted"
+
 var (
 	ErrCancelled       = errors.New("operation cancelled")
 	ErrSessionNotFound = errors.New("session not found")
@@ -1138,6 +1141,10 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 			_ = e.eagerWireSession(ctx, fanout.SessionID, fanout.UserID)
 			e.log.Info("engine.handle_session_event.open", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID))
 			return nil
+		case internalSessionDeletedMethod:
+			// Teardown any local per-session subscriptions.
+			e.cancelAllSubscriptionsForSession(fanout.SessionID)
+			return nil
 		case string(mcp.CancelledNotificationMethod):
 			var params mcp.CancelledNotification
 			if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -1305,6 +1312,18 @@ func (e *Engine) DeleteSession(ctx context.Context, sessID, userID string) (stri
 		return "", ErrSessionNotFound
 	}
 	pv := meta.ProtocolVersion
+	// Best-effort: cancel any local subscriptions for this session prior to deletion.
+	e.cancelAllSubscriptionsForSession(sessID)
+
+	// Broadcast a fanout event so other instances can cancel their local subscriptions.
+	// This uses an internal method name understood only by the engine fanout handler.
+	note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: internalSessionDeletedMethod}
+	bytes, _ := json.Marshal(note)
+	outer := fanoutMessage{SessionID: sessID, UserID: userID, Msg: bytes}
+	if payload, err := json.Marshal(outer); err == nil {
+		_ = e.host.PublishEvent(context.Background(), sessionFanoutTopic, payload)
+	}
+
 	if err := e.host.DeleteSession(ctx, sessID); err != nil {
 		return "", fmt.Errorf("delete session: %w", err)
 	}
@@ -1335,6 +1354,21 @@ func (e *Engine) PublishToSession(ctx context.Context, sessID, userID string, ms
 		return "", fmt.Errorf("publish session: %w", err)
 	}
 	return evtID, nil
+}
+
+// cancelAllSubscriptionsForSession cancels and removes all tracked subscriptions for sessID.
+func (e *Engine) cancelAllSubscriptionsForSession(sessID string) {
+	e.subMu.Lock()
+	if m := e.subCancels[sessID]; len(m) > 0 {
+		for uri, cancel := range m {
+			if cancel != nil {
+				_ = cancel(context.Background())
+			}
+			delete(m, uri)
+		}
+		delete(e.subCancels, sessID)
+	}
+	e.subMu.Unlock()
 }
 
 // randomID returns a hex-encoded 16-byte cryptographically random string.
