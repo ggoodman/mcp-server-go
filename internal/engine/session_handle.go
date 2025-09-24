@@ -11,6 +11,7 @@ type SessionHandle struct {
 	sessionID       string
 	userID          string
 	protocolVersion string
+	state           sessions.SessionState
 
 	logLevel mcp.LoggingLevel // verbosity level for this session
 
@@ -25,6 +26,7 @@ func NewSessionHandle(host sessions.SessionHost, meta *sessions.SessionMetadata,
 		sessionID:       meta.SessionID,
 		userID:          meta.UserID,
 		protocolVersion: meta.ProtocolVersion,
+		state:           meta.State,
 
 		logLevel: mcp.LoggingLevelInfo, // default
 	}
@@ -35,6 +37,8 @@ func NewSessionHandle(host sessions.SessionHost, meta *sessions.SessionMetadata,
 
 	return s
 }
+
+func (s *SessionHandle) State() sessions.SessionState { return s.state }
 
 type SessionHandleOption func(*SessionHandle)
 

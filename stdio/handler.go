@@ -33,6 +33,7 @@ type Handler struct {
 	userID  string
 
 	initialized   bool
+	sessionOpen   bool
 	session       sessions.Session
 	sessionCancel context.CancelFunc
 }
@@ -107,10 +108,15 @@ func (h *Handler) Serve(ctx context.Context) error {
 				continue
 			}
 			if req.Method == string(mcp.InitializeMethod) {
+				// Initialization is a one-time handshake; handle synchronously.
 				h.handleInitialize(engineCtx, logger, req)
 				continue
 			}
-			h.handleRequest(engineCtx, logger, req)
+
+			// Handle non-initialize requests concurrently so we can continue
+			// reading stdin for cancellations and client responses.
+			reqCopy := *req
+			go h.handleRequest(engineCtx, logger, &reqCopy)
 		case "notification":
 			req := msg.AsRequest()
 			if req == nil {
@@ -174,7 +180,7 @@ func (h *Handler) handleInitialize(ctx context.Context, logger *slog.Logger, req
 
 	h.session = sess
 	h.initialized = true
-	h.startSessionPump(ctx, sess.SessionID())
+	// Do not start the session pump yet; wait for notifications/initialized.
 
 	resp, err := jsonrpc.NewResultResponse(req.ID, initRes)
 	if err != nil {
@@ -190,6 +196,10 @@ func (h *Handler) handleInitialize(ctx context.Context, logger *slog.Logger, req
 
 func (h *Handler) handleRequest(ctx context.Context, logger *slog.Logger, req *jsonrpc.Request) {
 	if !h.initialized || h.session == nil {
+		h.writeError(logger, req.ID, jsonrpc.ErrorCodeInvalidRequest, "session not initialized", nil)
+		return
+	}
+	if !h.sessionOpen {
 		h.writeError(logger, req.ID, jsonrpc.ErrorCodeInvalidRequest, "session not initialized", nil)
 		return
 	}
@@ -229,6 +239,13 @@ func (h *Handler) handleNotification(ctx context.Context, logger *slog.Logger, n
 
 	if err := h.engine.HandleNotification(ctx, h.session.SessionID(), h.session.UserID(), note); err != nil {
 		logger.Error("notification.handle.fail", slog.String("method", note.Method), slog.String("err", err.Error()))
+		return
+	}
+
+	if note.Method == string(mcp.InitializedNotificationMethod) && !h.sessionOpen {
+		// Mark session open locally and start pump; engine will flip state via fanout.
+		h.sessionOpen = true
+		h.startSessionPump(ctx, h.session.SessionID())
 	}
 }
 

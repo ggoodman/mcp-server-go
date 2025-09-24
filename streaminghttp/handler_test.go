@@ -416,7 +416,7 @@ func TestMultiInstance(t *testing.T) {
 		// Step 3: Coordinate on server-side readiness, then publish once
 		ctx := t.Context()
 		readyCh := make(chan struct{}, 1)
-		if err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+		if err := sharedHost.SubscribeEvents(ctx, "streaminghttp/ready", func(context.Context, []byte) error {
 			select {
 			case readyCh <- struct{}{}:
 			default:
@@ -431,7 +431,7 @@ func TestMultiInstance(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			// proceed anyway; worst case the publish below races (rare on CI), the SSE reader still loops
 		}
-		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.ResourcesListChangedNotificationMethod), nil)
+		_ = sharedHost.PublishEvent(ctx, string(mcp.ResourcesListChangedNotificationMethod), nil)
 
 		// Step 4: Wait for notification
 		select {
@@ -499,15 +499,15 @@ func TestMultiInstance(t *testing.T) {
 		// Step 3: Coordinate on server-side readiness, then publish once
 		ctx := t.Context()
 		readyCh := make(chan struct{}, 1)
-		unsub, err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+		err := sharedHost.SubscribeEvents(ctx, "streaminghttp/ready", func(context.Context, []byte) error {
 			select {
 			case readyCh <- struct{}{}:
 			default:
 			}
 			return nil
 		})
-		if err == nil && unsub != nil {
-			defer unsub()
+		if err != nil {
+			t.Fatalf("subscribe ready: %v", err)
 		}
 		select {
 		case <-readyCh:
@@ -515,7 +515,7 @@ func TestMultiInstance(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			// proceed anyway
 		}
-		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.ToolsListChangedNotificationMethod), nil)
+		_ = sharedHost.PublishEvent(ctx, string(mcp.ToolsListChangedNotificationMethod), nil)
 
 		// Step 4: Wait for notification
 		select {
@@ -575,21 +575,21 @@ func TestMultiInstance(t *testing.T) {
 		// Coordinate on server readiness before publishing
 		ctx := t.Context()
 		readyCh := make(chan struct{}, 1)
-		unsub, err := sharedHost.SubscribeEvents(ctx, sessID, "streaminghttp/ready", func(context.Context, []byte) error {
+		err := sharedHost.SubscribeEvents(ctx, "streaminghttp/ready", func(context.Context, []byte) error {
 			select {
 			case readyCh <- struct{}{}:
 			default:
 			}
 			return nil
 		})
-		if err == nil && unsub != nil {
-			defer unsub()
+		if err != nil {
+			t.Fatalf("subscribe ready: %v", err)
 		}
 		select {
 		case <-readyCh:
 		case <-time.After(3 * time.Second):
 		}
-		_ = sharedHost.PublishEvent(ctx, sessID, string(mcp.PromptsListChangedNotificationMethod), nil)
+		_ = sharedHost.PublishEvent(ctx, string(mcp.PromptsListChangedNotificationMethod), nil)
 
 		select {
 		case evt := <-eventsCh:

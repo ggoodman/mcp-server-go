@@ -47,6 +47,7 @@ type Engine struct {
 	// session config
 	sessionTTL         time.Duration
 	sessionMaxLifetime time.Duration
+	handshakeTTL       time.Duration
 
 	// tool call tracking
 	toolCtxMu      sync.Mutex
@@ -56,6 +57,10 @@ type Engine struct {
 	rdvMu      sync.Mutex
 	rdvChans   map[string]chan []byte // reqID -> response channel
 	rdvClosers map[string]func()      // reqID -> close function
+
+	// wiring state for per-session background emitters
+	wireMu sync.Mutex
+	wired  map[string]bool // sessionID -> registered
 }
 
 func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opts ...EngineOption) *Engine {
@@ -65,8 +70,12 @@ func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opt
 		log:                slog.Default(),
 		sessionTTL:         defaultSessionTTL,
 		sessionMaxLifetime: defaultSessionMaxLifetime,
+		handshakeTTL:       30 * time.Second,
 		toolCtxCancels:     make(map[string]context.CancelCauseFunc),
+		wired:              make(map[string]bool),
 	}
+	// Keep linters honest about method usage in builds where certain paths are pruned.
+	_ = e.handshakeTTL
 	return e
 }
 
@@ -79,6 +88,16 @@ func WithSessionTTL(d time.Duration) EngineOption { return func(m *Engine) { m.s
 // WithSessionMaxLifetime sets an absolute maximum lifetime horizon (0 = disabled).
 func WithSessionMaxLifetime(d time.Duration) EngineOption {
 	return func(m *Engine) { m.sessionMaxLifetime = d }
+}
+
+// WithHandshakeTTL sets the TTL for a pending session awaiting the client's
+// notifications/initialized message. Default is 30s.
+func WithHandshakeTTL(d time.Duration) EngineOption {
+	return func(m *Engine) {
+		if d > 0 {
+			m.handshakeTTL = d
+		}
+	}
 }
 
 // WithLogger sets a custom logger for the Engine.
@@ -221,6 +240,7 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 	}
 
 	cleanup = false
+
 	return sess, initRes, nil
 }
 
@@ -233,6 +253,12 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 	))
 	if err != nil {
 		return nil, err
+	}
+
+	// Require session to be open before serving requests (except initialize, which
+	// doesn't reach here).
+	if st := sess.State(); st != "" && st != sessions.SessionStateOpen {
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidRequest, "session not initialized", nil), nil
 	}
 
 	ctx = logctx.WithSessionID(ctx, sess.SessionID())
@@ -323,7 +349,7 @@ func (e *Engine) handleToolsList(ctx context.Context, sess *SessionHandle, req *
 		Tools: page.Items,
 	}
 	if page.NextCursor != nil {
-		result.PaginatedResult.NextCursor = *page.NextCursor
+		result.NextCursor = *page.NextCursor
 	}
 
 	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()), slog.Int("tool_count", len(page.Items)))
@@ -392,6 +418,11 @@ func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *j
 
 	res, err := cap.CallTool(toolCtx, sess, &params)
 	if err != nil {
+		// If the tool was cancelled, surface a JSON-RPC error to the client quickly.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			log.InfoContext(ctx, "engine.handle_request.cancelled", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "cancelled", nil), nil
+		}
 		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
 	}
@@ -409,6 +440,47 @@ func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, 
 	_, err := e.loadSession(ctx, sessID, userID, nil, nil)
 	if err != nil {
 		return err
+	}
+
+	// If the client signals initialized, open the session immediately on this
+	// instance to avoid local races, then fan out for other instances.
+	if note.Method == string(mcp.InitializedNotificationMethod) {
+		now := time.Now().UTC()
+		if err := e.host.MutateSession(ctx, sessID, func(m *sessions.SessionMetadata) error {
+			if m == nil || m.Revoked || m.UserID != userID {
+				return nil
+			}
+			// Idempotent: if already open, nothing to do.
+			if m.State == sessions.SessionStateOpen {
+				return nil
+			}
+			// Treat empty as pending for newly created sessions; set to open.
+			m.State = sessions.SessionStateOpen
+			if m.OpenedAt.IsZero() {
+				m.OpenedAt = now
+			}
+			m.TTL = e.sessionTTL
+			m.UpdatedAt = now
+			m.LastAccess = now
+			return nil
+		}); err != nil {
+			e.log.Error("engine.handle_notification.open.fail", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
+			// Continue to publish fanout even if local mutation failed.
+		} else {
+			// Best-effort eager wiring; safe to call multiple times.
+			_ = e.eagerWireSession(ctx, sessID, userID)
+		}
+	}
+
+	if note.Method == string(mcp.CancelledNotificationMethod) {
+		var params mcp.CancelledNotification
+		if err := json.Unmarshal(note.Params, &params); err != nil {
+			e.log.Error("engine.handle_notification.cancel.decode", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
+			return nil
+		}
+
+		hadCancel := e.cancelInFlightRequest(params.RequestID, params.Reason)
+		e.log.Info("engine.handle_notification.cancel.dispatched", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("request_id", params.RequestID), slog.Bool("had_cancel", hadCancel))
 	}
 
 	// We got a notification from a transport. We don't directly handle notifications in the engine. Instead
@@ -434,6 +506,9 @@ func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, 
 		return fmt.Errorf("failed to publish notification: %w", err)
 	}
 
+	// Trace successful dispatch
+	e.log.Info("engine.handle_notification.dispatch", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("method", note.Method))
+
 	return nil
 }
 
@@ -455,10 +530,11 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 		ProtocolVersion: protocolVersion,
 		Client:          meta,
 		Capabilities:    caps,
+		State:           sessions.SessionStatePending,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 		LastAccess:      now,
-		TTL:             e.sessionTTL,
+		TTL:             e.handshakeTTL,
 		MaxLifetime:     e.sessionMaxLifetime,
 		Revoked:         false,
 	}
@@ -478,18 +554,92 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 	)
 
 	opts := []SessionHandleOption{}
-	if metaRec.Capabilities.Sampling {
-		// TODO: Wire up sampling capability here.
-	}
-	if metaRec.Capabilities.Roots {
-		// TODO: Wire up roots capability here.
-	}
-	if metaRec.Capabilities.Elicitation {
-
-		// TODO: Wire up elicitation capability here.
-	}
 
 	return NewSessionHandle(e.host, metaRec, opts...), nil
+}
+
+// eagerWireSession ensures the session has session-scoped writers wired so that
+// background capabilities can emit immediately after open.
+func (e *Engine) eagerWireSession(ctx context.Context, sessID, userID string) error {
+	// We only need a session-scoped writer that delivers to the per-session
+	// client-facing stream; requestScopedWriter can be nil here.
+	sess, err := e.loadSession(ctx, sessID, userID, nil, NewMessageWriterFunc(
+		func(ctx context.Context, msg jsonrpc.Message) error {
+			_, err := e.host.PublishSession(ctx, sessID, msg)
+			return err
+		},
+	))
+	if err != nil {
+		return err
+	}
+	// Mark wiring intent (ensures wireMu is used at least for state guarding)
+	e.wireMu.Lock()
+	already := e.wired[sessID]
+	e.wireMu.Unlock()
+	if already {
+		return nil
+	}
+	return e.registerListChangedEmitters(ctx, sess)
+}
+
+// registerListChangedEmitters wires capability change listeners to emit JSON-RPC
+// notifications on the per-session client stream. It is idempotent per session.
+//
+//lint:ignore U1000 used via eagerWireSession
+func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionHandle) error {
+	sid := sess.SessionID()
+	uid := sess.UserID()
+
+	e.wireMu.Lock()
+	if e.wired[sid] {
+		e.wireMu.Unlock()
+		return nil
+	}
+	e.wired[sid] = true
+	e.wireMu.Unlock()
+
+	// helper to publish a no-param notification
+	publishNote := func(method mcp.Method) {
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(method)}
+		bytes, err := json.Marshal(note)
+		if err != nil {
+			e.log.Error("engine.emitter.encode.fail", slog.String("session_id", sid), slog.String("user_id", uid), slog.String("method", string(method)), slog.String("err", err.Error()))
+			return
+		}
+		if _, err := e.host.PublishSession(ctx, sid, bytes); err != nil {
+			e.log.Error("engine.emitter.publish.fail", slog.String("session_id", sid), slog.String("user_id", uid), slog.String("method", string(method)), slog.String("err", err.Error()))
+		}
+	}
+
+	// Resources listChanged
+	if resCap, ok, err := e.srv.GetResourcesCapability(ctx, sess); err == nil && ok && resCap != nil {
+		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, sess); lErr == nil && hasLC && lc != nil {
+			_, _ = lc.Register(ctx, sess, func(cbCtx context.Context, s sessions.Session, uri string) {
+				_ = uri // we emit generic listChanged per spec
+				publishNote(mcp.ResourcesListChangedNotificationMethod)
+			})
+		}
+	}
+
+	// Tools listChanged
+	if toolsCap, ok, err := e.srv.GetToolsCapability(ctx, sess); err == nil && ok && toolsCap != nil {
+		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, sess); lErr == nil && hasLC && lc != nil {
+			_, _ = lc.Register(ctx, sess, func(cbCtx context.Context, s sessions.Session) {
+				publishNote(mcp.ToolsListChangedNotificationMethod)
+			})
+		}
+	}
+
+	// Prompts listChanged
+	if promptsCap, ok, err := e.srv.GetPromptsCapability(ctx, sess); err == nil && ok && promptsCap != nil {
+		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, sess); lErr == nil && hasLC && lc != nil {
+			_, _ = lc.Register(ctx, sess, func(cbCtx context.Context, s sessions.Session) {
+				publishNote(mcp.PromptsListChangedNotificationMethod)
+			})
+		}
+	}
+
+	return nil
 }
 
 // loadSession retrieves and validates session metadata, returning a handle.
@@ -526,24 +676,47 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 				sessionScopedWriter: sessionScopedWriter,
 			}))
 		}
-		if metaRec.Capabilities.Roots {
-			// TODO: Wire up roots capability here.
-		}
 		if metaRec.Capabilities.Elicitation {
-			// TODO: Wire up elicitation capability here.
+			opts = append(opts, WithElicitationCapability(&elicitationCapability{
+				eng:                 e,
+				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "elicitation")),
+				sessID:              sessID,
+				userID:              userID,
+				requestScopedWriter: requestScopedWriter,
+				sessionScopedWriter: sessionScopedWriter,
+			}))
 		}
 	}
 
 	return NewSessionHandle(e.host, metaRec, opts...), nil
 }
 
-func (e *Engine) cancelToolCall(reqID string, reason string) {
+func (e *Engine) cancelInFlightRequest(reqID string, reason string) bool {
+	if reqID == "" {
+		return false
+	}
+
 	e.toolCtxMu.Lock()
 	cancel, exists := e.toolCtxCancels[reqID]
 	e.toolCtxMu.Unlock()
+
 	if exists && cancel != nil {
-		cancel(errors.New(reason))
+		cancelReason := reason
+		if cancelReason == "" {
+			cancelReason = "cancelled"
+		}
+		cancel(errors.New(cancelReason))
 	}
+
+	e.rdvMu.Lock()
+	if closer, ok := e.rdvClosers[reqID]; ok && closer != nil {
+		delete(e.rdvClosers, reqID)
+		closer()
+	}
+	delete(e.rdvChans, reqID)
+	e.rdvMu.Unlock()
+
+	return exists && cancel != nil
 }
 
 // handleSessionEvent processes a session-related event message received over
@@ -555,6 +728,9 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 		return nil // ignore malformed messages
 	}
 
+	// Trace event receipt
+	e.log.Info("engine.handle_session_event.recv", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID))
+
 	var jsonMsg jsonrpc.AnyMessage
 	if err := json.Unmarshal(fanout.Msg, &jsonMsg); err != nil {
 		e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
@@ -564,6 +740,32 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 	req := jsonMsg.AsRequest()
 	if req != nil {
 		switch req.Method {
+		case string(mcp.InitializedNotificationMethod):
+			now := time.Now().UTC()
+			// Flip session to open (idempotent) for cross-instance coordination.
+			if err := e.host.MutateSession(ctx, fanout.SessionID, func(m *sessions.SessionMetadata) error {
+				if m == nil || m.Revoked || m.UserID != fanout.UserID {
+					return nil
+				}
+				if m.State == sessions.SessionStateOpen {
+					return nil
+				}
+				m.State = sessions.SessionStateOpen
+				if m.OpenedAt.IsZero() {
+					m.OpenedAt = now
+				}
+				m.TTL = e.sessionTTL
+				m.UpdatedAt = now
+				m.LastAccess = now
+				return nil
+			}); err != nil {
+				e.log.Error("engine.handle_session_event.open.fail", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+				return nil
+			}
+			// Eager-wire emitters after open.
+			_ = e.eagerWireSession(ctx, fanout.SessionID, fanout.UserID)
+			e.log.Info("engine.handle_session_event.open", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID))
+			return nil
 		case string(mcp.CancelledNotificationMethod):
 			var params mcp.CancelledNotification
 			if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -571,7 +773,11 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 				return nil // ignore malformed messages
 			}
 
-			e.cancelToolCall(params.RequestID, params.Reason)
+			// Trace cancellation delivery
+			e.log.Info("engine.handle_session_event.cancel", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", params.RequestID), slog.String("reason", params.Reason))
+
+			hadCancel := e.cancelInFlightRequest(params.RequestID, params.Reason)
+			e.log.Info("engine.handle_session_event.cancel.dispatched", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", params.RequestID), slog.Bool("had_cancel", hadCancel))
 			return nil
 		default:
 			// Unknown request; ignore.
@@ -596,7 +802,8 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 			// Best-effort send; if the channel is blocked or closed, just drop the message.
 			select {
 			case rdvCh <- fanout.Msg:
-			case <-ctx.Done():
+			default:
+				// receiver not ready; drop as per at-least-once semantics
 			}
 			return nil
 		} else {
@@ -613,7 +820,8 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 // The returned close function MUST be called to clean up resources associated
 // with the rendez-vous once it is no longer needed.
 func (e *Engine) createRendezVous(reqID string) (<-chan []byte, func()) {
-	recvCh := make(chan []byte)
+	// Small buffer to tolerate brief receiver delays without blocking the fanout loop.
+	recvCh := make(chan []byte, 1)
 	closeCh := func() {
 		close(recvCh)
 	}

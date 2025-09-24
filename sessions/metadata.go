@@ -38,6 +38,19 @@ type MetadataClientInfo struct {
 	InstanceID string `json:"instance_id,omitempty"`
 }
 
+// SessionState represents the lifecycle phase of a session.
+type SessionState string
+
+const (
+	// SessionStatePending indicates the server has responded to initialize but
+	// has not yet received the client's notifications/initialized. While pending,
+	// the session must not accept requests.
+	SessionStatePending SessionState = "pending"
+	// SessionStateOpen indicates the client has completed initialization and the
+	// session is fully operational.
+	SessionStateOpen SessionState = "open"
+)
+
 // SessionMetadata is the authoritative persisted representation of an MCP
 // session. Invalidation and lifetime are handled via stored flags + TTL
 // semantics in the host.
@@ -56,12 +69,17 @@ type SessionMetadata struct {
 	ProtocolVersion string             `json:"protocol_version,omitempty"` // immutable after creation handshake
 	Client          MetadataClientInfo `json:"client,omitempty"`           // immutable (can relax later if needed)
 	Capabilities    CapabilitySet      `json:"capabilities,omitempty"`     // immutable
+	// State tracks whether the session is pending or open. Missing state should
+	// be interpreted as open for backward compatibility.
+	State SessionState `json:"state,omitempty"`
 
 	CreatedAt   time.Time     `json:"created_at"`
 	UpdatedAt   time.Time     `json:"updated_at"`
 	LastAccess  time.Time     `json:"last_access"`
 	TTL         time.Duration `json:"ttl"`
 	MaxLifetime time.Duration `json:"max_lifetime,omitempty"`
+	// OpenedAt records when the session transitioned to open.
+	OpenedAt time.Time `json:"opened_at,omitempty"`
 
 	Revoked bool `json:"revoked"`
 
