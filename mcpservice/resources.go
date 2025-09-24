@@ -233,7 +233,8 @@ func (r resourceSubscriptionFromContainer) Subscribe(ctx context.Context, sessio
 				default:
 				}
 				if emit != nil {
-					emit(context.Background(), uri)
+					// Preserve values (session, request, tracing) while decoupling from caller cancellation.
+					emit(context.WithoutCancel(fwdCtx), uri)
 				}
 			}
 		}

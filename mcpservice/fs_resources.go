@@ -589,7 +589,8 @@ func (f fsSubscription) Subscribe(ctx context.Context, s sessions.Session, uri s
 	f.r.mu.Unlock()
 
 	// Bridge update signals to the provided emitter.
-	fwdCtx, stop := context.WithCancel(context.Background())
+	// Preserve values (session/user/tracing) but decouple from caller cancellation.
+	fwdCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
 	ch := f.r.subscriberForURI(uri)
 	go func() {
 		for {
@@ -601,7 +602,7 @@ func (f fsSubscription) Subscribe(ctx context.Context, s sessions.Session, uri s
 					return
 				}
 				if emit != nil {
-					emit(context.Background(), uri)
+					emit(context.WithoutCancel(fwdCtx), uri)
 				}
 			}
 		}
