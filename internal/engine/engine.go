@@ -65,6 +65,7 @@ func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opt
 		log:                slog.Default(),
 		sessionTTL:         defaultSessionTTL,
 		sessionMaxLifetime: defaultSessionMaxLifetime,
+		toolCtxCancels:     make(map[string]context.CancelCauseFunc),
 	}
 	return e
 }
@@ -99,6 +100,130 @@ func (e *Engine) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
+// InitializeSession handles the MCP initialize handshake, creating a session record,
+// wiring negotiated capabilities, and returning the InitializeResult payload alongside
+// a session handle for subsequent requests.
+func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.InitializeRequest) (*SessionHandle, *mcp.InitializeResult, error) {
+	if req == nil {
+		return nil, nil, fmt.Errorf("initialize request required")
+	}
+
+	negotiatedVersion := req.ProtocolVersion
+	if v, ok, err := e.srv.GetPreferredProtocolVersion(ctx); err != nil {
+		return nil, nil, fmt.Errorf("get preferred protocol version: %w", err)
+	} else if ok && v != "" {
+		negotiatedVersion = v
+	}
+
+	capSet := sessions.CapabilitySet{}
+	if req.Capabilities.Sampling != nil {
+		capSet.Sampling = true
+	}
+	if req.Capabilities.Roots != nil {
+		capSet.Roots = true
+		capSet.RootsListChanged = req.Capabilities.Roots.ListChanged
+	}
+	if req.Capabilities.Elicitation != nil {
+		capSet.Elicitation = true
+	}
+
+	meta := sessions.MetadataClientInfo{
+		Name:    req.ClientInfo.Name,
+		Version: req.ClientInfo.Version,
+	}
+
+	sess, err := e.createSession(ctx, userID, negotiatedVersion, capSet, meta)
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = e.host.DeleteSession(ctx, sess.SessionID())
+		}
+	}()
+
+	serverInfo, err := e.srv.GetServerInfo(ctx, sess)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get server info: %w", err)
+	}
+
+	initRes := &mcp.InitializeResult{
+		ProtocolVersion: negotiatedVersion,
+		Capabilities:    mcp.ServerCapabilities{},
+		ServerInfo:      serverInfo,
+	}
+
+	if instr, ok, err := e.srv.GetInstructions(ctx, sess); err != nil {
+		return nil, nil, fmt.Errorf("get instructions: %w", err)
+	} else if ok {
+		initRes.Instructions = instr
+	}
+
+	if resCap, ok, err := e.srv.GetResourcesCapability(ctx, sess); err != nil {
+		return nil, nil, fmt.Errorf("get resources capability: %w", err)
+	} else if ok && resCap != nil {
+		entry := &struct {
+			ListChanged bool `json:"listChanged"`
+			Subscribe   bool `json:"subscribe"`
+		}{}
+		if subCap, hasSub, subErr := resCap.GetSubscriptionCapability(ctx, sess); subErr != nil {
+			return nil, nil, fmt.Errorf("get resources subscription capability: %w", subErr)
+		} else if hasSub && subCap != nil {
+			entry.Subscribe = true
+		}
+		if lcCap, hasLC, lcErr := resCap.GetListChangedCapability(ctx, sess); lcErr != nil {
+			return nil, nil, fmt.Errorf("get resources listChanged capability: %w", lcErr)
+		} else if hasLC && lcCap != nil {
+			entry.ListChanged = true
+		}
+		initRes.Capabilities.Resources = entry
+	}
+
+	if toolsCap, ok, err := e.srv.GetToolsCapability(ctx, sess); err != nil {
+		return nil, nil, fmt.Errorf("get tools capability: %w", err)
+	} else if ok && toolsCap != nil {
+		entry := &struct {
+			ListChanged bool `json:"listChanged"`
+		}{}
+		if lcCap, hasLC, lcErr := toolsCap.GetListChangedCapability(ctx, sess); lcErr != nil {
+			return nil, nil, fmt.Errorf("get tools listChanged capability: %w", lcErr)
+		} else if hasLC && lcCap != nil {
+			entry.ListChanged = true
+		}
+		initRes.Capabilities.Tools = entry
+	}
+
+	if promptsCap, ok, err := e.srv.GetPromptsCapability(ctx, sess); err != nil {
+		return nil, nil, fmt.Errorf("get prompts capability: %w", err)
+	} else if ok && promptsCap != nil {
+		entry := &struct {
+			ListChanged bool `json:"listChanged"`
+		}{}
+		if lcCap, hasLC, lcErr := promptsCap.GetListChangedCapability(ctx, sess); lcErr != nil {
+			return nil, nil, fmt.Errorf("get prompts listChanged capability: %w", lcErr)
+		} else if hasLC && lcCap != nil {
+			entry.ListChanged = true
+		}
+		initRes.Capabilities.Prompts = entry
+	}
+
+	if _, ok, err := e.srv.GetLoggingCapability(ctx, sess); err != nil {
+		return nil, nil, fmt.Errorf("get logging capability: %w", err)
+	} else if ok {
+		initRes.Capabilities.Logging = &struct{}{}
+	}
+
+	if _, ok, err := e.srv.GetCompletionsCapability(ctx, sess); err != nil {
+		return nil, nil, fmt.Errorf("get completions capability: %w", err)
+	} else if ok {
+		initRes.Capabilities.Completions = &struct{}{}
+	}
+
+	cleanup = false
+	return sess, initRes, nil
+}
+
 func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *jsonrpc.Request, requestScopedWriter MessageWriter) (*jsonrpc.Response, error) {
 	sess, err := e.loadSession(ctx, sessID, userID, requestScopedWriter, NewMessageWriterFunc(
 		func(ctx context.Context, msg jsonrpc.Message) error {
@@ -114,6 +239,8 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 	ctx = logctx.WithUserID(ctx, sess.userID)
 
 	switch req.Method {
+	case string(mcp.ToolsListMethod):
+		return e.handleToolsList(ctx, sess, req)
 	case string(mcp.LoggingSetLevelMethod):
 		return e.handleSetLoggingLevel(ctx, sess, req)
 	case string(mcp.ToolsCallMethod):
@@ -152,6 +279,52 @@ func (e *Engine) handleSetLoggingLevel(ctx context.Context, sess *SessionHandle,
 	}
 
 	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+}
+
+func (e *Engine) handleToolsList(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.ListToolsRequest
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+		}
+	}
+
+	cap, ok, err := e.srv.GetToolsCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok || cap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
+	}
+
+	var cursor *string
+	if params.Cursor != "" {
+		s := params.Cursor
+		cursor = &s
+	}
+
+	page, err := cap.ListTools(ctx, sess, cursor)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	result := &mcp.ListToolsResult{
+		Tools: page.Items,
+	}
+	if page.NextCursor != nil {
+		result.PaginatedResult.NextCursor = *page.NextCursor
+	}
+
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()), slog.Int("tool_count", len(page.Items)))
+
+	return jsonrpc.NewResultResponse(req.ID, result)
 }
 
 func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request, writer MessageWriter) (*jsonrpc.Response, error) {

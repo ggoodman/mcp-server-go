@@ -57,25 +57,34 @@ func WithElicitationCapability(cap sessions.ElicitationCapability) SessionHandle
 }
 
 func (s *SessionHandle) SessionID() string {
-	panic("not implemented")
+	return s.sessionID
 }
 
 func (s *SessionHandle) UserID() string {
-	panic("not implemented")
+	return s.userID
 }
 
 func (s *SessionHandle) ProtocolVersion() string {
-	panic("not implemented")
+	return s.protocolVersion
 }
 
 func (s *SessionHandle) GetSamplingCapability() (cap sessions.SamplingCapability, ok bool) {
-	panic("not implemented")
+	if s.samplingCap == nil {
+		return nil, false
+	}
+	return s.samplingCap, true
 }
 
 func (s *SessionHandle) GetRootsCapability() (cap sessions.RootsCapability, ok bool) {
-	panic("not implemented")
+	if s.rootsCap == nil {
+		return nil, false
+	}
+	return s.rootsCap, true
 }
 
 func (s *SessionHandle) GetElicitationCapability() (cap sessions.ElicitationCapability, ok bool) {
-	panic("not implemented")
+	if s.elicitationCap == nil {
+		return nil, false
+	}
+	return s.elicitationCap, true
 }
