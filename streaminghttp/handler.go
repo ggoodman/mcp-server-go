@@ -48,8 +48,6 @@ const (
 	mcpProtocolVersionHeader = "Mcp-Protocol-Version"
 	authorizationHeader      = "Authorization"
 	wwwAuthenticateHeader    = "WWW-Authenticate"
-	// internal engine fanout topic for rendezvous and notifications
-	sessionFanoutTopic = "session:events"
 )
 
 // writeJSONError emits a minimal JSON body for HTTP-layer rejections before a JSON-RPC
@@ -883,29 +881,7 @@ func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
 
 // (sessionWithWriter wrapper removed; superseded by SessionHandle.SetDirectWriter)
 
-// ensureSessionParentContext returns a per-session parent context that preserves
-// the values of parent (using context.WithoutCancel) but is not canceled with it.
-// The returned context is canceled only when teardownSession is called for the
-// session, or when all per-URI forwarders are explicitly unsubscribed and a
-// later teardown occurs. Safe for concurrent use.
-func (h *StreamingHTTPHandler) ensureSessionParentContext(parent context.Context, sessionID string) context.Context {
-	h.sessMu.Lock()
-	defer h.sessMu.Unlock()
-	if ctx, ok := h.sessParents[sessionID]; ok && ctx != nil {
-		return ctx
-	}
-	base := context.WithoutCancel(parent)
-	ctx, cancel := context.WithCancel(base)
-	if h.sessParents == nil {
-		h.sessParents = make(map[string]context.Context)
-	}
-	if h.sessCancel == nil {
-		h.sessCancel = make(map[string]context.CancelFunc)
-	}
-	h.sessParents[sessionID] = ctx
-	h.sessCancel[sessionID] = cancel
-	return ctx
-}
+// (ensureSessionParentContext removed; it was unused after refactor)
 
 // teardownSession cancels the per-session parent context (if any) and cancels
 // all per-URI forwarders. It also removes bookkeeping entries. This does not

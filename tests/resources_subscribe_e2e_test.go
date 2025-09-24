@@ -164,8 +164,7 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
-	var gotUpdated bool
-	for !gotUpdated {
+	for {
 		select {
 		case <-deadline.C:
 			getResp.Body.Close()
@@ -186,7 +185,6 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 			continue
 		}
 		if method, _ := m["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
-			gotUpdated = true
 			break
 		}
 	}
