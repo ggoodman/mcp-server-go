@@ -193,6 +193,37 @@ func (th *testHarness) drainUntilMethod(method string, timeout time.Duration) (*
 	return nil, false
 }
 
+// --- Test helper capability implementations ---
+
+// rootsTriggerToolsCap triggers a client roots/list when tools/list is called, to test client roundtrip wiring.
+type rootsTriggerToolsCap struct{}
+
+var _ mcpservice.ToolsCapability = (*rootsTriggerToolsCap)(nil)
+
+func (rootsTriggerToolsCap) ListTools(ctx context.Context, session sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
+	if rc, ok := session.GetRootsCapability(); ok {
+		_, _ = rc.ListRoots(ctx) // trigger client call; ignore errors
+	}
+	return mcpservice.NewPage([]mcp.Tool{{Name: "t"}}), nil
+}
+
+func (rootsTriggerToolsCap) CallTool(context.Context, sessions.Session, *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+	return &mcp.CallToolResult{Content: []mcp.ContentBlock{}}, nil
+}
+
+func (rootsTriggerToolsCap) GetListChangedCapability(ctx context.Context, s sessions.Session) (mcpservice.ToolListChangedCapability, bool, error) {
+	return nil, false, nil
+}
+
+// fakeCompletions is a simple completions capability for tests.
+type fakeCompletions struct{}
+
+var _ mcpservice.CompletionsCapability = (*fakeCompletions)(nil)
+
+func (fakeCompletions) Complete(ctx context.Context, _ sessions.Session, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
+	return &mcp.CompleteResult{Completion: mcp.Completion{Values: []string{"one", "two"}, Total: 2}}, nil
+}
+
 // --- Tests ---
 
 func TestInitialize_HappyPath(t *testing.T) {
@@ -514,48 +545,194 @@ func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
 }
 
 func TestResources_ListReadSubscribe(t *testing.T) {
-	t.Skip("resources capability integration pending stdio engine support")
+	// Static resources: one resource with initial contents
+	uri := "mem://a"
+	sr := mcpservice.NewStaticResources(
+		[]mcp.Resource{{URI: uri, Name: "A", MimeType: "text/plain"}},
+		nil,
+		map[string][]mcp.ResourceContents{
+			uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v1"}},
+		},
+	)
+	srv := mcpservice.NewServer(
+		mcpservice.WithResourcesOptions(
+			mcpservice.WithStaticResourceContainer(sr),
+		),
+	)
+	th := newHarness(t, srv)
 
-	// Skeleton:
-	// - Build server with static FS resources via mcpservice.NewStaticResources.
-	// - Initialize with default client caps plus resources listChanged.
-	// - Issue resources/list and resources/read requests and assert responses.
-	// - Exercise resources/subscribe + server-side change -> expect notifications/resources/updated.
+	// initialize + open
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// list
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil { t.Fatal(err) }
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if res.Error != nil { t.Fatalf("list error: %+v", res.Error) }
+	var lres mcp.ListResourcesResult
+	if err := json.Unmarshal(res.Result, &lres); err != nil { t.Fatal(err) }
+	if len(lres.Resources) != 1 || lres.Resources[0].URI != uri { t.Fatalf("unexpected list: %+v", lres.Resources) }
+
+	// read
+	readReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesReadMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.ReadResourceRequest{URI: uri})}
+	if err := th.send(readReq); err != nil { t.Fatal(err) }
+	res, err = th.expectResponse(1 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if res.Error != nil { t.Fatalf("read error: %+v", res.Error) }
+	var rres mcp.ReadResourceResult
+	if err := json.Unmarshal(res.Result, &rres); err != nil { t.Fatal(err) }
+	if len(rres.Contents) == 0 || rres.Contents[0].Text != "v1" { t.Fatalf("unexpected contents: %+v", rres.Contents) }
+
+	// subscribe
+	subReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesSubscribeMethod), ID: jsonrpc.NewRequestID("3"), Params: mustJSON(t, mcp.SubscribeRequest{URI: uri})}
+	if err := th.send(subReq); err != nil { t.Fatal(err) }
+	if res, err = th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
+		if err != nil { t.Fatal(err) }
+		t.Fatalf("subscribe error: %+v", res.Error)
+	}
+
+	// mutate contents -> expect notifications/resources/updated
+	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v2"}}})
+	note, ok := th.drainUntilMethod(string(mcp.ResourcesUpdatedNotificationMethod), 2*time.Second)
+	if !ok { t.Fatalf("expected %s after content change", mcp.ResourcesUpdatedNotificationMethod) }
+	var upd mcp.ResourceUpdatedNotification
+	if err := json.Unmarshal(note.Params, &upd); err != nil { t.Fatalf("decode updated: %v", err) }
+	if upd.URI != uri { t.Fatalf("updated for wrong uri: %+v", upd) }
+
+	// unsubscribe then change again -> should not see another update quickly
+	unsubReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUnsubscribeMethod), ID: jsonrpc.NewRequestID("4"), Params: mustJSON(t, mcp.UnsubscribeRequest{URI: uri})}
+	if err := th.send(unsubReq); err != nil { t.Fatal(err) }
+	if res, err = th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
+		if err != nil { t.Fatal(err) }
+		t.Fatalf("unsubscribe error: %+v", res.Error)
+	}
+	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v3"}}})
+	if _, ok := th.drainUntilMethod(string(mcp.ResourcesUpdatedNotificationMethod), 200*time.Millisecond); ok {
+		t.Fatalf("unexpected resources/updated after unsubscribe")
+	}
 }
 
 func TestPrompts_ListAndGet(t *testing.T) {
-	t.Skip("prompts capability integration pending stdio engine support")
+	// One prompt with simple handler
+	sp := mcpservice.NewStaticPrompts(mcpservice.StaticPrompt{
+		Descriptor: mcp.Prompt{Name: "hello", Description: "say hi"},
+		Handler: func(ctx context.Context, _ sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Description: "hi", Messages: []mcp.PromptMessage{{Role: mcp.RoleUser, Content: []mcp.ContentBlock{{Type: mcp.ContentTypeText, Text: "hello"}}}}}, nil
+		},
+	})
+	srv := mcpservice.NewServer(mcpservice.WithPromptsOptions(mcpservice.WithStaticPromptsContainer(sp)))
+	th := newHarness(t, srv)
 
-	// Skeleton:
-	// - Configure server with static prompts from mcpservice.NewStaticPrompts.
-	// - After initialize, send prompts/list and prompts/get.
-	// - Verify prompts/list_changed notifications propagate when server updates prompts.
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// list
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil { t.Fatal(err) }
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if res.Error != nil { t.Fatalf("list prompts error: %+v", res.Error) }
+	var lp mcp.ListPromptsResult
+	if err := json.Unmarshal(res.Result, &lp); err != nil { t.Fatal(err) }
+	if len(lp.Prompts) != 1 || lp.Prompts[0].Name != "hello" { t.Fatalf("unexpected prompts: %+v", lp.Prompts) }
+
+	// get
+	getReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsGetMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.GetPromptRequest{Name: "hello"})}
+	if err := th.send(getReq); err != nil { t.Fatal(err) }
+	res, err = th.expectResponse(1 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if res.Error != nil { t.Fatalf("get prompt error: %+v", res.Error) }
+	var gp mcp.GetPromptResult
+	if err := json.Unmarshal(res.Result, &gp); err != nil { t.Fatal(err) }
+	if len(gp.Messages) == 0 { t.Fatalf("missing prompt messages") }
+
+	// change -> expect prompts/list_changed
+	sp.Add(t.Context(), mcpservice.StaticPrompt{Descriptor: mcp.Prompt{Name: "bye"}})
+	if _, ok := th.drainUntilMethod(string(mcp.PromptsListChangedNotificationMethod), 2*time.Second); !ok {
+		t.Fatalf("expected %s after prompts change", mcp.PromptsListChangedNotificationMethod)
+	}
 }
 
 func TestRoots_ListAndListChanged(t *testing.T) {
-	t.Skip("roots capability integration pending stdio engine support")
+	// We don't have a native roots provider; instead trigger a client round-trip via a tools list.
+	srv := mcpservice.NewServer(mcpservice.WithToolsCapability(rootsTriggerToolsCap{}))
+	th := newHarness(t, srv)
 
-	// Skeleton:
-	// - Provide roots capability via mcpservice.WithRootsCapability.
-	// - Client advertises roots listChanged support.
-	// - Validate roots/list response and notifications/roots/list_changed fan-out.
+	// client advertises roots capability so the engine wires a roots client bridge
+	init := defaultInitializeRequest()
+	init.Capabilities.Roots = &struct{ ListChanged bool `json:"listChanged"` }{}
+	_ = th.initialize(t, "init-1", init)
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// Issue tools/list -> expect a client roots/list request first
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil { t.Fatal(err) }
+	first, err := th.expectRequest(2 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if first.Method != string(mcp.RootsListMethod) { t.Fatalf("expected first outbound %s, got %s", mcp.RootsListMethod, first.Method) }
+	// respond as client
+	if first.ID == nil || first.ID.IsNil() { t.Fatalf("missing id on roots/list request") }
+	rootsResp := &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, ID: first.ID, Result: mustJSON(t, mcp.ListRootsResult{Roots: []mcp.Root{}})}
+	if err := th.send(rootsResp); err != nil { t.Fatal(err) }
+
+	// then the final response to tools/list
+	if _, err := th.expectResponse(2 * time.Second); err != nil { t.Fatal(err) }
 }
 
 func TestCompletion_Complete(t *testing.T) {
-	t.Skip("completion capability integration pending stdio engine support")
+	// Fake completions capability
+	srv := mcpservice.NewServer(mcpservice.WithCompletionsCapability(fakeCompletions{}))
+	th := newHarness(t, srv)
 
-	// Skeleton:
-	// - Provide completions capability returning canned suggestions.
-	// - Issue completion/complete and assert streaming vs final behavior once wired.
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	req := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CompletionCompleteMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(t, mcp.CompleteRequest{Ref: mcp.ResourceReference{Type: "file", URI: "mem://a"}, Argument: mcp.CompleteArgument{Name: "path", Value: ""}})}
+	if err := th.send(req); err != nil { t.Fatal(err) }
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if res.Error != nil { t.Fatalf("complete error: %+v", res.Error) }
+	var cres mcp.CompleteResult
+	if err := json.Unmarshal(res.Result, &cres); err != nil { t.Fatal(err) }
+	if len(cres.Completion.Values) != 2 { t.Fatalf("unexpected completion: %+v", cres.Completion) }
 }
 
 func TestLogging_SetLevelAndMessages(t *testing.T) {
-	t.Skip("logging capability integration pending stdio engine support")
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+	srv := mcpservice.NewServer(mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)))
+	th := newHarness(t, srv)
 
-	// Skeleton:
-	// - Reuse slog LevelVar logging capability.
-	// - Send logging/setLevel and assert server adjusts LevelVar.
-	// - Confirm notifications/message delivered for server-side log events.
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// Before: debug should be disabled
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: &lv}))
+	if logger.Enabled(th.ctx, slog.LevelDebug) {
+		t.Fatalf("debug unexpectedly enabled before setLevel")
+	}
+
+	// Set to debug
+	setReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.LoggingSetLevelMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(t, mcp.SetLevelRequest{Level: mcp.LoggingLevelDebug})}
+	if err := th.send(setReq); err != nil { t.Fatal(err) }
+	if res, err := th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
+		if err != nil { t.Fatal(err) }
+		t.Fatalf("setLevel error: %+v", res.Error)
+	}
+	if !logger.Enabled(th.ctx, slog.LevelDebug) {
+		t.Fatalf("debug not enabled after setLevel")
+	}
+
+	// Invalid level should return InvalidParams
+	badReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.LoggingSetLevelMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.SetLevelRequest{Level: "bogus"})}
+	if err := th.send(badReq); err != nil { t.Fatal(err) }
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil { t.Fatal(err) }
+	if res.Error == nil || res.Error.Code != jsonrpc.ErrorCodeInvalidParams {
+		t.Fatalf("expected invalid params for bad level, got: %+v", res.Error)
+	}
 }
 
 // --- helpers ---
