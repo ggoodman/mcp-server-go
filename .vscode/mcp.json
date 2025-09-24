@@ -5,7 +5,8 @@
 			"command": "gopls",
 			"args": [
 				"mcp"
-			]
+			],
+			"cwd": "${workspaceFolder}"
 		}
 	},
 	"inputs": []
