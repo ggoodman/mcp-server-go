@@ -277,6 +277,12 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 		return e.handleResourcesRead(ctx, sess, req)
 	case string(mcp.ResourcesTemplatesListMethod):
 		return e.handleResourcesTemplatesList(ctx, sess, req)
+	case string(mcp.PromptsListMethod):
+		return e.handlePromptsList(ctx, sess, req)
+	case string(mcp.PromptsGetMethod):
+		return e.handlePromptsGet(ctx, sess, req)
+	case string(mcp.CompletionCompleteMethod):
+		return e.handleCompletionsComplete(ctx, sess, req)
 	case string(mcp.LoggingSetLevelMethod):
 		return e.handleSetLoggingLevel(ctx, sess, req)
 	case string(mcp.ToolsCallMethod):
@@ -482,6 +488,110 @@ func (e *Engine) handleResourcesTemplatesList(ctx context.Context, sess *Session
 	}
 	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()), slog.Int("template_count", len(page.Items)))
 	return jsonrpc.NewResultResponse(req.ID, res)
+}
+
+func (e *Engine) handlePromptsList(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.ListPromptsRequest
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+		}
+	}
+
+	cap, ok, err := e.srv.GetPromptsCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok || cap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+	}
+
+	var cursor *string
+	if params.Cursor != "" {
+		s := params.Cursor
+		cursor = &s
+	}
+
+	page, err := cap.ListPrompts(ctx, sess, cursor)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+
+	res := &mcp.ListPromptsResult{Prompts: page.Items}
+	if page.NextCursor != nil {
+		res.NextCursor = *page.NextCursor
+	}
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()), slog.Int("prompt_count", len(page.Items)))
+	return jsonrpc.NewResultResponse(req.ID, res)
+}
+
+func (e *Engine) handlePromptsGet(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.GetPromptRequestReceived
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+	if params.Name == "" {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", "missing name"), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	cap, ok, err := e.srv.GetPromptsCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok || cap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
+	}
+
+	result, err := cap.GetPrompt(ctx, sess, &params)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+	return jsonrpc.NewResultResponse(req.ID, result)
+}
+
+func (e *Engine) handleCompletionsComplete(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.CompleteRequest
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", err.Error()), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	cap, ok, err := e.srv.GetCompletionsCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok || cap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
+	}
+
+	result, err := cap.Complete(ctx, sess, &params)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+	return jsonrpc.NewResultResponse(req.ID, result)
 }
 
 func (e *Engine) handleResourcesList(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
