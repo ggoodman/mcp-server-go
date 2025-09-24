@@ -102,7 +102,10 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 		getReq.Header.Set("Authorization", "Bearer test-token")
 		getReq.Header.Set("mcp-session-id", sessID)
 		r, e := http.DefaultClient.Do(getReq)
-		if e != nil { errCh <- e; return }
+		if e != nil {
+			errCh <- e
+			return
+		}
 		respCh <- r
 	}()
 
@@ -119,6 +122,22 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 		t.Fatalf("get status: %d", getResp.StatusCode)
 	}
 
+	// 2b) Signal notifications/initialized so the server opens the session and accepts requests
+	initNote := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  string(mcp.InitializedNotificationMethod),
+	}
+	b, _ = json.Marshal(initNote)
+	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("mcp-session-id", sessID)
+	initNoteResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("initialized notification: %v", err)
+	}
+	_ = initNoteResp.Body.Close()
+
 	// 3) Subscribe to res://x via POST JSON-RPC resources/subscribe
 	subBody := map[string]any{
 		"jsonrpc": "2.0",
@@ -132,7 +151,9 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("mcp-session-id", sessID)
 	subResp, err := http.DefaultClient.Do(req)
-	if err != nil { t.Fatalf("subscribe: %v", err) }
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 	_ = subResp.Body.Close()
 
 	// 4) Trigger an update via ReplaceAllContents (which marks updated on res://x)
@@ -151,12 +172,19 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 			t.Fatalf("timed out waiting for resources/updated")
 		default:
 		}
-		if !scanner.Scan() { time.Sleep(10 * time.Millisecond); continue }
+		if !scanner.Scan() {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") { continue }
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 		var m map[string]any
-		if err := json.Unmarshal([]byte(payload), &m); err != nil { continue }
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			continue
+		}
 		if method, _ := m["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
 			gotUpdated = true
 			break
@@ -176,7 +204,9 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer test-token")
 	req.Header.Set("mcp-session-id", sessID)
 	unsubResp, err := http.DefaultClient.Do(req)
-	if err != nil { t.Fatalf("unsubscribe: %v", err) }
+	if err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
 	_ = unsubResp.Body.Close()
 
 	// Trigger another update; give a short window and ensure we don't receive a second updated notification
@@ -190,7 +220,10 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 			return
 		default:
 		}
-		if !scanner.Scan() { time.Sleep(10 * time.Millisecond); continue }
+		if !scanner.Scan() {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		if line := scanner.Text(); strings.HasPrefix(line, "data: ") {
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 			var m map[string]any
