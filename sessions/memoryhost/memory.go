@@ -30,6 +30,7 @@ type sessionStream struct {
 	messages []message
 	nextID   int64
 	waiters  []chan struct{}
+	closed   bool
 }
 
 type message struct {
@@ -101,6 +102,10 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 
 	// Determine starting index
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("session closed")
+	}
 	startIdx := 0
 	if lastEventID == "" { // only future messages
 		startIdx = len(s.messages)
@@ -128,6 +133,10 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 		}
 		// Fast path: drain any pending messages >= startIdx
 		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return errors.New("session closed")
+		}
 		if startIdx < len(s.messages) {
 			msg := s.messages[startIdx]
 			startIdx++
@@ -295,6 +304,8 @@ func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 		return ctx.Err()
 	}
 	h.mu.Lock()
+	// capture stream pointer to signal subscribers after unlocking host mutex
+	s := h.streams[sessionID]
 	// delete metadata
 	delete(h.metas, sessionID)
 	// delete kv
@@ -302,6 +313,22 @@ func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	// delete message stream
 	delete(h.streams, sessionID)
 	h.mu.Unlock()
+
+	// If there was an active stream, mark it closed and wake any waiters
+	if s != nil {
+		s.mu.Lock()
+		s.closed = true
+		// Snapshot waiters and clear to avoid double signaling
+		waiters := append([]chan struct{}(nil), s.waiters...)
+		s.waiters = nil
+		s.mu.Unlock()
+		for _, ch := range waiters {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
 	return nil
 }
 
