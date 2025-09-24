@@ -60,9 +60,7 @@ func (h *Host) dataKey(sessionID, key string) string {
 func (h *Host) dataScanPattern(sessionID string) string {
 	return h.keyPrefix + "data:" + sessionID + ":*"
 }
-func (h *Host) eventStreamKey(sessionID, topic string) string {
-	return h.keyPrefix + "evtstream:" + sessionID + ":" + topic
-}
+func (h *Host) eventStreamKey(topic string) string { return h.keyPrefix + "evtstream:" + topic }
 
 // --- Messaging via Redis Streams ---
 
@@ -124,8 +122,6 @@ func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	_, _ = h.client.Del(c, h.metaKey(sessionID)).Result()
 	// delete stream
 	_, _ = h.client.Del(c, h.streamKey(sessionID)).Result()
-	// delete event streams
-	_ = h.deleteByPattern(c, h.keyPrefix+"evtstream:"+sessionID+":*")
 	// delete kv entries
 	_ = h.deleteByPattern(c, h.dataScanPattern(sessionID))
 	return nil
@@ -292,8 +288,8 @@ func (h *Host) deleteByPattern(ctx context.Context, pattern string) error {
 
 // --- Server-internal event pub/sub using Redis Pub/Sub ---
 
-func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
-	key := h.eventStreamKey(sessionID, topic)
+func (h *Host) PublishEvent(ctx context.Context, topic string, payload []byte) error {
+	key := h.eventStreamKey(topic)
 	// minimal retention: rely on stream trimming (approximate) to cap size; we don't replay anyway.
 	// Use MAXLEN ~ 1000 (arbitrary) to avoid unbounded growth; config tweak later if needed.
 	// If trimming fails, still deliver event.
@@ -301,8 +297,8 @@ func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payloa
 	return err
 }
 
-func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) error {
-	key := h.eventStreamKey(sessionID, topic)
+func (h *Host) SubscribeEvents(ctx context.Context, topic string, handler sessions.EventHandlerFunction) error {
+	key := h.eventStreamKey(topic)
 	// First read uses the special "$" ID to mean "only entries added after this call".
 	// Subsequent reads use the last delivered entry ID for strict ordering.
 	started := make(chan struct{})

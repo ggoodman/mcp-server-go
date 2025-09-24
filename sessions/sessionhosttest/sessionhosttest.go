@@ -327,10 +327,23 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 	}
 	var r1, r2 rec
 
+	// Envelope used to carry session scoping within the topic payload
+	type eventEnvelope struct {
+		SessionID string `json:"sessionID"`
+		Payload   string `json:"payload"`
+	}
+
 	subCtx1, cancel1 := context.WithCancel(ctx)
-	if err := h.SubscribeEvents(subCtx1, sessionID, topic, func(c context.Context, p []byte) error {
+	if err := h.SubscribeEvents(subCtx1, topic, func(c context.Context, p []byte) error {
+		var env eventEnvelope
+		if err := json.Unmarshal(p, &env); err != nil {
+			return err
+		}
+		if env.SessionID != sessionID {
+			return nil // ignore events for other sessions
+		}
 		r1.mu.Lock()
-		r1.events = append(r1.events, append([]byte(nil), p...))
+		r1.events = append(r1.events, []byte(env.Payload))
 		r1.mu.Unlock()
 		if len(r1.events) == n {
 			cancel1()
@@ -341,9 +354,16 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 	}
 	defer cancel1()
 	subCtx2, cancel2 := context.WithCancel(ctx)
-	if err := h.SubscribeEvents(subCtx2, sessionID, topic, func(c context.Context, p []byte) error {
+	if err := h.SubscribeEvents(subCtx2, topic, func(c context.Context, p []byte) error {
+		var env eventEnvelope
+		if err := json.Unmarshal(p, &env); err != nil {
+			return err
+		}
+		if env.SessionID != sessionID {
+			return nil
+		}
 		r2.mu.Lock()
-		r2.events = append(r2.events, append([]byte(nil), p...))
+		r2.events = append(r2.events, []byte(env.Payload))
 		r2.mu.Unlock()
 		if len(r2.events) == n {
 			cancel2()
@@ -356,7 +376,8 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 
 	// Publish immediately after subscriptions become active (implementation must ensure no missed events)
 	for i := 0; i < n; i++ {
-		if err := h.PublishEvent(ctx, sessionID, topic, []byte(strconv.Itoa(i))); err != nil {
+		b, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: strconv.Itoa(i)})
+		if err := h.PublishEvent(ctx, topic, b); err != nil {
 			t.Fatalf("publish %d: %v", i, err)
 		}
 	}
@@ -396,10 +417,22 @@ func testEventsLateSubscriber(t *testing.T, factory HostFactory) {
 	}
 	var rEarly, rLate rec
 
+	type eventEnvelope struct {
+		SessionID string `json:"sessionID"`
+		Payload   string `json:"payload"`
+	}
+
 	earlyCtx, earlyCancel := context.WithCancel(ctx)
-	if err := h.SubscribeEvents(earlyCtx, sessionID, topic, func(c context.Context, p []byte) error {
+	if err := h.SubscribeEvents(earlyCtx, topic, func(c context.Context, p []byte) error {
+		var env eventEnvelope
+		if err := json.Unmarshal(p, &env); err != nil {
+			return err
+		}
+		if env.SessionID != sessionID {
+			return nil
+		}
 		rEarly.mu.Lock()
-		rEarly.events = append(rEarly.events, append([]byte(nil), p...))
+		rEarly.events = append(rEarly.events, []byte(env.Payload))
 		rEarly.mu.Unlock()
 		return nil
 	}); err != nil {
@@ -409,15 +442,23 @@ func testEventsLateSubscriber(t *testing.T, factory HostFactory) {
 
 	// Publish first batch (late subscriber should NOT get these)
 	for i := 0; i < first; i++ {
-		if err := h.PublishEvent(ctx, sessionID, topic, []byte("A"+strconv.Itoa(i))); err != nil {
+		b, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: "A" + strconv.Itoa(i)})
+		if err := h.PublishEvent(ctx, topic, b); err != nil {
 			t.Fatalf("publish pre %d: %v", i, err)
 		}
 	}
 
 	lateCtx, lateCancel := context.WithCancel(ctx)
-	if err := h.SubscribeEvents(lateCtx, sessionID, topic, func(c context.Context, p []byte) error {
+	if err := h.SubscribeEvents(lateCtx, topic, func(c context.Context, p []byte) error {
+		var env eventEnvelope
+		if err := json.Unmarshal(p, &env); err != nil {
+			return err
+		}
+		if env.SessionID != sessionID {
+			return nil
+		}
 		rLate.mu.Lock()
-		rLate.events = append(rLate.events, append([]byte(nil), p...))
+		rLate.events = append(rLate.events, []byte(env.Payload))
 		rLate.mu.Unlock()
 		return nil
 	}); err != nil {
@@ -425,7 +466,8 @@ func testEventsLateSubscriber(t *testing.T, factory HostFactory) {
 	}
 
 	for i := 0; i < second; i++ {
-		if err := h.PublishEvent(ctx, sessionID, topic, []byte("B"+strconv.Itoa(i))); err != nil {
+		b, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: "B" + strconv.Itoa(i)})
+		if err := h.PublishEvent(ctx, topic, b); err != nil {
 			t.Fatalf("publish post %d: %v", i, err)
 		}
 	}
@@ -458,8 +500,16 @@ func testEventsHandlerError(t *testing.T, factory HostFactory) {
 	var gotSecond bool
 	subCtx, subCancel := context.WithCancel(ctx)
 	defer subCancel()
-	if err := h.SubscribeEvents(subCtx, sessionID, topic, func(c context.Context, p []byte) error {
-		if string(p) == "1" {
+	type eventEnvelope struct {
+		SessionID string `json:"sessionID"`
+		Payload   string `json:"payload"`
+	}
+	if err := h.SubscribeEvents(subCtx, topic, func(c context.Context, p []byte) error {
+		var env eventEnvelope
+		if err := json.Unmarshal(p, &env); err != nil {
+			return err
+		}
+		if env.SessionID == sessionID && env.Payload == "1" {
 			gotSecond = true
 		}
 		return errSentinel
@@ -467,8 +517,10 @@ func testEventsHandlerError(t *testing.T, factory HostFactory) {
 		t.Fatalf("subscribe: %v", err)
 	}
 	// First publish triggers error, second may or may not be delivered depending on timing but should not cause panic.
-	_ = h.PublishEvent(ctx, sessionID, topic, []byte("0"))
-	_ = h.PublishEvent(ctx, sessionID, topic, []byte("1"))
+	b0, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: "0"})
+	b1, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: "1"})
+	_ = h.PublishEvent(ctx, topic, b0)
+	_ = h.PublishEvent(ctx, topic, b1)
 	time.Sleep(100 * time.Millisecond)
 	if gotSecond {
 		t.Logf("second event delivered after handler error (acceptable at-least-once)")
@@ -479,9 +531,8 @@ func testEventsCancellation(t *testing.T, factory HostFactory) {
 	h := factory(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	sessionID := "ev-sess-4"
 	topic := "t4"
-	if err := h.SubscribeEvents(ctx, sessionID, topic, func(c context.Context, p []byte) error { return nil }); err != nil {
+	if err := h.SubscribeEvents(ctx, topic, func(c context.Context, p []byte) error { return nil }); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 	// Just wait for context deadline

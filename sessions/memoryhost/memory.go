@@ -21,7 +21,7 @@ type Host struct {
 	streams map[string]*sessionStream            // sessionID -> ordered message stream
 	metas   map[string]*sessions.SessionMetadata // sessionID -> metadata
 	kv      map[string]map[string][]byte         // sessionID -> (key -> value)
-	events  map[string]*eventStream              // (sessionID + "\x00" + topic) -> event fan-out
+	events  map[string]*eventStream              // topic -> event fan-out
 }
 
 // sessionStream stores ordered messages for a session plus waiters for new data.
@@ -153,10 +153,10 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 
 // --- Event fan-out (no replay) ---
 
-func (h *Host) eventKey(sessionID, topic string) string { return sessionID + "\x00" + topic }
+func (h *Host) eventKey(topic string) string { return topic }
 
-func (h *Host) getOrCreateEventStream(sessionID, topic string) *eventStream {
-	key := h.eventKey(sessionID, topic)
+func (h *Host) getOrCreateEventStream(topic string) *eventStream {
+	key := h.eventKey(topic)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if es, ok := h.events[key]; ok {
@@ -167,11 +167,11 @@ func (h *Host) getOrCreateEventStream(sessionID, topic string) *eventStream {
 	return es
 }
 
-func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
+func (h *Host) PublishEvent(ctx context.Context, topic string, payload []byte) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	es := h.getOrCreateEventStream(sessionID, topic)
+	es := h.getOrCreateEventStream(topic)
 	es.mu.Lock()
 	// snapshot subscriber channels
 	chans := make([]chan []byte, 0, len(es.subs))
@@ -192,8 +192,8 @@ func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payloa
 	return nil
 }
 
-func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) error {
-	es := h.getOrCreateEventStream(sessionID, topic)
+func (h *Host) SubscribeEvents(ctx context.Context, topic string, handler sessions.EventHandlerFunction) error {
+	es := h.getOrCreateEventStream(topic)
 	es.mu.Lock()
 	es.nextID++
 	id := es.nextID
@@ -301,18 +301,6 @@ func (h *Host) DeleteSession(ctx context.Context, sessionID string) error {
 	delete(h.kv, sessionID)
 	// delete message stream
 	delete(h.streams, sessionID)
-	// delete event streams (close subscriber channels)
-	for k, es := range h.events {
-		if len(k) >= len(sessionID)+1 && k[:len(sessionID)] == sessionID && k[len(sessionID)] == '\x00' {
-			delete(h.events, k)
-			es.mu.Lock()
-			for _, ch := range es.subs {
-				close(ch)
-			}
-			es.subs = nil
-			es.mu.Unlock()
-		}
-	}
 	h.mu.Unlock()
 	return nil
 }
