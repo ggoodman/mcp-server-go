@@ -275,6 +275,10 @@ func (e *Engine) handleSetLoggingLevel(ctx context.Context, sess *SessionHandle,
 
 	if err := cap.SetLevel(ctx, sess, params.Level); err != nil {
 		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		// Invalid level is a client error -> InvalidParams
+		if errors.Is(err, mcpservice.ErrInvalidLoggingLevel) {
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+		}
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
 	}
 
@@ -334,6 +338,10 @@ func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *j
 	var params mcp.CallToolRequestReceived
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		log.InfoContext(ctx, "engine.handle_request.invalid", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+	if params.Name == "" {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", "missing tool name"), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
 	}
 
