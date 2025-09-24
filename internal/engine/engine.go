@@ -60,6 +60,10 @@ type Engine struct {
 	// wiring state for per-session background emitters
 	wireMu sync.Mutex
 	wired  map[string]bool // sessionID -> registered
+
+	// subscription tracking: sessionID -> uri -> cancel
+	subMu      sync.Mutex
+	subCancels map[string]map[string]mcpservice.CancelSubscription
 }
 
 func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opts ...EngineOption) *Engine {
@@ -72,6 +76,7 @@ func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opt
 		handshakeTTL:       30 * time.Second,
 		toolCtxCancels:     make(map[string]context.CancelCauseFunc),
 		wired:              make(map[string]bool),
+		subCancels:         make(map[string]map[string]mcpservice.CancelSubscription),
 	}
 	// Keep linters honest about method usage in builds where certain paths are pruned.
 	_ = e.handshakeTTL
@@ -277,6 +282,10 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 		return e.handleResourcesRead(ctx, sess, req)
 	case string(mcp.ResourcesTemplatesListMethod):
 		return e.handleResourcesTemplatesList(ctx, sess, req)
+	case string(mcp.ResourcesSubscribeMethod):
+		return e.handleResourcesSubscribe(ctx, sess, req)
+	case string(mcp.ResourcesUnsubscribeMethod):
+		return e.handleResourcesUnsubscribe(ctx, sess, req)
 	case string(mcp.PromptsListMethod):
 		return e.handlePromptsList(ctx, sess, req)
 	case string(mcp.PromptsGetMethod):
@@ -324,6 +333,117 @@ func (e *Engine) handleSetLoggingLevel(ctx context.Context, sess *SessionHandle,
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
 	}
 
+	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+}
+
+// handleResourcesSubscribe wires a per-URI subscription via provider and stores a cancel.
+func (e *Engine) handleResourcesSubscribe(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.SubscribeRequest
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.URI == "" {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", "invalid params"), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	resCap, ok, err := e.srv.GetResourcesCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !ok || resCap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
+	}
+	subCap, hasSub, err := resCap.GetSubscriptionCapability(ctx, sess)
+	if err != nil {
+		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+	}
+	if !hasSub || subCap == nil {
+		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "subscriptions not supported", nil), nil
+	}
+
+	// Idempotency: if already subscribed, succeed.
+	e.subMu.Lock()
+	if _, ok := e.subCancels[sess.SessionID()]; !ok {
+		e.subCancels[sess.SessionID()] = make(map[string]mcpservice.CancelSubscription)
+	}
+	if _, exists := e.subCancels[sess.SessionID()][params.URI]; exists {
+		e.subMu.Unlock()
+		return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+	}
+	e.subMu.Unlock()
+
+	// Build emit closure: publishes notifications/resources/updated
+	emit := func(cbCtx context.Context, uri string) {
+		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod)}
+		// attach params
+		b, _ := json.Marshal(mcp.ResourceUpdatedNotification{URI: uri})
+		note.Params = b
+		bytes, err := json.Marshal(note)
+		if err != nil {
+			log.ErrorContext(ctx, "engine.resources.subscribe.emit_encode_fail", slog.String("err", err.Error()))
+			return
+		}
+		if _, err := e.host.PublishSession(context.Background(), sess.SessionID(), bytes); err != nil {
+			log.ErrorContext(ctx, "engine.resources.subscribe.emit_fail", slog.String("err", err.Error()))
+		}
+	}
+
+	cancel, err := subCap.Subscribe(ctx, sess, params.URI, emit)
+	if err != nil {
+		// Treat not found or validation as InvalidParams if detectable; otherwise internal error.
+		log.InfoContext(ctx, "engine.handle_request.subscribe.fail", slog.String("err", err.Error()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	e.subMu.Lock()
+	e.subCancels[sess.SessionID()][params.URI] = cancel
+	e.subMu.Unlock()
+
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
+}
+
+// handleResourcesUnsubscribe cancels any local subscription and broadcasts a fanout to other nodes.
+func (e *Engine) handleResourcesUnsubscribe(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	start := time.Now()
+	log := e.log.With(slog.String("method", req.Method))
+
+	var params mcp.UnsubscribeRequest
+	if err := json.Unmarshal(req.Params, &params); err != nil || params.URI == "" {
+		log.InfoContext(ctx, "engine.handle_request.invalid", slog.String("err", "invalid params"), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	}
+
+	// Best-effort local cancel
+	e.subMu.Lock()
+	if m := e.subCancels[sess.SessionID()]; len(m) > 0 {
+		if cancel, ok := m[params.URI]; ok && cancel != nil {
+			_ = cancel(context.Background())
+			delete(m, params.URI)
+		}
+		if len(m) == 0 {
+			delete(e.subCancels, sess.SessionID())
+		}
+	}
+	e.subMu.Unlock()
+
+	// Broadcast cross-instance unsubscribe message by publishing an internal request
+	// onto the fanout topic that will be handled in handleSessionEvent.
+	note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUnsubscribeMethod)}
+	b, _ := json.Marshal(params)
+	note.Params = b
+	bytes, _ := json.Marshal(note)
+	outer := fanoutMessage{SessionID: sess.SessionID(), UserID: sess.UserID(), Msg: bytes}
+	if payload, err := json.Marshal(outer); err == nil {
+		_ = e.host.PublishEvent(context.Background(), sessionFanoutTopic, payload)
+	}
+
+	log.InfoContext(ctx, "engine.handle_request.ok", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 	return jsonrpc.NewResultResponse(req.ID, &mcp.EmptyResult{})
 }
 
@@ -1030,6 +1150,25 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 
 			hadCancel := e.cancelInFlightRequest(params.RequestID, params.Reason)
 			e.log.Info("engine.handle_session_event.cancel.dispatched", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", params.RequestID), slog.Bool("had_cancel", hadCancel))
+			return nil
+		case string(mcp.ResourcesUnsubscribeMethod):
+			var params mcp.UnsubscribeRequest
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+				return nil
+			}
+			// Best-effort local cancel only. No response expected here.
+			e.subMu.Lock()
+			if m := e.subCancels[fanout.SessionID]; len(m) > 0 {
+				if cancel, ok := m[params.URI]; ok && cancel != nil {
+					_ = cancel(context.Background())
+					delete(m, params.URI)
+				}
+				if len(m) == 0 {
+					delete(e.subCancels, fanout.SessionID)
+				}
+			}
+			e.subMu.Unlock()
 			return nil
 		default:
 			// Unknown request; ignore.
