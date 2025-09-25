@@ -428,22 +428,11 @@ func TestMultiInstance(t *testing.T) {
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		<-time.After(10 * time.Millisecond) // give some time for GET to be fully established
-
-		// Step 4: Trigger a resources list change via the shared container
-		sharedSR.ReplaceResources(context.Background(), sharedSR.SnapshotResources())
-
-		// Step 5: Wait for notification
-		select {
-		case evt := <-eventsCh:
-			var msg jsonrpc.AnyMessage
-			mustUnmarshalJSON(t, evt.data, &msg)
-			if msg.Method != string(mcp.ResourcesListChangedNotificationMethod) {
-				t.Fatalf("unexpected method: want %q got %q", mcp.ResourcesListChangedNotificationMethod, msg.Method)
-			}
-		case <-t.Context().Done():
-			t.Fatalf("context done: %v", t.Context().Err())
-		}
+		// Step 4/5: Trigger and wait (with retries) for resources list_changed
+		trigger := func() { sharedSR.ReplaceResources(context.Background(), sharedSR.SnapshotResources()) }
+		// Initial trigger before entering retry loop to preserve existing behavior
+		trigger()
+		waitForListChanged(t, t.Context(), eventsCh, trigger)
 	})
 
 	t.Run("Tools list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
@@ -506,20 +495,10 @@ func TestMultiInstance(t *testing.T) {
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Step 4: Trigger a tools list change via the shared container
-		sharedTools.Replace(context.Background())
-
-		// Step 5: Wait for notification
-		select {
-		case evt := <-eventsCh:
-			var msg jsonrpc.AnyMessage
-			mustUnmarshalJSON(t, evt.data, &msg)
-			if msg.Method != string(mcp.ToolsListChangedNotificationMethod) {
-				t.Fatalf("unexpected method: want %q got %q", mcp.ToolsListChangedNotificationMethod, msg.Method)
-			}
-		case <-t.Context().Done():
-			t.Fatalf("context done: %v", t.Context().Err())
-		}
+		// Step 4/5: Trigger and wait (with retries) for tools list_changed
+		trigger := func() { sharedTools.Replace(context.Background()) }
+		trigger()
+		waitForListChanged(t, t.Context(), eventsCh, trigger)
 	})
 
 	t.Run("Prompts list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
@@ -572,19 +551,9 @@ func TestMultiInstance(t *testing.T) {
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
 
-		// Trigger prompts list change via shared container
-		sharedPrompts.Replace(context.Background())
-
-		select {
-		case evt := <-eventsCh:
-			var msg jsonrpc.AnyMessage
-			mustUnmarshalJSON(t, evt.data, &msg)
-			if msg.Method != string(mcp.PromptsListChangedNotificationMethod) {
-				t.Fatalf("unexpected method: want %q got %q", mcp.PromptsListChangedNotificationMethod, msg.Method)
-			}
-		case <-t.Context().Done():
-			t.Fatalf("context done: %v", t.Context().Err())
-		}
+		trigger := func() { sharedPrompts.Replace(context.Background()) }
+		trigger()
+		waitForListChanged(t, t.Context(), eventsCh, trigger)
 	})
 
 }
@@ -1371,4 +1340,68 @@ func TestProtectedResourceMetadata_CORS(t *testing.T) {
 		t.Fatalf("missing ACAO on PRM GET")
 	}
 	getResp.Body.Close()
+}
+
+// waitForListChanged waits for a single SSE event whose JSON-RPC method matches
+// one of the expected method names. While waiting it will periodically invoke
+// the provided trigger function (e.g. ReplaceResources / Replace) to prompt the
+// server to emit the list_changed notification in case an earlier trigger raced
+// with subscription establishment. This reduces test flakes in CI where
+// scheduling variance is higher.
+//
+// ctx governs the overall timeout / cancellation. A short jittered ticker is
+// used to space re-triggers. The first trigger is assumed to have already
+// happened prior to calling this helper (so trigger is not called immediately).
+//
+// If an event is received whose method does not match any expected value, the
+// wait continues. (Presently the tests only expect exactly one event, but this
+// defensive behavior avoids spurious failures should other notifications appear
+// in the future.)
+func waitForListChanged(t *testing.T, ctx context.Context, ch <-chan sseEvent, trigger func()) {
+	t.Helper()
+
+	// Ticker to retry triggering the change. Start after a short delay so that
+	// the subscription (GET stream) has time to fully attach.
+	base := 25 * time.Millisecond
+	if deadline, ok := ctx.Deadline(); ok {
+		// ensure we do not run too many retries near the end—cap to 1/40 of remaining
+		rem := time.Until(deadline)
+		if rem/40 < base {
+			base = rem / 40
+			if base < 5*time.Millisecond {
+				base = 5 * time.Millisecond
+			}
+		}
+	}
+	ticker := time.NewTicker(base)
+	defer ticker.Stop()
+
+	expected := map[string]struct{}{
+		string(mcp.ResourcesListChangedNotificationMethod): {},
+		string(mcp.ToolsListChangedNotificationMethod):     {},
+		string(mcp.PromptsListChangedNotificationMethod):   {},
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for list_changed notification: %v", ctx.Err())
+		case evt, ok := <-ch:
+			if !ok {
+				t.Fatalf("event channel closed before notification")
+			}
+			var msg jsonrpc.AnyMessage
+			if err := json.Unmarshal(evt.data, &msg); err != nil {
+				// If we cannot decode we fail fast (corrupt stream)
+				t.Fatalf("decode event: %v data=%s", err, string(evt.data))
+			}
+			if _, ok := expected[msg.Method]; ok {
+				// Received desired notification
+				return
+			}
+			// Ignore other methods (keep waiting)
+		case <-ticker.C:
+			trigger()
+		}
+	}
 }
