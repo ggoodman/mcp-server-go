@@ -131,18 +131,7 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	defer getResp.Body.Close()
 	scanner := bufio.NewScanner(getResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	ctxDeadline := t.Context()
-	for {
-		select {
-		case <-ctxDeadline.Done():
-			t.Fatalf("context done waiting for list_changed notification: %v", ctxDeadline.Err())
-		default:
-		}
-		if !scanner.Scan() {
-			// brief yield
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
+	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -153,7 +142,11 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 			continue
 		}
 		if method, _ := m["method"].(string); method == string(mcp.ResourcesListChangedNotificationMethod) {
-			break
+			return
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanner error while waiting for list_changed: %v", err)
+	}
+	t.Fatalf("SSE stream closed before receiving resources/list_changed")
 }

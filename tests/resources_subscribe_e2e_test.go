@@ -161,18 +161,7 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	// 5) Expect a notifications/resources/updated on SSE
 	scanner := bufio.NewScanner(getResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for {
-		select {
-		case <-t.Context().Done():
-			t.Fatalf("context done scanning GET /mcp response: %v", t.Context().Err())
-		default:
-		}
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				t.Fatalf("scanner: %v", err)
-			}
-			break // EOF
-		}
+	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -183,9 +172,14 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 			continue
 		}
 		if method, _ := m["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
-			break
+			// proceed to unsubscribe phase
+			goto afterUpdated
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanner error scanning GET /mcp response: %v", err)
+	}
+afterUpdated:
 
 	// 6) Unsubscribe via POST JSON-RPC; do not assert immediate quiescence (eventual semantics)
 	unsubBody := map[string]any{

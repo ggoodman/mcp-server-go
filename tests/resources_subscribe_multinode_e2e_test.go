@@ -246,16 +246,11 @@ func readOneSSEResponse(ctx context.Context, body io.ReadCloser) error {
 	defer body.Close()
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for {
+	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-		}
-		if !scanner.Scan() {
-			// small yield
-			time.Sleep(5 * time.Millisecond)
-			continue
 		}
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -271,4 +266,8 @@ func readOneSSEResponse(ctx context.Context, body io.ReadCloser) error {
 			return nil
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return io.EOF
 }
