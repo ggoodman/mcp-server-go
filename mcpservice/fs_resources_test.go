@@ -98,9 +98,11 @@ func TestFSResources_SubscribeAndDebouncedUpdate(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("expected subscription capability: %v %v", ok, err)
 	}
-	if err := subCap.Subscribe(ctx, fakeSession("s1"), uri); err != nil {
+	cfn, err := subCap.Subscribe(ctx, fakeSession("s1"), uri, func(ctx context.Context, _ string) {})
+	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
+	defer func() { _ = cfn(context.Background()) }()
 
 	// Observe internal per-URI notifier channel to assert debouncing behavior.
 	ch := r.subscriberForURI(uri)

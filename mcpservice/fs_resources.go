@@ -563,10 +563,10 @@ func within(target, root string) bool {
 
 type fsSubscription struct{ r *FSResources }
 
-func (f fsSubscription) Subscribe(ctx context.Context, s sessions.Session, uri string) error {
+func (f fsSubscription) Subscribe(ctx context.Context, s sessions.Session, uri string, emit NotifyResourceUpdatedFunc) (CancelSubscription, error) {
 	// Ensure the URI exists and is a file
 	if !f.r.uriExists(ctx, uri) {
-		return fmt.Errorf("resource not found: %s", uri)
+		return nil, fmt.Errorf("resource not found: %s", uri)
 	}
 	// Ensure a watcher is running so updates are detected. Lazily start once.
 	f.r.pollOnce.Do(func() {
@@ -587,26 +587,46 @@ func (f fsSubscription) Subscribe(ctx context.Context, s sessions.Session, uri s
 	f.r.subsByURI[uri][sid] = struct{}{}
 	f.r.subsBySession[sid][uri] = struct{}{}
 	f.r.mu.Unlock()
-	return nil
-}
 
-func (f fsSubscription) Unsubscribe(ctx context.Context, s sessions.Session, uri string) error {
-	sid := s.SessionID()
-	f.r.mu.Lock()
-	if m, ok := f.r.subsByURI[uri]; ok {
-		delete(m, sid)
-		if len(m) == 0 {
-			delete(f.r.subsByURI, uri)
+	// Bridge update signals to the provided emitter.
+	// Preserve values (session/user/tracing) but decouple from caller cancellation.
+	fwdCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	ch := f.r.subscriberForURI(uri)
+	go func() {
+		for {
+			select {
+			case <-fwdCtx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				if emit != nil {
+					emit(context.WithoutCancel(fwdCtx), uri)
+				}
+			}
 		}
-	}
-	if m, ok := f.r.subsBySession[sid]; ok {
-		delete(m, uri)
-		if len(m) == 0 {
-			delete(f.r.subsBySession, sid)
+	}()
+
+	cancel := func(ctx context.Context) error {
+		stop()
+		f.r.mu.Lock()
+		if m, ok := f.r.subsByURI[uri]; ok {
+			delete(m, sid)
+			if len(m) == 0 {
+				delete(f.r.subsByURI, uri)
+			}
 		}
+		if m, ok := f.r.subsBySession[sid]; ok {
+			delete(m, uri)
+			if len(m) == 0 {
+				delete(f.r.subsBySession, sid)
+			}
+		}
+		f.r.mu.Unlock()
+		return nil
 	}
-	f.r.mu.Unlock()
-	return nil
+	return cancel, nil
 }
 
 // uriExists returns true if the URI resolves to a regular file within the allowed root.

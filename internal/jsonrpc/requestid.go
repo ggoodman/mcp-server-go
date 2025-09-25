@@ -20,8 +20,7 @@ func NewRequestID(value interface{}) *RequestID {
 	}
 }
 
-// String returns the prefixed string representation of the ID
-// Format: "s:<string_value>" for strings, "n:<numeric_value>" for numbers, "nil:" for nil values
+// String returns the string representation of the ID
 func (id *RequestID) String() string {
 	if id.value == nil {
 		return ""

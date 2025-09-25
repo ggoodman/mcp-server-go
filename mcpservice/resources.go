@@ -202,24 +202,51 @@ func (rc *resourcesCapability) GetListChangedCapability(ctx context.Context, ses
 // resourceSubscriptionFromContainer adapts StaticResources to ResourceSubscriptionCapability.
 type resourceSubscriptionFromContainer struct{ sr *StaticResources }
 
-func (r resourceSubscriptionFromContainer) Subscribe(ctx context.Context, session sessions.Session, uri string) error {
-	// Accept only URIs that exist
+func (r resourceSubscriptionFromContainer) Subscribe(ctx context.Context, session sessions.Session, uri string, emit NotifyResourceUpdatedFunc) (CancelSubscription, error) {
+	if r.sr == nil {
+		return func(ctx context.Context) error { return nil }, nil
+	}
+	// Validate the resource exists
 	if !r.sr.HasResource(uri) {
-		return fmt.Errorf("resource not found: %s", uri)
+		return nil, fmt.Errorf("resource not found: %s", uri)
 	}
 	sid := session.SessionID()
-	_ = r.sr.Subscribe(ctx, sid, uri) // idempotent add
-	return nil
-}
+	// Record the subscription for bookkeeping (idempotent)
+	_ = r.sr.Subscribe(ctx, sid, uri)
 
-// Unsubscribe removes a previously added subscription. It is idempotent.
-func (r resourceSubscriptionFromContainer) Unsubscribe(ctx context.Context, session sessions.Session, uri string) error {
-	if r.sr == nil {
+	// Create a long-lived goroutine that forwards per-URI updates via emit.
+	fwdCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	ch := r.sr.SubscriberForURI(uri)
+	go func() {
+		for {
+			select {
+			case <-fwdCtx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				// Re-check context after tick to avoid emitting after cancellation
+				select {
+				case <-fwdCtx.Done():
+					return
+				default:
+				}
+				if emit != nil {
+					// Preserve values (session, request, tracing) while decoupling from caller cancellation.
+					emit(context.WithoutCancel(fwdCtx), uri)
+				}
+			}
+		}
+	}()
+
+	// Return cancel function that prunes bookkeeping and stops the goroutine.
+	cancel := func(ctx context.Context) error {
+		stop()
+		_ = r.sr.Unsubscribe(ctx, sid, uri)
 		return nil
 	}
-	sid := session.SessionID()
-	_ = r.sr.Unsubscribe(ctx, sid, uri) // idempotent remove
-	return nil
+	return cancel, nil
 }
 
 // resourceListChangedFromSubscriber adapts a ChangeSubscriber to ResourceListChangedCapability.

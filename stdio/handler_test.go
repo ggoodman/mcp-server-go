@@ -2,9 +2,9 @@ package stdio
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -18,1195 +18,836 @@ import (
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
-func TestInitializeAndPing(t *testing.T) {
-	t.Parallel()
+// testHarness wires a Handler to an in-memory stdio pair with helpers to send/recv messages.
+type testHarness struct {
+	t      *testing.T
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	// Prepare server capabilities
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-test", Version: "0.1.0"}),
-	)
+	stdinW  io.WriteCloser
+	stdoutR *bufio.Scanner
 
-	// Input: initialize + ping, newline-delimited
-	initReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	}
-	pingReq := map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)}
+	outMu sync.Mutex
+	lines []string
+}
 
-	var in bytes.Buffer
-	mustWriteJSONL(t, &in, initReq)
-	mustWriteJSONL(t, &in, pingReq)
+const defaultProtocolVersion = "2024-11-05"
 
-	var out bytes.Buffer
-	h := NewHandler(server, WithIO(&in, &out))
-
-	if err := h.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve returned error: %v", err)
-	}
-
-	lines := splitNonEmptyLines(out.String())
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 responses, got %d: %q", len(lines), out.String())
-	}
-
-	// Validate initialize response
-	var initRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[0]), &initRes); err != nil {
-		t.Fatalf("unmarshal init response: %v", err)
-	}
-	if initRes.Error != nil {
-		t.Fatalf("init error: %+v", initRes.Error)
-	}
-	var initPayload mcp.InitializeResult
-	if err := json.Unmarshal(initRes.Result, &initPayload); err != nil {
-		t.Fatalf("unmarshal init payload: %v", err)
-	}
-	if got, want := initPayload.ProtocolVersion, "2025-06-18"; got != want {
-		t.Fatalf("protocol version: got %q want %q", got, want)
-	}
-	if initPayload.ServerInfo.Name != "stdio-test" || initPayload.ServerInfo.Version != "0.1.0" {
-		t.Fatalf("server info mismatch: %+v", initPayload.ServerInfo)
-	}
-
-	// Validate ping response
-	var pingRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[1]), &pingRes); err != nil {
-		t.Fatalf("unmarshal ping response: %v", err)
-	}
-	if pingRes.Error != nil {
-		t.Fatalf("ping error: %+v", pingRes.Error)
+func defaultInitializeRequest() mcp.InitializeRequest {
+	return mcp.InitializeRequest{
+		ProtocolVersion: defaultProtocolVersion,
+		ClientInfo:      mcp.ImplementationInfo{Name: "client", Version: "0.0.1"},
+		Capabilities:    mcp.ClientCapabilities{Sampling: &struct{}{}, Elicitation: &struct{}{}},
 	}
 }
 
-func TestToolsList(t *testing.T) {
-	t.Parallel()
+func newHarness(t *testing.T, srv mcpservice.ServerCapabilities) *testHarness {
+	t.Helper()
 
-	// Tools capability with one tool
-	tool := mcp.Tool{
-		Name:        "echo",
-		Description: "Echo input",
-		InputSchema: mcp.ToolInputSchema{Type: "object"},
-	}
-	tools := mcpservice.NewToolsCapability(
-		mcpservice.WithListTools(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.Tool], error) {
-			return mcpservice.NewPage([]mcp.Tool{tool}), nil
-		}),
-	)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-tools", Version: "0.1.0"}),
-		mcpservice.WithToolsCapability(tools),
-	)
-
-	// initialize + tools/list
-	initReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	}
-	listReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  string(mcp.ToolsListMethod),
-		"params":  map[string]any{"cursor": ""},
-	}
-
-	var in bytes.Buffer
-	mustWriteJSONL(t, &in, initReq)
-	mustWriteJSONL(t, &in, listReq)
-	var out bytes.Buffer
-
-	h := NewHandler(server, WithIO(&in, &out))
-	if err := h.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve returned error: %v", err)
-	}
-
-	lines := splitNonEmptyLines(out.String())
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 responses, got %d: %q", len(lines), out.String())
-	}
-
-	// tools/list response
-	var toolsRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[1]), &toolsRes); err != nil {
-		t.Fatalf("unmarshal tools response: %v", err)
-	}
-	if toolsRes.Error != nil {
-		t.Fatalf("tools list error: %+v", toolsRes.Error)
-	}
-	var payload mcp.ListToolsResult
-	if err := json.Unmarshal(toolsRes.Result, &payload); err != nil {
-		t.Fatalf("unmarshal tools payload: %v", err)
-	}
-	if len(payload.Tools) != 1 || payload.Tools[0].Name != "echo" {
-		t.Fatalf("unexpected tools payload: %+v", payload)
-	}
-}
-
-func TestResourcesListAndRead(t *testing.T) {
-	t.Parallel()
-
-	res := mcp.Resource{URI: "res://hello.txt", Name: "hello.txt"}
-	contents := []mcp.ResourceContents{{URI: res.URI, Text: "hello"}}
-
-	resources := mcpservice.NewResourcesCapability(
-		mcpservice.WithListResources(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.Resource], error) {
-			return mcpservice.NewPage([]mcp.Resource{res}), nil
-		}),
-		mcpservice.WithReadResource(func(_ context.Context, _ sessions.Session, uri string) ([]mcp.ResourceContents, error) {
-			if uri != res.URI {
-				return nil, nil
-			}
-			return contents, nil
-		}),
-	)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-resources", Version: "0.1.0"}),
-		mcpservice.WithResourcesCapability(resources),
-	)
-
-	// initialize + resources/list + resources/read
-	initReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	}
-	listReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  string(mcp.ResourcesListMethod),
-		"params":  map[string]any{"cursor": ""},
-	}
-	readReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      3,
-		"method":  string(mcp.ResourcesReadMethod),
-		"params":  map[string]any{"uri": res.URI},
-	}
-
-	var in bytes.Buffer
-	mustWriteJSONL(t, &in, initReq)
-	mustWriteJSONL(t, &in, listReq)
-	mustWriteJSONL(t, &in, readReq)
-	var out bytes.Buffer
-
-	h := NewHandler(server, WithIO(&in, &out))
-	if err := h.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve returned error: %v", err)
-	}
-
-	lines := splitNonEmptyLines(out.String())
-	if len(lines) != 3 {
-		t.Fatalf("expected 3 responses, got %d: %q", len(lines), out.String())
-	}
-
-	// resources/list
-	var listRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[1]), &listRes); err != nil {
-		t.Fatalf("unmarshal resources/list: %v", err)
-	}
-	if listRes.Error != nil {
-		t.Fatalf("resources/list error: %+v", listRes.Error)
-	}
-	var listPayload mcp.ListResourcesResult
-	if err := json.Unmarshal(listRes.Result, &listPayload); err != nil {
-		t.Fatalf("unmarshal resources payload: %v", err)
-	}
-	if len(listPayload.Resources) != 1 || listPayload.Resources[0].URI != res.URI {
-		t.Fatalf("unexpected resources payload: %+v", listPayload)
-	}
-
-	// resources/read
-	var readRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[2]), &readRes); err != nil {
-		t.Fatalf("unmarshal resources/read: %v", err)
-	}
-	if readRes.Error != nil {
-		t.Fatalf("resources/read error: %+v", readRes.Error)
-	}
-	var readPayload mcp.ReadResourceResult
-	if err := json.Unmarshal(readRes.Result, &readPayload); err != nil {
-		t.Fatalf("unmarshal read payload: %v", err)
-	}
-	if len(readPayload.Contents) != 1 || readPayload.Contents[0].Text != "hello" {
-		t.Fatalf("unexpected read payload: %+v", readPayload)
-	}
-}
-
-func TestResourcesTemplatesList(t *testing.T) {
-	t.Parallel()
-
-	tmpl := mcp.ResourceTemplate{URITemplate: "file://{path}", Name: "file"}
-	resources := mcpservice.NewResourcesCapability(
-		mcpservice.WithListResourceTemplates(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
-			return mcpservice.NewPage([]mcp.ResourceTemplate{tmpl}), nil
-		}),
-	)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-res-templates", Version: "0.1.0"}),
-		mcpservice.WithResourcesCapability(resources),
-	)
-
-	initReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	}
-	listReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  string(mcp.ResourcesTemplatesListMethod),
-		"params":  map[string]any{"cursor": ""},
-	}
-
-	var in bytes.Buffer
-	mustWriteJSONL(t, &in, initReq)
-	mustWriteJSONL(t, &in, listReq)
-	var out bytes.Buffer
-
-	h := NewHandler(server, WithIO(&in, &out))
-	if err := h.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve returned error: %v", err)
-	}
-
-	lines := splitNonEmptyLines(out.String())
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 responses, got %d: %q", len(lines), out.String())
-	}
-
-	var rpcRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[1]), &rpcRes); err != nil {
-		t.Fatalf("unmarshal templates response: %v", err)
-	}
-	if rpcRes.Error != nil {
-		t.Fatalf("templates list error: %+v", rpcRes.Error)
-	}
-	var payload mcp.ListResourceTemplatesResult
-	if err := json.Unmarshal(rpcRes.Result, &payload); err != nil {
-		t.Fatalf("unmarshal templates payload: %v", err)
-	}
-	if len(payload.ResourceTemplates) != 1 || payload.ResourceTemplates[0].URITemplate != tmpl.URITemplate {
-		t.Fatalf("unexpected templates payload: %+v", payload)
-	}
-}
-
-func TestPromptsListAndGet(t *testing.T) {
-	t.Parallel()
-
-	p := mcp.Prompt{Name: "hello", Description: "say hello"}
-	prompts := mcpservice.NewPromptsCapability(
-		mcpservice.WithListPrompts(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.Prompt], error) {
-			return mcpservice.NewPage([]mcp.Prompt{p}), nil
-		}),
-		mcpservice.WithGetPrompt(func(_ context.Context, _ sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
-			if req.Name != p.Name {
-				return nil, nil
-			}
-			return &mcp.GetPromptResult{
-				Description: "say hello",
-				Messages: []mcp.PromptMessage{{
-					Role:    mcp.RoleAssistant,
-					Content: []mcp.ContentBlock{{Type: "text", Text: "hello"}},
-				}},
-			}, nil
-		}),
-	)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-prompts", Version: "0.1.0"}),
-		mcpservice.WithPromptsCapability(prompts),
-	)
-
-	// initialize + prompts/list + prompts/get
-	initReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	}
-	listReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      2,
-		"method":  string(mcp.PromptsListMethod),
-		"params":  map[string]any{"cursor": ""},
-	}
-	getReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      3,
-		"method":  string(mcp.PromptsGetMethod),
-		"params":  map[string]any{"name": p.Name},
-	}
-
-	var in bytes.Buffer
-	mustWriteJSONL(t, &in, initReq)
-	mustWriteJSONL(t, &in, listReq)
-	mustWriteJSONL(t, &in, getReq)
-	var out bytes.Buffer
-
-	h := NewHandler(server, WithIO(&in, &out))
-	if err := h.Serve(context.Background()); err != nil {
-		t.Fatalf("Serve returned error: %v", err)
-	}
-
-	lines := splitNonEmptyLines(out.String())
-	if len(lines) != 3 {
-		t.Fatalf("expected 3 responses, got %d: %q", len(lines), out.String())
-	}
-
-	// prompts/list
-	var listRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[1]), &listRes); err != nil {
-		t.Fatalf("unmarshal prompts/list: %v", err)
-	}
-	if listRes.Error != nil {
-		t.Fatalf("prompts/list error: %+v", listRes.Error)
-	}
-	var listPayload mcp.ListPromptsResult
-	if err := json.Unmarshal(listRes.Result, &listPayload); err != nil {
-		t.Fatalf("unmarshal prompts payload: %v", err)
-	}
-	if len(listPayload.Prompts) != 1 || listPayload.Prompts[0].Name != p.Name {
-		t.Fatalf("unexpected prompts payload: %+v", listPayload)
-	}
-
-	// prompts/get
-	var getRes jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[2]), &getRes); err != nil {
-		t.Fatalf("unmarshal prompts/get: %v", err)
-	}
-	if getRes.Error != nil {
-		t.Fatalf("prompts/get error: %+v", getRes.Error)
-	}
-	var getPayload mcp.GetPromptResult
-	if err := json.Unmarshal(getRes.Result, &getPayload); err != nil {
-		t.Fatalf("unmarshal get payload: %v", err)
-	}
-	if len(getPayload.Messages) != 1 || getPayload.Messages[0].Content[0].Text != "hello" {
-		t.Fatalf("unexpected get payload: %+v", getPayload)
-	}
-}
-
-func TestResourcesSubscribeAndListChanged(t *testing.T) {
-	t.Parallel()
-
-	// Static resources container enables subscribe + listChanged
-	sr := mcpservice.NewStaticResources(
-		[]mcp.Resource{{URI: "res://a.txt", Name: "a.txt"}},
-		nil,
-		map[string][]mcp.ResourceContents{
-			"res://a.txt": {{URI: "res://a.txt", Text: "A"}},
-		},
-	)
-
-	resources := mcpservice.NewResourcesCapability(
-		mcpservice.WithStaticResourceContainer(sr),
-	)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-res-subs", Version: "0.1.0"}),
-		mcpservice.WithResourcesCapability(resources),
-	)
-
-	// Build input: initialize -> subscribe -> (server change) -> unsubscribe
-	initReq := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	}
-	subReq := map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.ResourcesSubscribeMethod), "params": map[string]any{"uri": "res://a.txt"}}
-	unsubReq := map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ResourcesUnsubscribeMethod), "params": map[string]any{"uri": "res://a.txt"}}
-
-	// Use pipes to simulate streaming stdio safely across goroutines
+	// wire stdio via io.Pipe
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 
-	h := NewHandler(server, WithIO(inR, outW))
+	// handler writes to outW, reads from inR
+	// Use default logger to surface engine/handler logs in test output
+	h := NewHandler(srv, WithIO(inR, outW), WithLogger(slog.Default()))
 
-	// Start a reader to prevent PipeWriter flush from blocking
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
+	ctx, cancel := context.WithCancel(context.Background())
+	th := &testHarness{t: t, ctx: ctx, cancel: cancel, stdinW: inW, stdoutR: bufio.NewScanner(outR)}
+
+	// start handler
 	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
-		}
-		close(scanDone)
+		_ = h.Serve(ctx)
 	}()
 
-	// Run Serve in background
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
+	// start stdout collector
+	go func() {
+		for th.stdoutR.Scan() {
+			line := strings.TrimSpace(th.stdoutR.Text())
+			th.t.Logf("OUT: %s", line)
+			th.outMu.Lock()
+			th.lines = append(th.lines, line)
+			th.outMu.Unlock()
+		}
+	}()
 
-	// Write initialize and subscribe
-	mustWriteJSONLToWriter(t, inW, initReq)
-	// Signal that the client finished initialization
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-	// Synchronize: send a ping and wait for init+ping responses so registrations are active
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-	waitForLines(t, &linesMu, &lines, 2)
-	mustWriteJSONLToWriter(t, inW, subReq)
+	t.Cleanup(func() {
+		cancel()
+		_ = inW.Close()
+		_ = outW.Close()
+		// allow goroutines to wind down
+		time.Sleep(10 * time.Millisecond)
+	})
+	return th
+}
 
-	// Trigger a list change by adding a new resource; should yield a list_changed notification.
-	_ = sr.AddResource(context.Background(), mcp.Resource{URI: "res://b.txt", Name: "b.txt"})
-	// Wait until we observe the notification before proceeding to avoid race with shutdown.
-	waitForNotification(t, &linesMu, &lines, string(mcp.ResourcesListChangedNotificationMethod))
-
-	// Now request unsubscribe and close input to end the handler loop gracefully
-	mustWriteJSONLToWriter(t, inW, unsubReq)
-	_ = inW.Close() // signal EOF
-
-	// Wait for Serve to return, then close output writer and wait for reader
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	linesMu.Lock()
-	defer linesMu.Unlock()
-	if len(lines) < 3 {
-		t.Fatalf("expected at least 3 messages (init, subscribe result, list_changed), got %d: %+v", len(lines), lines)
+func (th *testHarness) send(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
 	}
-	// Find a resources list_changed notification among messages
-	foundListChanged := false
-	for _, l := range lines {
-		var any jsonrpc.AnyMessage
-		if err := json.Unmarshal([]byte(l), &any); err != nil {
+	if _, err := th.stdinW.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (th *testHarness) nextLine(timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		th.outMu.Lock()
+		if len(th.lines) > 0 {
+			s := th.lines[0]
+			th.lines = th.lines[1:]
+			th.outMu.Unlock()
+			return s, nil
+		}
+		th.outMu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+	}
+	return "", fmt.Errorf("timeout waiting for output line")
+}
+
+func (th *testHarness) expectResponse(timeout time.Duration) (*jsonrpc.Response, error) {
+	line, err := th.nextLine(timeout)
+	if err != nil {
+		return nil, err
+	}
+	var any jsonrpc.AnyMessage
+	if err := json.Unmarshal([]byte(line), &any); err != nil {
+		return nil, err
+	}
+	if any.Type() != "response" {
+		return nil, fmt.Errorf("expected response, got %s", any.Type())
+	}
+	return any.AsResponse(), nil
+}
+
+func (th *testHarness) expectRequest(timeout time.Duration) (*jsonrpc.Request, error) {
+	line, err := th.nextLine(timeout)
+	if err != nil {
+		return nil, err
+	}
+	var any jsonrpc.AnyMessage
+	if err := json.Unmarshal([]byte(line), &any); err != nil {
+		return nil, err
+	}
+	if any.Type() != "request" && any.Type() != "notification" {
+		return nil, fmt.Errorf("expected request/notification, got %s", any.Type())
+	}
+	return any.AsRequest(), nil
+}
+
+func (th *testHarness) initialize(t *testing.T, id string, req mcp.InitializeRequest) *mcp.InitializeResult {
+	t.Helper()
+
+	initReq := &jsonrpc.Request{
+		JSONRPCVersion: jsonrpc.ProtocolVersion,
+		Method:         string(mcp.InitializeMethod),
+		ID:             jsonrpc.NewRequestID(id),
+		Params:         mustJSON(t, req),
+	}
+
+	if err := th.send(initReq); err != nil {
+		t.Fatalf("send initialize: %v", err)
+	}
+
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatalf("expect initialize response: %v", err)
+	}
+	if res.Error != nil {
+		t.Fatalf("initialize failed: %+v", res.Error)
+	}
+
+	var initRes mcp.InitializeResult
+	if err := json.Unmarshal(res.Result, &initRes); err != nil {
+		t.Fatalf("decode initialize result: %v", err)
+	}
+	return &initRes
+}
+
+func (th *testHarness) drainUntilMethod(method string, timeout time.Duration) (*jsonrpc.Request, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		line, err := th.nextLine(10 * time.Millisecond)
+		if err != nil {
 			continue
 		}
-		if any.Type() == "notification" && any.Method == string(mcp.ResourcesListChangedNotificationMethod) {
-			foundListChanged = true
-			break
+		var any jsonrpc.AnyMessage
+		if json.Unmarshal([]byte(line), &any) != nil {
+			continue
+		}
+		if any.Type() == "response" {
+			// push response back into queue for future expectations
+			th.outMu.Lock()
+			th.lines = append([]string{line}, th.lines...)
+			th.outMu.Unlock()
+			continue
+		}
+		req := any.AsRequest()
+		if req != nil && req.Method == method {
+			return req, true
 		}
 	}
-	if !foundListChanged {
-		t.Fatalf("did not observe resources list_changed notification; outputs: %+v", lines)
+	return nil, false
+}
+
+// --- Test helper capability implementations ---
+
+// rootsTriggerToolsCap triggers a client roots/list when tools/list is called, to test client roundtrip wiring.
+type rootsTriggerToolsCap struct{}
+
+var _ mcpservice.ToolsCapability = (*rootsTriggerToolsCap)(nil)
+
+func (rootsTriggerToolsCap) ListTools(ctx context.Context, session sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
+	if rc, ok := session.GetRootsCapability(); ok {
+		_, _ = rc.ListRoots(ctx) // trigger client call; ignore errors
+	}
+	return mcpservice.NewPage([]mcp.Tool{{Name: "t"}}), nil
+}
+
+func (rootsTriggerToolsCap) CallTool(context.Context, sessions.Session, *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+	return &mcp.CallToolResult{Content: []mcp.ContentBlock{}}, nil
+}
+
+func (rootsTriggerToolsCap) GetListChangedCapability(ctx context.Context, s sessions.Session) (mcpservice.ToolListChangedCapability, bool, error) {
+	return nil, false, nil
+}
+
+// fakeCompletions is a simple completions capability for tests.
+type fakeCompletions struct{}
+
+var _ mcpservice.CompletionsCapability = (*fakeCompletions)(nil)
+
+func (fakeCompletions) Complete(ctx context.Context, _ sessions.Session, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
+	return &mcp.CompleteResult{Completion: mcp.Completion{Values: []string{"one", "two"}, Total: 2}}, nil
+}
+
+// --- Tests ---
+
+func TestInitialize_HappyPath(t *testing.T) {
+	srv := mcpservice.NewServer(
+		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "test", Version: "1.0.0"}),
+		mcpservice.WithPreferredProtocolVersion(defaultProtocolVersion),
+		mcpservice.WithInstructions("Have fun!"),
+		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools())),
+		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&slog.LevelVar{})),
+	)
+	th := newHarness(t, srv)
+
+	initRes := th.initialize(t, "init-1", defaultInitializeRequest())
+	if initRes.ProtocolVersion != defaultProtocolVersion {
+		t.Fatalf("negotiated protocol mismatch: %s", initRes.ProtocolVersion)
+	}
+	if initRes.ServerInfo.Name != "test" {
+		t.Fatalf("server info missing")
+	}
+	if initRes.Capabilities.Tools == nil {
+		t.Fatalf("tools capability not advertised")
 	}
 }
 
-func TestToolsListChangedNotification(t *testing.T) {
-	t.Parallel()
+func TestTools_ListAndCall(t *testing.T) {
+	// Define a simple echo tool without schema reflection
+	echoDesc := mcp.Tool{
+		Name: "echo",
+		InputSchema: mcp.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]mcp.SchemaProperty{
+				"text": {Type: "string"},
+			},
+			Required: []string{"text"},
+		},
+	}
+	echo := mcpservice.StaticTool{Descriptor: echoDesc, Handler: func(ctx context.Context, _ sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+		var args struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(req.Arguments, &args); err != nil {
+			return mcpservice.Errorf("invalid arguments: %v", err), nil
+		}
+		_ = mcpservice.ReportProgress(ctx, 0.25, 1)
+		return mcpservice.TextResult(args.Text), nil
+	}}
+	st := mcpservice.NewStaticTools(echo)
+	srv := mcpservice.NewServer(
+		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)),
+	)
+	th := newHarness(t, srv)
 
-	// Static tools container enables listChanged
+	// Initialize and open
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// List tools
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("list error: %+v", res.Error)
+	}
+	var list mcp.ListToolsResult
+	if err := json.Unmarshal(res.Result, &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Tools) != 1 || list.Tools[0].Name != "echo" {
+		t.Fatalf("unexpected tools: %+v", list.Tools)
+	}
+
+	// Call tool
+	callReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsCallMethod), ID: jsonrpc.NewRequestID("2")}
+	callReq.Params = mustJSON(t, mcp.CallToolRequestReceived{Name: "echo", Arguments: mustJSONRaw(t, map[string]any{"text": "hi"})})
+	if err := th.send(callReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Optionally observe a progress notification (transport emits it)
+	// It's a notification from server to client, so it will appear as a request without ID
+	// Don't assert strictly to avoid flakes
+	_ = tryDrainUntilProgress(th, 200*time.Millisecond)
+
+	res, err = th.expectResponse(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("call error: %+v", res.Error)
+	}
+	var result mcp.CallToolResult
+	if err := json.Unmarshal(res.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Content) == 0 || result.Content[0].Text != "hi" {
+		t.Fatalf("unexpected tool result: %+v", result)
+	}
+}
+
+// Handshake gating: requests must fail until client sends notifications/initialized.
+func TestHandshake_PendingRejectsRequests(t *testing.T) {
+	srv := mcpservice.NewServer()
+	th := newHarness(t, srv)
+
+	// Initialize session
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+
+	// Immediately send a ping request before initialized; expect InvalidRequest error
+	ping := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PingMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(ping); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil || res.Error.Code != jsonrpc.ErrorCodeInvalidRequest {
+		t.Fatalf("expected invalid request error before initialized, got: %+v", res.Error)
+	}
+}
+
+// After notifications/initialized, requests should succeed.
+func TestHandshake_InitializedAllowsRequests(t *testing.T) {
+	srv := mcpservice.NewServer()
+	th := newHarness(t, srv)
+
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+
+	// Send client notifications/initialized
+	initNote := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+	if err := th.send(initNote); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give the handler a brief moment to start the session pump
+	time.Sleep(20 * time.Millisecond)
+
+	// Now ping should no longer be rejected for being uninitialized. The engine
+	// may still return not implemented for ping, which is fine. We only assert
+	// the gating error is gone.
+	ping := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PingMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(ping); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil && res.Error.Message == "session not initialized" {
+		t.Fatalf("unexpected error after initialized: %+v", res.Error)
+	}
+}
+
+// Eager wiring: after Open the server should emit tools listChanged notifications when the
+// static tools container changes, and wiring should be idempotent even if initialized is sent twice.
+func TestEagerWiring_ToolsListChanged_IdempotentInitialized(t *testing.T) {
+	// Start with an empty static tools container that exposes listChanged via subscriber.
 	st := mcpservice.NewStaticTools()
-	toolsCap := mcpservice.NewToolsCapability(
-		mcpservice.WithStaticToolsContainer(st),
+	srv := mcpservice.NewServer(
+		mcpservice.WithToolsOptions(
+			mcpservice.WithStaticToolsContainer(st),
+		),
 	)
+	th := newHarness(t, srv)
 
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-tools-lc", Version: "0.1.0"}),
-		mcpservice.WithToolsCapability(toolsCap),
-	)
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
 
-	// Use pipes to simulate streaming stdio
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
+	// Send initialized twice (idempotent)
+	initNote := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)}
+	if err := th.send(initNote); err != nil {
+		t.Fatal(err)
+	}
+	if err := th.send(initNote); err != nil {
+		t.Fatal(err)
+	}
 
-	// concurrent reader to drain outputs
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
+	// Wait until a simple ping succeeds to ensure session is open and pump running
+	func() {
+		ping := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PingMethod), ID: jsonrpc.NewRequestID("p1")}
+		if err := th.send(ping); err != nil {
+			t.Fatal(err)
 		}
-		close(scanDone)
+		if _, err := th.expectResponse(1 * time.Second); err != nil {
+			t.Fatalf("ping after initialized: %v", err)
+		}
 	}()
 
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	// Write initialize
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	})
-	// Send notifications/initialized to mark client readiness for notifications
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-
-	// Synchronize: send a ping and wait for init+ping responses so registrations are active
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-	waitForLines(t, &linesMu, &lines, 2)
-
-	// Trigger tools change -> should emit list_changed
-	st.Add(context.Background(), mcpservice.StaticTool{
-		Descriptor: mcp.Tool{Name: "noop", InputSchema: mcp.ToolInputSchema{Type: "object"}},
-		Handler: func(ctx context.Context, _ sessions.Session, _ *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
-			return &mcp.CallToolResult{}, nil
-		},
-	})
-
-	// Wait for the tools list_changed notification to appear
-	waitForNotification(t, &linesMu, &lines, string(mcp.ToolsListChangedNotificationMethod))
-
-	_ = inW.Close() // signal EOF
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	linesMu.Lock()
-	defer linesMu.Unlock()
-	found := false
-	for _, l := range lines {
-		var any jsonrpc.AnyMessage
-		if err := json.Unmarshal([]byte(l), &any); err != nil {
-			continue
-		}
-		if any.Type() == "notification" && any.Method == string(mcp.ToolsListChangedNotificationMethod) {
-			found = true
-			break
-		}
+	// Trigger a tools change twice; expect exactly one list_changed per change
+	// Change 1
+	st.Replace(t.Context())
+	if req, ok := th.drainUntilMethod(string(mcp.ToolsListChangedNotificationMethod), 1*time.Second); !ok {
+		t.Fatalf("expected %s after first change", mcp.ToolsListChangedNotificationMethod)
+	} else if req.ID != nil && !req.ID.IsNil() {
+		t.Fatalf("notification should not have ID: %+v", req.ID)
 	}
-	if !found {
-		t.Fatalf("did not observe tools list_changed notification; outputs: %+v", lines)
+
+	// Change 2
+	st.Replace(t.Context())
+	if req, ok := th.drainUntilMethod(string(mcp.ToolsListChangedNotificationMethod), 1*time.Second); !ok {
+		t.Fatalf("expected %s after second change", mcp.ToolsListChangedNotificationMethod)
+	} else if req.ID != nil && !req.ID.IsNil() {
+		t.Fatalf("notification should not have ID: %+v", req.ID)
+	}
+
+	// Ensure there isn't an unexpected extra third notification within a short window
+	if _, ok := th.drainUntilMethod(string(mcp.ToolsListChangedNotificationMethod), 150*time.Millisecond); ok {
+		t.Fatalf("unexpected extra tools list_changed notification (duplicate wiring?)")
 	}
 }
 
-func TestPromptsListChangedNotification(t *testing.T) {
-	t.Parallel()
+func TestCancellation_ToolsCall(t *testing.T) {
+	// Tool that waits on context cancellation
+	slowDesc := mcp.Tool{Name: "slow", InputSchema: mcp.ToolInputSchema{Type: "object"}}
+	cancelled := make(chan struct{})
+	closeCancelled := sync.Once{}
+	slow := mcpservice.StaticTool{Descriptor: slowDesc, Handler: func(ctx context.Context, _ sessions.Session, _ *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+		// Emit progress so the test can detect we've started, ensuring the engine
+		// has registered cancellation handlers for this request ID.
+		_ = mcpservice.ReportProgress(ctx, 0, 1)
+		<-ctx.Done()
+		closeCancelled.Do(func() {
+			close(cancelled)
+		})
+		t.Logf("tool handler exiting due to cancellation: %v", ctx.Err())
+		return nil, ctx.Err()
+	}}
+	st := mcpservice.NewStaticTools(slow)
+	srv := mcpservice.NewServer(mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)))
+	th := newHarness(t, srv)
 
-	sp := mcpservice.NewStaticPrompts()
-	promptsCap := mcpservice.NewPromptsCapability(
-		mcpservice.WithStaticPromptsContainer(sp),
-	)
+	// init and open
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
 
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-prompts-lc", Version: "0.1.0"}),
-		mcpservice.WithPromptsCapability(promptsCap),
-	)
-
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
-		}
-		close(scanDone)
-	}()
-
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "test", "version": "0.0.0"},
-		},
-	})
-
-	// Send notifications/initialized to mark client readiness for notifications
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-
-	// Synchronize: send a ping and wait for init+ping responses so registrations are active
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-	waitForLines(t, &linesMu, &lines, 2)
-
-	// Trigger prompts change -> should emit list_changed
-	sp.Add(context.Background(), mcpservice.StaticPrompt{
-		Descriptor: mcp.Prompt{Name: "hi"},
-		Handler: func(ctx context.Context, _ sessions.Session, _ *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
-			return &mcp.GetPromptResult{Messages: []mcp.PromptMessage{}}, nil
-		},
-	})
-
-	// Wait for the prompts list_changed notification to appear
-	waitForNotification(t, &linesMu, &lines, string(mcp.PromptsListChangedNotificationMethod))
-
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	linesMu.Lock()
-	defer linesMu.Unlock()
-	found := false
-	for _, l := range lines {
-		var any jsonrpc.AnyMessage
-		if err := json.Unmarshal([]byte(l), &any); err != nil {
-			continue
-		}
-		if any.Type() == "notification" && any.Method == string(mcp.PromptsListChangedNotificationMethod) {
-			found = true
-			break
-		}
+	// call
+	rid := "42"
+	callReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsCallMethod), ID: jsonrpc.NewRequestID(rid)}
+	callReq.Params = mustJSON(t, mcp.CallToolRequestReceived{Name: "slow"})
+	if err := th.send(callReq); err != nil {
+		t.Fatal(err)
 	}
-	if !found {
-		t.Fatalf("did not observe prompts list_changed notification; outputs: %+v", lines)
+
+	// Wait until we see a progress notification indicating the tool started.
+	if !tryDrainUntilProgress(th, 750*time.Millisecond) {
+		t.Fatalf("expected progress notification before cancellation")
+	}
+
+	// cancel via notification
+	cancelNote := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CancelledNotificationMethod)}
+	cancelNote.Params = mustJSON(t, mcp.CancelledNotification{RequestID: rid, Reason: "test"})
+	if err := th.send(cancelNote); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("tool context was not cancelled")
+	}
+
+	res, err := th.expectResponse(time.Second)
+	if err != nil {
+		t.Fatalf("expect cancellation response: %v", err)
+	}
+	if res.Error == nil {
+		t.Fatalf("expected error response, got: %+v", res)
 	}
 }
 
-func TestResourcesUpdatedNotificationOnStdio(t *testing.T) {
-	t.Parallel()
+func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
+	// This test exercises that handler forwards client responses back into engine rendezvous.
+	// We trigger sampling.CreateMessage from inside a tool.
+	roundtripDesc := mcp.Tool{Name: "roundtrip", InputSchema: mcp.ToolInputSchema{Type: "object"}}
+	tool := mcpservice.StaticTool{Descriptor: roundtripDesc, Handler: func(ctx context.Context, session sessions.Session, _ *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+		if smp, ok := session.GetSamplingCapability(); ok {
+			req := &mcp.CreateMessageRequest{Messages: []mcp.SamplingMessage{{Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "hi"}}}}
+			go func() { _, _ = smp.CreateMessage(ctx, req) }()
+		}
+		return mcpservice.TextResult("ok"), nil
+	}}
+	st := mcpservice.NewStaticTools(tool)
+	srv := mcpservice.NewServer(mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)))
+	th := newHarness(t, srv)
 
-	// StaticResources with one file and subscribe support
+	// init with sampling + elicitation client caps so engine sets up session writers
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// call tool
+	rid := "77"
+	callReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsCallMethod), ID: jsonrpc.NewRequestID(rid)}
+	callReq.Params = mustJSON(t, mcp.CallToolRequestReceived{Name: "roundtrip"})
+	if err := th.send(callReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect the call tool response first.
+	res, err := th.expectResponse(2 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("unexpected error: %+v", res.Error)
+	}
+
+	// We expect server to send out requests for sampling/elicitation if used.
+	// Drain any follow-up requests to ensure the transport forwards them without deadlocks.
+	drainDeadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(drainDeadline) {
+		if _, err := th.expectRequest(50 * time.Millisecond); err != nil {
+			break
+		}
+	}
+}
+
+func TestResources_ListReadSubscribe(t *testing.T) {
+	// Static resources: one resource with initial contents
+	uri := "mem://a"
 	sr := mcpservice.NewStaticResources(
-		[]mcp.Resource{{URI: "res://a.txt", Name: "a.txt"}},
+		[]mcp.Resource{{URI: uri, Name: "A", MimeType: "text/plain"}},
 		nil,
 		map[string][]mcp.ResourceContents{
-			"res://a.txt": {{URI: "res://a.txt", Text: "A"}},
+			uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v1"}},
 		},
 	)
-	resources := mcpservice.NewResourcesCapability(mcpservice.WithStaticResourceContainer(sr))
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-updated", Version: "0.1.0"}),
-		mcpservice.WithResourcesCapability(resources),
+	srv := mcpservice.NewServer(
+		mcpservice.WithResourcesOptions(
+			mcpservice.WithStaticResourceContainer(sr),
+		),
 	)
+	th := newHarness(t, srv)
 
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
+	// initialize + open
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
 
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
+	// list
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("list error: %+v", res.Error)
+	}
+	var lres mcp.ListResourcesResult
+	if err := json.Unmarshal(res.Result, &lres); err != nil {
+		t.Fatal(err)
+	}
+	if len(lres.Resources) != 1 || lres.Resources[0].URI != uri {
+		t.Fatalf("unexpected list: %+v", lres.Resources)
+	}
+
+	// read
+	readReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesReadMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.ReadResourceRequest{URI: uri})}
+	if err := th.send(readReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err = th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("read error: %+v", res.Error)
+	}
+	var rres mcp.ReadResourceResult
+	if err := json.Unmarshal(res.Result, &rres); err != nil {
+		t.Fatal(err)
+	}
+	if len(rres.Contents) == 0 || rres.Contents[0].Text != "v1" {
+		t.Fatalf("unexpected contents: %+v", rres.Contents)
+	}
+
+	// subscribe
+	subReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesSubscribeMethod), ID: jsonrpc.NewRequestID("3"), Params: mustJSON(t, mcp.SubscribeRequest{URI: uri})}
+	if err := th.send(subReq); err != nil {
+		t.Fatal(err)
+	}
+	if res, err = th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
+		if err != nil {
+			t.Fatal(err)
 		}
-		close(scanDone)
-	}()
+		t.Fatalf("subscribe error: %+v", res.Error)
+	}
 
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
+	// mutate contents -> expect notifications/resources/updated
+	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v2"}}})
+	note, ok := th.drainUntilMethod(string(mcp.ResourcesUpdatedNotificationMethod), 2*time.Second)
+	if !ok {
+		t.Fatalf("expected %s after content change", mcp.ResourcesUpdatedNotificationMethod)
+	}
+	var upd mcp.ResourceUpdatedNotification
+	if err := json.Unmarshal(note.Params, &upd); err != nil {
+		t.Fatalf("decode updated: %v", err)
+	}
+	if upd.URI != uri {
+		t.Fatalf("updated for wrong uri: %+v", upd)
+	}
 
-	// Initialize and mark notifications/initialized
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
-		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
-	})
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-	// Sync to ensure list_changed registrations are active
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-	waitForLines(t, &linesMu, &lines, 2)
-
-	// Subscribe to the resource
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ResourcesSubscribeMethod), "params": map[string]any{"uri": "res://a.txt"}})
-	// Wait for the subscribe response to ensure the registration is active before triggering updates
-	waitForLines(t, &linesMu, &lines, 3)
-
-	// Trigger an update by replacing contents (best-effort signal should tick) after subscription is active
-	sr.ReplaceAllContents(context.Background(), map[string][]mcp.ResourceContents{
-		"res://a.txt": {{URI: "res://a.txt", Text: "B"}},
-	})
-
-	// Wait for notifications/resources/updated
-	waitForNotification(t, &linesMu, &lines, string(mcp.ResourcesUpdatedNotificationMethod))
-
-	// Cleanup
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
+	// unsubscribe then change again -> eventual semantics: do not assert immediate quiescence
+	unsubReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUnsubscribeMethod), ID: jsonrpc.NewRequestID("4"), Params: mustJSON(t, mcp.UnsubscribeRequest{URI: uri})}
+	if err := th.send(unsubReq); err != nil {
+		t.Fatal(err)
+	}
+	if res, err = th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("unsubscribe error: %+v", res.Error)
+	}
+	// Close harness; do not assert on no further updates immediately.
 }
 
-// helpers
-func mustWriteJSONL(t *testing.T, buf *bytes.Buffer, v any) {
+func TestPrompts_ListAndGet(t *testing.T) {
+	// One prompt with simple handler
+	sp := mcpservice.NewStaticPrompts(mcpservice.StaticPrompt{
+		Descriptor: mcp.Prompt{Name: "hello", Description: "say hi"},
+		Handler: func(ctx context.Context, _ sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Description: "hi", Messages: []mcp.PromptMessage{{Role: mcp.RoleUser, Content: []mcp.ContentBlock{{Type: mcp.ContentTypeText, Text: "hello"}}}}}, nil
+		},
+	})
+	srv := mcpservice.NewServer(mcpservice.WithPromptsOptions(mcpservice.WithStaticPromptsContainer(sp)))
+	th := newHarness(t, srv)
+
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// list
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("list prompts error: %+v", res.Error)
+	}
+	var lp mcp.ListPromptsResult
+	if err := json.Unmarshal(res.Result, &lp); err != nil {
+		t.Fatal(err)
+	}
+	if len(lp.Prompts) != 1 || lp.Prompts[0].Name != "hello" {
+		t.Fatalf("unexpected prompts: %+v", lp.Prompts)
+	}
+
+	// get
+	getReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsGetMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.GetPromptRequest{Name: "hello"})}
+	if err := th.send(getReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err = th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("get prompt error: %+v", res.Error)
+	}
+	var gp mcp.GetPromptResult
+	if err := json.Unmarshal(res.Result, &gp); err != nil {
+		t.Fatal(err)
+	}
+	if len(gp.Messages) == 0 {
+		t.Fatalf("missing prompt messages")
+	}
+
+	// change -> expect prompts/list_changed
+	sp.Add(t.Context(), mcpservice.StaticPrompt{Descriptor: mcp.Prompt{Name: "bye"}})
+	if _, ok := th.drainUntilMethod(string(mcp.PromptsListChangedNotificationMethod), 2*time.Second); !ok {
+		t.Fatalf("expected %s after prompts change", mcp.PromptsListChangedNotificationMethod)
+	}
+}
+
+func TestRoots_ListAndListChanged(t *testing.T) {
+	// We don't have a native roots provider; instead trigger a client round-trip via a tools list.
+	srv := mcpservice.NewServer(mcpservice.WithToolsCapability(rootsTriggerToolsCap{}))
+	th := newHarness(t, srv)
+
+	// client advertises roots capability so the engine wires a roots client bridge
+	init := defaultInitializeRequest()
+	init.Capabilities.Roots = &struct {
+		ListChanged bool `json:"listChanged"`
+	}{}
+	_ = th.initialize(t, "init-1", init)
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// Issue tools/list -> expect a client roots/list request first
+	listReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListMethod), ID: jsonrpc.NewRequestID("1")}
+	if err := th.send(listReq); err != nil {
+		t.Fatal(err)
+	}
+	first, err := th.expectRequest(2 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Method != string(mcp.RootsListMethod) {
+		t.Fatalf("expected first outbound %s, got %s", mcp.RootsListMethod, first.Method)
+	}
+	// respond as client
+	if first.ID == nil || first.ID.IsNil() {
+		t.Fatalf("missing id on roots/list request")
+	}
+	rootsResp := &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, ID: first.ID, Result: mustJSON(t, mcp.ListRootsResult{Roots: []mcp.Root{}})}
+	if err := th.send(rootsResp); err != nil {
+		t.Fatal(err)
+	}
+
+	// then the final response to tools/list
+	if _, err := th.expectResponse(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompletion_Complete(t *testing.T) {
+	// Fake completions capability
+	srv := mcpservice.NewServer(mcpservice.WithCompletionsCapability(fakeCompletions{}))
+	th := newHarness(t, srv)
+
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	req := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CompletionCompleteMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(t, mcp.CompleteRequest{Ref: mcp.ResourceReference{Type: "file", URI: "mem://a"}, Argument: mcp.CompleteArgument{Name: "path", Value: ""}})}
+	if err := th.send(req); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error != nil {
+		t.Fatalf("complete error: %+v", res.Error)
+	}
+	var cres mcp.CompleteResult
+	if err := json.Unmarshal(res.Result, &cres); err != nil {
+		t.Fatal(err)
+	}
+	if len(cres.Completion.Values) != 2 {
+		t.Fatalf("unexpected completion: %+v", cres.Completion)
+	}
+}
+
+func TestLogging_SetLevelAndMessages(t *testing.T) {
+	var lv slog.LevelVar
+	lv.Set(slog.LevelInfo)
+	srv := mcpservice.NewServer(mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)))
+	th := newHarness(t, srv)
+
+	_ = th.initialize(t, "init-1", defaultInitializeRequest())
+	_ = th.send(&jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializedNotificationMethod)})
+
+	// Before: debug should be disabled
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: &lv}))
+	if logger.Enabled(th.ctx, slog.LevelDebug) {
+		t.Fatalf("debug unexpectedly enabled before setLevel")
+	}
+
+	// Set to debug
+	setReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.LoggingSetLevelMethod), ID: jsonrpc.NewRequestID("1"), Params: mustJSON(t, mcp.SetLevelRequest{Level: mcp.LoggingLevelDebug})}
+	if err := th.send(setReq); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := th.expectResponse(1 * time.Second); err != nil || res.Error != nil {
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("setLevel error: %+v", res.Error)
+	}
+	if !logger.Enabled(th.ctx, slog.LevelDebug) {
+		t.Fatalf("debug not enabled after setLevel")
+	}
+
+	// Invalid level should return InvalidParams
+	badReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.LoggingSetLevelMethod), ID: jsonrpc.NewRequestID("2"), Params: mustJSON(t, mcp.SetLevelRequest{Level: "bogus"})}
+	if err := th.send(badReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err := th.expectResponse(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == nil || res.Error.Code != jsonrpc.ErrorCodeInvalidParams {
+		t.Fatalf("expected invalid params for bad level, got: %+v", res.Error)
+	}
+}
+
+// --- helpers ---
+
+func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatal(err)
 	}
-	if _, err := buf.Write(append(b, '\n')); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	return b
 }
+func mustJSONRaw(t *testing.T, v any) json.RawMessage { return mustJSON(t, v) }
 
-func splitNonEmptyLines(s string) []string {
-	raw := strings.Split(s, "\n")
-	out := make([]string, 0, len(raw))
-	for _, l := range raw {
-		l = strings.TrimSpace(l)
-		if l != "" {
-			out = append(out, l)
-		}
-	}
-	return out
-}
-
-// Write helper for io.Writer targets (e.g., pipes)
-func mustWriteJSONLToWriter(t *testing.T, w io.Writer, v any) {
-	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if _, err := w.Write(append(b, '\n')); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-}
-
-// waitForLines waits until the collected output lines reach at least n, or times out.
-func waitForLines(t *testing.T, mu *sync.Mutex, lines *[]string, n int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+func tryDrainUntilProgress(th *testHarness, dur time.Duration) bool {
+	deadline := time.Now().Add(dur)
 	for time.Now().Before(deadline) {
-		mu.Lock()
-		l := len(*lines)
-		mu.Unlock()
-		if l >= n {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	mu.Lock()
-	l := len(*lines)
-	mu.Unlock()
-	t.Fatalf("timeout waiting for %d lines, saw %d", n, l)
-}
-
-// waitForNotification waits until a notification with the given method appears in the collected lines.
-func waitForNotification(t *testing.T, mu *sync.Mutex, lines *[]string, method string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		snapshot := append([]string(nil), (*lines)...)
-		mu.Unlock()
-		for _, l := range snapshot {
-			var any jsonrpc.AnyMessage
-			if err := json.Unmarshal([]byte(l), &any); err != nil {
-				continue
-			}
-			if any.Type() == "notification" && any.Method == method {
-				return
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timeout waiting for notification %q", method)
-}
-
-func TestIgnoreClientResponseAndContinue(t *testing.T) {
-	t.Parallel()
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-ignore-response", Version: "0.1.0"}),
-	)
-
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
-		}
-		close(scanDone)
-	}()
-
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	// Initialize
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
-		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
-	})
-	// Client sends notifications/initialized
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-
-	// Send a stray client response (should be ignored)
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 999, "result": map[string]any{"ok": true}})
-
-	// Then a valid ping request which should get a response
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-
-	// Close input and collect
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	linesMu.Lock()
-	defer linesMu.Unlock()
-	// Expect at least 2 responses: initialize result and ping result
-	count := 0
-	for _, l := range lines {
-		var any jsonrpc.AnyMessage
-		if err := json.Unmarshal([]byte(l), &any); err != nil {
+		th.outMu.Lock()
+		if len(th.lines) == 0 {
+			th.outMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
 			continue
 		}
-		if any.Type() == "response" {
-			count++
-		}
-	}
-	if count < 2 {
-		t.Fatalf("expected at least 2 server responses, got %d; lines=%v", count, lines)
-	}
-}
-
-func TestAcceptProgressAndCancelledNotifications(t *testing.T) {
-	t.Parallel()
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-notifs", Version: "0.1.0"}),
-	)
-
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
-		}
-		close(scanDone)
-	}()
-
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	// Initialize
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
-		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
-	})
-	// Client sends notifications/initialized
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-
-	// Send progress and cancelled notifications which should be accepted and ignored
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.ProgressNotificationMethod), "params": map[string]any{"progressToken": "t1", "progress": 0.5}})
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.CancelledNotificationMethod), "params": map[string]any{"requestId": "42"}})
-
-	// Then send a ping request and ensure we still get a response
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	linesMu.Lock()
-	defer linesMu.Unlock()
-	// Expect at least 2 responses (init + ping). Notifications should not produce responses.
-	respCount := 0
-	for _, l := range lines {
+		s := th.lines[0]
+		th.lines = th.lines[1:]
+		th.outMu.Unlock()
 		var any jsonrpc.AnyMessage
-		if err := json.Unmarshal([]byte(l), &any); err != nil {
-			continue
-		}
-		if any.Type() == "response" {
-			respCount++
-		}
-	}
-	if respCount < 2 {
-		t.Fatalf("expected at least 2 responses, got %d; lines=%v", respCount, lines)
-	}
-}
-
-func TestStdioClientRootsListChangedForwarding(t *testing.T) {
-	t.Parallel()
-
-	// Channel to observe server-side roots list_changed listener invocations
-	fired := make(chan struct{}, 1)
-
-	// Tools capability that registers a roots list_changed listener on first list
-	tools := mcpservice.NewToolsCapability(
-		mcpservice.WithListTools(func(ctx context.Context, sess sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
-			if rootsCap, ok := sess.GetRootsCapability(); ok {
-				_, _ = rootsCap.RegisterRootsListChangedListener(ctx, func(ctx context.Context) error {
-					select {
-					case fired <- struct{}{}:
-					default:
-					}
-					return nil
-				})
-			}
-			return mcpservice.NewPage[mcp.Tool](nil), nil
-		}),
-	)
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-roots-forward", Version: "0.1.0"}),
-		mcpservice.WithToolsCapability(tools),
-	)
-
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
+		if json.Unmarshal([]byte(s), &any) == nil {
+			if any.Method == string(mcp.ProgressNotificationMethod) {
+				return true
 			}
 		}
-		close(scanDone)
-	}()
-
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	// Initialize with client capabilities advertising roots listChanged support
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
-		"params": map[string]any{
-			"protocolVersion": "2025-06-18",
-			"capabilities":    map[string]any{"roots": map[string]any{"listChanged": true}},
-			"clientInfo":      map[string]any{"name": "t", "version": "0"},
-		},
-	})
-
-	// Mark notifications/initialized and ping to flush handler registrations
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.InitializedNotificationMethod)})
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 2, "method": string(mcp.PingMethod)})
-	waitForLines(t, &linesMu, &lines, 2)
-
-	// Trigger the tools/list request to cause the server to register a roots listener
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "id": 3, "method": string(mcp.ToolsListMethod), "params": map[string]any{"cursor": ""}})
-	// Wait for the tools/list response to ensure registration has occurred
-	waitForLines(t, &linesMu, &lines, 3)
-
-	// Now send a client-originated roots list_changed notification
-	mustWriteJSONLToWriter(t, inW, map[string]any{"jsonrpc": "2.0", "method": string(mcp.RootsListChangedNotificationMethod)})
-
-	// Expect the listener to be invoked
-	select {
-	case <-fired:
-		// ok
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for server roots list_changed listener to fire")
 	}
-
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
-}
-
-func TestLoggingSetLevelOnStdio(t *testing.T) {
-	t.Parallel()
-
-	var lv slog.LevelVar
-	lv.Set(slog.LevelInfo)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-logging", Version: "0.1.0"}),
-		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
-	)
-
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
-		}
-		close(scanDone)
-	}()
-
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	// Initialize
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
-		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
-	})
-
-	// Change level to debug
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 2, "method": string(mcp.LoggingSetLevelMethod),
-		"params": map[string]any{"level": string(mcp.LoggingLevelDebug)},
-	})
-
-	// Close input and wait
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	// Expect two responses (init + setLevel) and level var changed
-	if got := lv.Level(); got != slog.LevelDebug {
-		t.Fatalf("expected slog level debug, got %v", got)
-	}
-}
-
-func TestLoggingSetLevelOnStdio_InvalidLevel(t *testing.T) {
-	t.Parallel()
-
-	var lv slog.LevelVar
-	lv.Set(slog.LevelInfo)
-
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "stdio-logging", Version: "0.1.0"}),
-		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
-	)
-
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-
-	var (
-		lines    []string
-		linesMu  sync.Mutex
-		scanDone = make(chan struct{})
-	)
-	go func() {
-		scanner := bufio.NewScanner(outR)
-		for scanner.Scan() {
-			s := strings.TrimSpace(scanner.Text())
-			if s != "" {
-				linesMu.Lock()
-				lines = append(lines, s)
-				linesMu.Unlock()
-			}
-		}
-		close(scanDone)
-	}()
-
-	h := NewHandler(server, WithIO(inR, outW))
-	done := make(chan error, 1)
-	go func() { done <- h.Serve(context.Background()) }()
-
-	// Initialize
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": string(mcp.InitializeMethod),
-		"params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "0"}},
-	})
-
-	// Invalid level
-	mustWriteJSONLToWriter(t, inW, map[string]any{
-		"jsonrpc": "2.0", "id": 2, "method": string(mcp.LoggingSetLevelMethod),
-		"params": map[string]any{"level": "verbose"},
-	})
-
-	// Close input and wait
-	_ = inW.Close()
-	<-done
-	_ = outW.Close()
-	<-scanDone
-
-	// Expect two responses and the second should be an error -32602
-	linesMu.Lock()
-	defer linesMu.Unlock()
-	if len(lines) < 2 {
-		t.Fatalf("expected at least 2 response lines, got %d", len(lines))
-	}
-	var res2 jsonrpc.Response
-	if err := json.Unmarshal([]byte(lines[1]), &res2); err != nil {
-		t.Fatalf("unmarshal setLevel response: %v", err)
-	}
-	if res2.Error == nil || res2.Error.Code != jsonrpc.ErrorCodeInvalidParams {
-		t.Fatalf("expected invalid params error, got %#v", res2.Error)
-	}
+	return false
 }

@@ -37,6 +37,7 @@ type StaticPrompts struct {
 // NewStaticPrompts constructs a new StaticPrompts container with the given definitions.
 func NewStaticPrompts(defs ...StaticPrompt) *StaticPrompts {
 	sp := &StaticPrompts{}
+	// No parent context available here; Replace ignores ctx, so Background is fine.
 	sp.Replace(context.Background(), defs...)
 	return sp
 }

@@ -16,9 +16,9 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
 	"github.com/ggoodman/mcp-server-go/auth"
+	"github.com/ggoodman/mcp-server-go/internal/engine"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/internal/logctx"
-	"github.com/ggoodman/mcp-server-go/internal/sessioncore"
 	"github.com/ggoodman/mcp-server-go/internal/wellknown"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
@@ -133,7 +133,7 @@ type StreamingHTTPHandler struct {
 
 	auth        auth.Authenticator
 	mcp         mcpservice.ServerCapabilities
-	sessions    *sessioncore.Manager // stateful manager only
+	eng         *engine.Engine
 	sessionHost sessions.SessionHost
 
 	// Per-session subscription bridges for resources/updated notifications.
@@ -154,9 +154,6 @@ type StreamingHTTPHandler struct {
 	// long-lived subscriptions (e.g., notifications/cancelled).
 	// (outbound dispatcher removed in stateful refactor)
 
-	// in-flight server-handled requests per session (for inbound cancellation)
-	inflightMu sync.Mutex
-	inflight   map[string]map[string]context.CancelFunc // sessionID -> requestID -> cancel
 }
 
 // lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
@@ -244,20 +241,24 @@ func New(
 		log = cfg.logger
 	}
 
-	sessions := &sessioncore.Manager{Host: host}
-
 	h := &StreamingHTTPHandler{
 		log:         log,
 		serverURL:   mcpURL,
 		auth:        authenticator,
 		mcp:         server,
-		sessions:    sessions,
 		sessionHost: host,
 		subCancels:  make(map[string]map[string]context.CancelFunc),
 		sessParents: make(map[string]context.Context),
 		sessCancel:  make(map[string]context.CancelFunc),
 	}
-	h.inflight = make(map[string]map[string]context.CancelFunc)
+
+	// Initialize Engine and start its event consumer loop.
+	h.eng = engine.NewEngine(host, server, engine.WithLogger(log))
+	go func() {
+		if err := h.eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("engine.run.fail", slog.String("err", err.Error()))
+		}
+	}()
 
 	// Build PRM based on auth mode
 	switch {
@@ -424,8 +425,8 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 	ctx = logctx.WithSessionID(ctx, sessID)
 	logger = logctx.Enrich(ctx, logger)
 
-	// Verify ownership & existence
-	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID(), "")
+	pvHeader := r.Header.Get(mcpProtocolVersionHeader)
+	respProtoVersion, err := h.eng.GetSessionProtocolVersion(ctx, sessID, userInfo.UserID())
 	if err != nil {
 		logger.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessID)
@@ -433,17 +434,21 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 		return
 	}
 	logger.InfoContext(ctx, "session.load.ok")
-	respProtoVersion := session.ProtocolVersion()
 
-	if pv := r.Header.Get(mcpProtocolVersionHeader); respProtoVersion != "" && pv != "" && pv != respProtoVersion {
-		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", respProtoVersion), slog.String("client_version", pv))
+	if pvHeader != "" && respProtoVersion != "" && pvHeader != respProtoVersion {
+		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", respProtoVersion), slog.String("client_version", pvHeader))
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
 
-	if err := h.sessions.DeleteSession(ctx, sessID); err != nil {
+	if _, err := h.eng.DeleteSession(ctx, sessID, userInfo.UserID()); err != nil {
+		if errors.Is(err, engine.ErrSessionNotFound) {
+			logger.InfoContext(ctx, "session.delete.miss")
+			h.teardownSession(sessID)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		logger.ErrorContext(ctx, "session.delete.fail", slog.String("err", err.Error()))
-		// Best-effort local teardown even on error.
 		h.teardownSession(sessID)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -505,8 +510,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	logger.InfoContext(ctx, "auth.ok")
 
 	var raw json.RawMessage
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(&raw); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		logger.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
 		return
@@ -526,9 +530,39 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
-		if err := h.handleSessionInitialization(ctx, w, userInfo, msg); err != nil {
+		// Session initialization via Engine
+		req := msg.AsRequest()
+		if req == nil || req.Method != string(mcp.InitializeMethod) {
+			writeJSONError(w, http.StatusNotFound, "expected initialize request")
+			logger.WarnContext(ctx, "session.initialize.invalid")
+			return
+		}
+		var initReq mcp.InitializeRequest
+		if err := json.Unmarshal(req.Params, &initReq); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid initialize params")
+			logger.WarnContext(ctx, "session.initialize.params.fail", slog.String("err", err.Error()))
+			return
+		}
+		sess, initRes, err := h.eng.InitializeSession(ctx, userInfo.UserID(), &initReq)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to initialize session")
 			logger.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
 			return
+		}
+		resp, err := jsonrpc.NewResultResponse(req.ID, initRes)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to encode initialize response")
+			logger.ErrorContext(ctx, "session.initialize.encode.fail", slog.String("err", err.Error()))
+			return
+		}
+		w.Header().Set(mcpSessionIDHeader, sess.SessionID())
+		if v := initRes.ProtocolVersion; v != "" {
+			w.Header().Set(mcpProtocolVersionHeader, v)
+		}
+		w.Header().Set("Content-Type", jsonMediaType.String())
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			logger.ErrorContext(ctx, "session.initialize.write.fail", slog.String("err", err.Error()))
 		}
 		logger.InfoContext(ctx, "session.initialize.ok", slog.Duration("dur", time.Since(start)))
 		return
@@ -536,7 +570,8 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	ctx = logctx.WithSessionID(ctx, sessID)
 	logger = logctx.Enrich(ctx, logger)
 
-	session, err := h.sessions.LoadSession(ctx, sessID, userInfo.UserID(), "")
+	// Validate and fetch protocol version via engine
+	sessionPV, err := h.eng.GetSessionProtocolVersion(ctx, sessID, userInfo.UserID())
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		logger.InfoContext(ctx, "session.load.miss")
@@ -551,7 +586,6 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
-	sessionPV := session.ProtocolVersion()
 	if clientPV != "" && sessionPV != "" && clientPV != sessionPV {
 		writeJSONError(w, http.StatusBadRequest, "protocol version mismatch")
 		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
@@ -560,12 +594,12 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	if req := msg.AsRequest(); req != nil {
 		if req.ID.IsNil() {
-			if err := h.handleNotification(ctx, session, userInfo, req); err != nil {
+			if err := h.eng.HandleNotification(ctx, sessID, userInfo.UserID(), req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				logger.ErrorContext(ctx, "notification.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
 				return
 			}
-			if spv := session.ProtocolVersion(); spv != "" {
+			if spv := sessionPV; spv != "" {
 				w.Header().Set(mcpProtocolVersionHeader, spv)
 			}
 			w.WriteHeader(http.StatusAccepted)
@@ -581,7 +615,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 				return
 			}
 		}
-		if spv := session.ProtocolVersion(); spv != "" {
+		if spv := sessionPV; spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
@@ -592,39 +626,18 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		defer cancel()
 
 		rid := req.ID.String()
-		sid := session.SessionID()
-		h.inflightMu.Lock()
-		if _, ok := h.inflight[sid]; !ok {
-			h.inflight[sid] = make(map[string]context.CancelFunc)
-		}
-		h.inflight[sid][rid] = cancel
-		h.inflightMu.Unlock()
-
 		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: wf, requestID: rid})
 
-		{
-			sh := session
-			restore := sh.SetDirectWriter(func(dwCtx context.Context, b []byte) error {
-				if err := writeSSEEvent(wf, "", b); err != nil {
-					_, pubErr := h.sessionHost.PublishSession(dwCtx, sessID, b)
-					if pubErr != nil {
-						return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
-					}
+		writer := engine.NewMessageWriterFunc(func(dwCtx context.Context, msg jsonrpc.Message) error {
+			if err := writeSSEEvent(wf, "", msg); err != nil {
+				if _, pubErr := h.eng.PublishToSession(dwCtx, sessID, userInfo.UserID(), msg); pubErr != nil {
+					return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
 				}
-				return nil
-			})
-			defer restore()
-		}
-
-		res, err := h.handleRequest(ctx, session, userInfo, req)
-		h.inflightMu.Lock()
-		if m, ok := h.inflight[sid]; ok {
-			delete(m, rid)
-			if len(m) == 0 {
-				delete(h.inflight, sid)
 			}
-		}
-		h.inflightMu.Unlock()
+			return nil
+		})
+
+		res, err := h.eng.HandleRequest(ctx, sessID, userInfo.UserID(), req, writer)
 		if err != nil {
 			logger.ErrorContext(ctx, "rpc.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
 			res = &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, Error: &jsonrpc.Error{Code: jsonrpc.ErrorCodeInternalError, Message: "internal server error"}, ID: req.ID}
@@ -643,15 +656,16 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	}
 
 	if res := msg.AsResponse(); res != nil {
-		if h.sessions != nil {
-			_ = h.sessions.DeliverResponse(ctx, session.SessionID(), res)
-		}
-		if err := h.handleResponse(ctx, session, res); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			logger.ErrorContext(ctx, "response.handle.fail", slog.String("err", err.Error()))
+		if err := h.eng.HandleClientResponse(ctx, sessID, userInfo.UserID(), res); err != nil {
+			if errors.Is(err, engine.ErrSessionNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			logger.ErrorContext(ctx, "response.forward.fail", slog.String("err", err.Error()))
 			return
 		}
-		if spv := session.ProtocolVersion(); spv != "" {
+		if spv := sessionPV; spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -711,7 +725,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	ctx = logctx.WithSessionID(ctx, sessionHeader)
 	logger = logctx.Enrich(ctx, logger)
 
-	session, err := h.sessions.LoadSession(ctx, sessionHeader, userInfo.UserID(), "")
+	// Validate via engine and retrieve protocol version
+	sessionPV, err := h.eng.GetSessionProtocolVersion(ctx, sessionHeader, userInfo.UserID())
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		logger.InfoContext(ctx, "session.load.miss")
@@ -720,10 +735,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 	logger.InfoContext(ctx, "session.load.ok")
 
-	sessionID := session.SessionID()
-
 	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
-		if spv := session.ProtocolVersion(); spv != "" && pv != spv {
+		if spv := sessionPV; spv != "" && pv != spv {
 			w.WriteHeader(http.StatusPreconditionFailed)
 			logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", spv), slog.String("client_version", pv))
 			return
@@ -732,99 +745,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	lastEventID := r.Header.Get(lastEventIDHeader)
 
-	const resourcesListChangedTopic = string(mcp.ResourcesListChangedNotificationMethod)
-	unsub, subErr := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesListChangedTopic, func(evtCtx context.Context, payload []byte) error {
-		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
-		b, err := json.Marshal(n)
-		if err != nil {
-			return err
-		}
-		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
-		return err
-	})
-	if subErr != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.resources_list_changed.fail", slog.String("err", subErr.Error()))
-		return
-	}
-	defer unsub()
-
-	const resourcesUpdatedTopic = string(mcp.ResourcesUpdatedNotificationMethod)
-	unsubUpdated, subUpdatedErr := h.sessionHost.SubscribeEvents(ctx, sessionID, resourcesUpdatedTopic, func(evtCtx context.Context, payload []byte) error {
-		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod), Params: payload}
-		b, err := json.Marshal(n)
-		if err != nil {
-			return err
-		}
-		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
-		return err
-	})
-	if subUpdatedErr != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.resources_updated.fail", slog.String("err", subUpdatedErr.Error()))
-		return
-	}
-	defer unsubUpdated()
-
-	const toolsListChangedTopic = string(mcp.ToolsListChangedNotificationMethod)
-	unsubTools, subToolsErr := h.sessionHost.SubscribeEvents(ctx, sessionID, toolsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
-		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ToolsListChangedNotificationMethod)}
-		b, err := json.Marshal(n)
-		if err != nil {
-			return err
-		}
-		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
-		return err
-	})
-	if subToolsErr != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.tools_list_changed.fail", slog.String("err", subToolsErr.Error()))
-		return
-	}
-	defer unsubTools()
-
-	const promptsListChangedTopic = string(mcp.PromptsListChangedNotificationMethod)
-	unsubPrompts, subPromptsErr := h.sessionHost.SubscribeEvents(ctx, sessionID, promptsListChangedTopic, func(evtCtx context.Context, payload []byte) error {
-		n := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PromptsListChangedNotificationMethod)}
-		b, err := json.Marshal(n)
-		if err != nil {
-			return err
-		}
-		_, err = h.sessionHost.PublishSession(evtCtx, sessionID, b)
-		return err
-	})
-	if subPromptsErr != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "subscribe.prompts_list_changed.fail", slog.String("err", subPromptsErr.Error()))
-		return
-	}
-	defer unsubPrompts()
-
-	_ = h.sessionHost.PublishEvent(ctx, sessionID, "streaminghttp/ready", nil)
-
-	if resCap, ok, err := h.mcp.GetResourcesCapability(ctx, session); err == nil && ok {
-		if lc, hasLC, lErr := resCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
-			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session, _ string) {
-				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, resourcesListChangedTopic, nil)
-			})
-		}
-	}
-	if toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session); err == nil && ok {
-		if lc, hasLC, lErr := toolsCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
-			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session) {
-				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, toolsListChangedTopic, nil)
-			})
-		}
-	}
-	if promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session); err == nil && ok {
-		if lc, hasLC, lErr := promptsCap.GetListChangedCapability(ctx, session); lErr == nil && hasLC {
-			_, _ = lc.Register(ctx, session, func(cbCtx context.Context, sess sessions.Session) {
-				_ = h.sessionHost.PublishEvent(cbCtx, sessionID, promptsListChangedTopic, nil)
-			})
-		}
-	}
-
-	if spv := session.ProtocolVersion(); spv != "" {
+	if spv := sessionPV; spv != "" {
 		w.Header().Set(mcpProtocolVersionHeader, spv)
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -833,7 +754,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	wf.Flush()
 	logger.InfoContext(ctx, "sse.stream.start")
 
-	if err := h.sessionHost.SubscribeSession(ctx, sessionID, lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
+	if err := h.eng.StreamSession(ctx, sessionHeader, userInfo.UserID(), lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
 		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
 			logger.ErrorContext(cbCtx, "sse.write.fail", slog.String("err", err.Error()))
 			return fmt.Errorf("failed to write session message to http response: %w", err)
@@ -841,7 +762,11 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		logger.InfoContext(cbCtx, "sse.message.deliver")
 		return nil
 	}); err != nil {
-		logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
+		if errors.Is(err, context.Canceled) {
+			logger.InfoContext(ctx, "subscribe.session.done")
+		} else {
+			logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
+		}
 		return
 	}
 
@@ -881,7 +806,6 @@ func (h *StreamingHTTPHandler) handleGetAuthorizationServerMetadata(w http.Respo
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Vary", "Origin")
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(h.authServerMetadata); err != nil {
 		http.Error(w, fmt.Sprintf("failed to encode authorization server metadata: %v", err), http.StatusInternalServerError)
 		return
@@ -891,684 +815,14 @@ func (h *StreamingHTTPHandler) handleGetAuthorizationServerMetadata(w http.Respo
 // handleOptionsAuthorizationServerMetadata responds to CORS preflight requests
 // for the authorization server metadata endpoint.
 func (h *StreamingHTTPHandler) handleOptionsAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
-	// Allow any origin; this is a public metadata document.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	// Allow only GET (and OPTIONS). Browsers will send Access-Control-Request-Method: GET
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	// Allow typical headers used by fetch; keep permissive as it's a read-only endpoint.
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
-	// Cache preflight for a reasonable period.
 	w.Header().Set("Access-Control-Max-Age", "600")
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *StreamingHTTPHandler) handleNotification(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) error {
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "notification"),
-		slog.String("method", req.Method),
-	)
-	logger.InfoContext(ctx, "notification.start")
-	// Intercept notifications/cancelled to cancel in-flight server-handled requests for this session.
-	if req.Method == string(mcp.CancelledNotificationMethod) && len(req.Params) > 0 {
-		var p struct {
-			RequestID string `json:"requestId"`
-		}
-		if err := json.Unmarshal(req.Params, &p); err == nil && p.RequestID != "" {
-			sid := session.SessionID()
-			h.inflightMu.Lock()
-			if m, ok := h.inflight[sid]; ok {
-				if cancel, ok := m[p.RequestID]; ok && cancel != nil {
-					cancel()
-					delete(m, p.RequestID)
-					if len(m) == 0 {
-						delete(h.inflight, sid)
-					}
-				}
-			}
-			h.inflightMu.Unlock()
-		}
-	}
-	// Publish server-internal event for fan-out to interested listeners.
-	// Topic is the JSON-RPC method; payload is the raw params.
-	if err := h.sessionHost.PublishEvent(ctx, session.SessionID(), req.Method, req.Params); err != nil {
-		logger.WarnContext(ctx, "notification.publish.fail", slog.String("err", err.Error()))
-		return fmt.Errorf("publish internal event: %w", err)
-	}
-	logger.InfoContext(ctx, "notification.ok")
-	return nil
-}
-
-// handleSessionInitialization handles the initialization of a new MCP session
-// when no mcp-session-id header is present in the request.
-func (h *StreamingHTTPHandler) handleSessionInitialization(ctx context.Context, w http.ResponseWriter, userInfo auth.UserInfo, msg jsonrpc.AnyMessage) error {
-	req := msg.AsRequest()
-	if req == nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return fmt.Errorf("expected request message for session initialization")
-	}
-
-	if req.Method != "initialize" {
-		w.WriteHeader(http.StatusNotFound)
-		return fmt.Errorf("expected initialize method, got %s", req.Method)
-	}
-
-	var initializeReq mcp.InitializeRequest
-	if err := json.Unmarshal(req.Params, &initializeReq); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return fmt.Errorf("failed to unmarshal initialize request: %w", err)
-	}
-
-	// Resolve protocol version preference BEFORE minting the session id so the
-	// negotiated version can be baked into the token.
-	negotiatedVersion := initializeReq.ProtocolVersion
-	if v, ok, err := h.mcp.GetPreferredProtocolVersion(ctx); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get preferred protocol version: %w", err)
-	} else if ok && v != "" {
-		negotiatedVersion = v
-	}
-
-	// Build capability set for stateful metadata
-	capSet := sessions.CapabilitySet{}
-	if initializeReq.Capabilities.Sampling != nil {
-		capSet.Sampling = true
-	}
-	if initializeReq.Capabilities.Roots != nil {
-		capSet.Roots = true
-		capSet.RootsListChanged = initializeReq.Capabilities.Roots.ListChanged
-	}
-	if initializeReq.Capabilities.Elicitation != nil {
-		capSet.Elicitation = true
-	}
-
-	clientName := initializeReq.ClientInfo.Name
-	clientVersion := initializeReq.ClientInfo.Version
-	session, err := h.sessions.CreateSession(ctx, userInfo.UserID(), negotiatedVersion, capSet, sessions.MetadataClientInfo{Name: clientName, Version: clientVersion})
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to create session: %w", err)
-	}
-
-	serverInfo, err := h.mcp.GetServerInfo(ctx, session)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get server info: %w", err)
-	}
-
-	initializeRes := &mcp.InitializeResult{
-		ProtocolVersion: negotiatedVersion,
-		ServerInfo:      serverInfo,
-	}
-
-	// Optional instructions
-	if instr, ok, err := h.mcp.GetInstructions(ctx, session); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get instructions: %w", err)
-	} else if ok {
-		initializeRes.Instructions = instr
-	}
-
-	resCap, hasResourcesCap, err := h.mcp.GetResourcesCapability(ctx, session)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get resources capability: %w", err)
-	}
-	if hasResourcesCap {
-		_, hasChangeSubCap, err := resCap.GetSubscriptionCapability(ctx, session)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return fmt.Errorf("failed to get resources subscription capability: %w", err)
-		}
-
-		_, hasListChangedCap, err := resCap.GetListChangedCapability(ctx, session)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return fmt.Errorf("failed to get resources listChanged capability: %w", err)
-		}
-
-		initializeRes.Capabilities.Resources = &struct {
-			ListChanged bool "json:\"listChanged\""
-			Subscribe   bool "json:\"subscribe\""
-		}{
-			ListChanged: hasListChangedCap,
-			Subscribe:   hasChangeSubCap,
-		}
-	}
-
-	// Discover tools capability and (optionally) listChanged capability
-	if toolsCap, hasToolsCap, err := h.mcp.GetToolsCapability(ctx, session); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get tools capability: %w", err)
-	} else if hasToolsCap {
-		_, hasToolsListChanged, err := toolsCap.GetListChangedCapability(ctx, session)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return fmt.Errorf("failed to get tools listChanged capability: %w", err)
-		}
-
-		initializeRes.Capabilities.Tools = &struct {
-			ListChanged bool "json:\"listChanged\""
-		}{
-			ListChanged: hasToolsListChanged,
-		}
-	}
-
-	// Discover prompts capability and (optionally) listChanged capability
-	if promptsCap, hasPromptsCap, err := h.mcp.GetPromptsCapability(ctx, session); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get prompts capability: %w", err)
-	} else if hasPromptsCap {
-		_, hasPromptsListChanged, err := promptsCap.GetListChangedCapability(ctx, session)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return fmt.Errorf("failed to get prompts listChanged capability: %w", err)
-		}
-
-		initializeRes.Capabilities.Prompts = &struct {
-			ListChanged bool "json:\"listChanged\""
-		}{
-			ListChanged: hasPromptsListChanged,
-		}
-	}
-
-	// Discover logging capability
-	if _, ok, err := h.mcp.GetLoggingCapability(ctx, session); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get logging capability: %w", err)
-	} else if ok {
-		initializeRes.Capabilities.Logging = &struct{}{}
-	}
-
-	// Discover completions capability
-	if _, ok, err := h.mcp.GetCompletionsCapability(ctx, session); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to get completions capability: %w", err)
-	} else if ok {
-		initializeRes.Capabilities.Completions = &struct{}{}
-	}
-
-	res, err := jsonrpc.NewResultResponse(req.ID, initializeRes)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return fmt.Errorf("failed to create initialize response: %w", err)
-	}
-
-	w.Header().Set(mcpSessionIDHeader, session.SessionID())
-	// Advertise the negotiated protocol version on the response
-	if negotiatedVersion != "" {
-		w.Header().Set(mcpProtocolVersionHeader, negotiatedVersion)
-	}
-	w.Header().Set("Content-Type", jsonMediaType.String())
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(res); err != nil {
-		return fmt.Errorf("failed to encode initialize response: %w", err)
-	}
-
-	return nil
-}
-
-// (legacy logging and completions capability handlers removed during cleanup)
-
-func (h *StreamingHTTPHandler) handleRequest(ctx context.Context, session sessions.Session, userInfo auth.UserInfo, req *jsonrpc.Request) (*jsonrpc.Response, error) {
-
-	internalErr := func(id *jsonrpc.RequestID) *jsonrpc.Response {
-		return jsonrpc.NewErrorResponse(id, jsonrpc.ErrorCodeInternalError, "internal error", nil)
-	}
-
-	switch req.Method {
-	case string(mcp.PingMethod):
-		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-	case string(mcp.ToolsListMethod):
-		toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || toolsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
-		}
-
-		var listToolsReq mcp.ListToolsRequest
-		if err := json.Unmarshal(req.Params, &listToolsReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		page, err := toolsCap.ListTools(ctx, session, func() *string {
-			if listToolsReq.Cursor == "" {
-				return nil
-			}
-			s := listToolsReq.Cursor
-			return &s
-		}())
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, &mcp.ListToolsResult{
-			Tools: page.Items,
-			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: func() string {
-					if page.NextCursor == nil {
-						return ""
-					}
-					return *page.NextCursor
-				}(),
-			},
-		})
-	case string(mcp.ToolsCallMethod):
-		toolsCap, ok, err := h.mcp.GetToolsCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || toolsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "tools capability not supported", nil), nil
-		}
-
-		var callToolReq mcp.CallToolRequestReceived
-		if err := json.Unmarshal(req.Params, &callToolReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		result, err := toolsCap.CallTool(ctx, session, &callToolReq)
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, result)
-	case string(mcp.ResourcesListMethod):
-		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
-		}
-
-		var listResourcesReq mcp.ListResourcesRequest
-		if err := json.Unmarshal(req.Params, &listResourcesReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		page, err := resourcesCap.ListResources(ctx, session, func() *string {
-			if listResourcesReq.Cursor == "" {
-				return nil
-			}
-			s := listResourcesReq.Cursor
-			return &s
-		}())
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourcesResult{
-			Resources: page.Items,
-			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: func() string {
-					if page.NextCursor == nil {
-						return ""
-					}
-					return *page.NextCursor
-				}(),
-			},
-		})
-	case string(mcp.ResourcesReadMethod):
-		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
-		}
-
-		var readResourceReq mcp.ReadResourceRequest
-		if err := json.Unmarshal(req.Params, &readResourceReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		contents, err := resourcesCap.ReadResource(ctx, session, readResourceReq.URI)
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, &mcp.ReadResourceResult{
-			Contents: contents,
-		})
-	case string(mcp.ResourcesTemplatesListMethod):
-		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
-		}
-
-		var listTemplatesReq mcp.ListResourceTemplatesRequest
-		if err := json.Unmarshal(req.Params, &listTemplatesReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		page, err := resourcesCap.ListResourceTemplates(ctx, session, func() *string {
-			if listTemplatesReq.Cursor == "" {
-				return nil
-			}
-			s := listTemplatesReq.Cursor
-			return &s
-		}())
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, &mcp.ListResourceTemplatesResult{
-			ResourceTemplates: page.Items,
-			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: func() string {
-					if page.NextCursor == nil {
-						return ""
-					}
-					return *page.NextCursor
-				}(),
-			},
-		})
-	case string(mcp.ResourcesSubscribeMethod):
-		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
-		}
-
-		var subscribeReq mcp.SubscribeRequest
-		if err := json.Unmarshal(req.Params, &subscribeReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		subCap, ok, err := resourcesCap.GetSubscriptionCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || subCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources subscription capability not supported", nil), nil
-		}
-
-		if err := subCap.Subscribe(ctx, session, subscribeReq.URI); err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		// Maintain a per-session, per-URI forwarder that listens for local update ticks
-		// and publishes notifications/resources/updated onto the session bus. If a forwarder
-		// already exists for this (session, uri), do nothing (idempotent).
-		// Establish forwarder only if the capability is our fs-backed implementation or any implementation
-		// that exposes an internal Subscriber channel via ChangeNotifier pattern.
-		if fsCap, ok, _ := h.mcp.GetResourcesCapability(ctx, session); ok {
-			// Best-effort: try to access a subscriber channel for this URI if supported by the implementation.
-			type uriSubscriber interface {
-				SubscriberForURI(uri string) <-chan struct{}
-			}
-			if us, uok := any(fsCap).(uriSubscriber); uok {
-				ch := us.SubscriberForURI(subscribeReq.URI)
-				if ch != nil {
-					sid := session.SessionID()
-					h.subMu.Lock()
-					if _, ok := h.subCancels[sid]; !ok {
-						h.subCancels[sid] = make(map[string]context.CancelFunc)
-					}
-					if _, exists := h.subCancels[sid][subscribeReq.URI]; !exists {
-						// Forwarder lifetime is tied to the session (until unsubscribe).
-						// Derive from the per-session parent context that preserves values
-						// but is not canceled by the request.
-						pctx := h.ensureSessionParentContext(ctx, sid)
-						fctx, cancel := context.WithCancel(pctx)
-						h.subCancels[sid][subscribeReq.URI] = cancel
-						go func(sess sessions.Session, uri string, ch <-chan struct{}) {
-							defer func() {
-								// On forwarder exit, clean up cancel map entry if still present
-								h.subMu.Lock()
-								if m, ok := h.subCancels[sid]; ok {
-									if _, ok := m[subscribeReq.URI]; ok {
-										delete(m, subscribeReq.URI)
-										if len(m) == 0 {
-											delete(h.subCancels, sid)
-										}
-									}
-								}
-								h.subMu.Unlock()
-							}()
-							for {
-								select {
-								case <-fctx.Done():
-									return
-								case _, ok := <-ch:
-									if !ok {
-										return
-									}
-									// Publish JSON payload {"uri": uri}
-									payload, _ := json.Marshal(&mcp.ResourceUpdatedNotification{URI: uri})
-									_ = h.sessionHost.PublishEvent(fctx, sess.SessionID(), string(mcp.ResourcesUpdatedNotificationMethod), payload)
-								}
-							}
-						}(session, subscribeReq.URI, ch)
-					}
-					h.subMu.Unlock()
-				}
-			}
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-	case string(mcp.ResourcesUnsubscribeMethod):
-		resourcesCap, ok, err := h.mcp.GetResourcesCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
-		}
-
-		var subscribeReq mcp.SubscribeRequest
-		if err := json.Unmarshal(req.Params, &subscribeReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		subCap, ok, err := resourcesCap.GetSubscriptionCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || subCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources subscription capability not supported", nil), nil
-		}
-
-		if err := subCap.Unsubscribe(ctx, session, subscribeReq.URI); err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		// Tear down the forwarder if present
-		{
-			sid := session.SessionID()
-			h.subMu.Lock()
-			if m, ok := h.subCancels[sid]; ok {
-				if cancel, ok := m[subscribeReq.URI]; ok {
-					cancel()
-					delete(m, subscribeReq.URI)
-					if len(m) == 0 {
-						delete(h.subCancels, sid)
-					}
-				}
-			}
-			h.subMu.Unlock()
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-	case string(mcp.PromptsListMethod):
-		promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || promptsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
-		}
-
-		var listPromptsReq mcp.ListPromptsRequest
-		if err := json.Unmarshal(req.Params, &listPromptsReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		page, err := promptsCap.ListPrompts(ctx, session, func() *string {
-			if listPromptsReq.Cursor == "" {
-				return nil
-			}
-			s := listPromptsReq.Cursor
-			return &s
-		}())
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, &mcp.ListPromptsResult{
-			Prompts: page.Items,
-			PaginatedResult: mcp.PaginatedResult{
-				NextCursor: func() string {
-					if page.NextCursor == nil {
-						return ""
-					}
-					return *page.NextCursor
-				}(),
-			},
-		})
-	case string(mcp.PromptsGetMethod):
-		promptsCap, ok, err := h.mcp.GetPromptsCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || promptsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "prompts capability not supported", nil), nil
-		}
-
-		var getPromptReq mcp.GetPromptRequestReceived
-		if err := json.Unmarshal(req.Params, &getPromptReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		result, err := promptsCap.GetPrompt(ctx, session, &getPromptReq)
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, result)
-	case string(mcp.LoggingSetLevelMethod):
-		loggingCap, ok, err := h.mcp.GetLoggingCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || loggingCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
-		}
-
-		var setLevelReq mcp.SetLevelRequest
-		if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		if !mcp.IsValidLoggingLevel(setLevelReq.Level) {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
-		}
-
-		if err := loggingCap.SetLevel(ctx, session, setLevelReq.Level); err != nil {
-			if errors.Is(err, mcpservice.ErrInvalidLoggingLevel) {
-				return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid logging level", nil), nil
-			}
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, struct{}{})
-	case string(mcp.CompletionCompleteMethod):
-		completionsCap, ok, err := h.mcp.GetCompletionsCapability(ctx, session)
-		if err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-		}
-		if !ok || completionsCap == nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
-		}
-
-		var completeReq mcp.CompleteRequest
-		if err := json.Unmarshal(req.Params, &completeReq); err != nil {
-			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		}
-
-		result, err := completionsCap.Complete(ctx, session, &completeReq)
-		if err != nil {
-			return internalErr(req.ID), nil
-		}
-
-		return jsonrpc.NewResultResponse(req.ID, result)
-		// case string(mcp.LoggingSetLevelMethod):
-		// 	loggingCap := h.hooks.GetLoggingCapability()
-
-		// 	if loggingCap == nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "logging capability not supported", nil), nil
-		// 	}
-
-		// 	var setLevelReq mcp.SetLevelRequest
-		// 	if err := json.Unmarshal(req.Params, &setLevelReq); err != nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		// 	}
-
-		// 	err := loggingCap.SetLevel(ctx, session, setLevelReq.Level)
-		// 	if err != nil {
-		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		// 	}
-
-		// 	return jsonrpc.NewResultResponse(req.ID, struct{}{})
-		// case string(mcp.CompletionCompleteMethod):
-		// 	completionsCap := h.hooks.GetCompletionsCapability()
-
-		// 	if completionsCap == nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "completions capability not supported", nil), nil
-		// 	}
-
-		// 	var completeReq mcp.CompleteRequest
-		// 	if err := json.Unmarshal(req.Params, &completeReq); err != nil {
-		// 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid parameters", nil), nil
-		// 	}
-
-		// 	result, err := completionsCap.Complete(ctx, session, &completeReq)
-		// 	if err != nil {
-		// 		return mapHooksErrorToJSONRPCError(req.ID, err), nil
-		// 	}
-
-		// 	return jsonrpc.NewResultResponse(req.ID, result)
-	}
-	// TODO: Actually handle the request
-	return &jsonrpc.Response{
-		JSONRPCVersion: jsonrpc.ProtocolVersion,
-		Error: &jsonrpc.Error{
-			Code:    jsonrpc.ErrorCodeMethodNotFound,
-			Message: "method not found",
-			Data: map[string]string{
-				"method": req.Method,
-			},
-		},
-		ID: req.ID,
-	}, nil
-}
-
-func (h *StreamingHTTPHandler) handleResponse(ctx context.Context, session sessions.Session, res *jsonrpc.Response) error {
-	if res == nil || res.ID == nil || res.ID.IsNil() {
-		return fmt.Errorf("response missing id")
-	}
-
-	// Re-encode to bytes for delivery to the awaiting goroutine on any instance.
-	payload, err := json.Marshal(res)
-	if err != nil {
-		return fmt.Errorf("marshal response: %w", err)
-	}
-
-	// Deliver to rendezvous topic as a server-internal event; drop if no subscriber.
-	topic := "rv:" + res.ID.String()
-	if err := h.sessionHost.PublishEvent(ctx, session.SessionID(), topic, payload); err != nil {
-		return fmt.Errorf("publish rendezvous event: %w", err)
-	}
-	return nil
-}
+// (legacy handleResponse removed)
 
 func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.Request, w http.ResponseWriter) auth.UserInfo {
 	authHeader := r.Header.Get(authorizationHeader)
@@ -1631,29 +885,7 @@ func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
 
 // (sessionWithWriter wrapper removed; superseded by SessionHandle.SetDirectWriter)
 
-// ensureSessionParentContext returns a per-session parent context that preserves
-// the values of parent (using context.WithoutCancel) but is not canceled with it.
-// The returned context is canceled only when teardownSession is called for the
-// session, or when all per-URI forwarders are explicitly unsubscribed and a
-// later teardown occurs. Safe for concurrent use.
-func (h *StreamingHTTPHandler) ensureSessionParentContext(parent context.Context, sessionID string) context.Context {
-	h.sessMu.Lock()
-	defer h.sessMu.Unlock()
-	if ctx, ok := h.sessParents[sessionID]; ok && ctx != nil {
-		return ctx
-	}
-	base := context.WithoutCancel(parent)
-	ctx, cancel := context.WithCancel(base)
-	if h.sessParents == nil {
-		h.sessParents = make(map[string]context.Context)
-	}
-	if h.sessCancel == nil {
-		h.sessCancel = make(map[string]context.CancelFunc)
-	}
-	h.sessParents[sessionID] = ctx
-	h.sessCancel[sessionID] = cancel
-	return ctx
-}
+// (ensureSessionParentContext removed; it was unused after refactor)
 
 // teardownSession cancels the per-session parent context (if any) and cancels
 // all per-URI forwarders. It also removes bookkeeping entries. This does not

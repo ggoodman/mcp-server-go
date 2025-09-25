@@ -18,6 +18,7 @@ This library MUST adhere to the following specs.
 - Designed for production users with minimal internal library opinions
 - Security is a first-class concern. We take no risks when it comes to cross-user contamination.
 - Aim for mutually exclusive and collectively exhaustive capabilities. Avoid having duplicate ways of doing things but make sure everything can be done.
+- Give code room to breathe by using newlines and idiomatic formatting. Scanning the code should show white space between logical breaks in intent and structure.
 
 ## Tool usage
 

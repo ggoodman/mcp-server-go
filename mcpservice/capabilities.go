@@ -136,6 +136,12 @@ type ResourcesCapability interface {
 // or diagnostics; callers should treat cancellation as best-effort.
 type CancelSubscription func(ctx context.Context) error
 
+// NotifyResourceUpdatedFunc is invoked by a provider to signal that a specific
+// resource URI's contents have been updated for the given session's view. The
+// Engine provides this to the provider during Subscribe and is responsible for
+// forwarding the event to the per-session client stream.
+type NotifyResourceUpdatedFunc func(ctx context.Context, uri string)
+
 // NotifyResourceChangeFunc is invoked to signal that the server's resource set
 // has changed for the session. The uri argument SHOULD refer to the resource
 // whose presence or metadata changed. When multiple changes occur or the exact
@@ -150,13 +156,12 @@ type NotifyResourceChangeFunc func(ctx context.Context, session sessions.Session
 // Cancel will be called at-least-once and MAY be called multiple times.
 type ResourceSubscriptionCapability interface {
 	// Subscribe begins delivering updates for the given resource URI to the
-	// client associated with the session. Implementations MAY coalesce
-	// duplicate subscriptions and MUST be idempotent.
-	Subscribe(ctx context.Context, session sessions.Session, uri string) (err error)
-
-	// Unsubscribe stops delivering updates for the given resource URI for the
-	// client associated with the session. MUST be idempotent.
-	Unsubscribe(ctx context.Context, session sessions.Session, uri string) (err error)
+	// client associated with the session. Implementations MUST be idempotent
+	// for duplicate calls on the same (session, uri) pair. The provided emit
+	// function MUST be called by the provider each time the resource is
+	// updated. The returned CancelSubscription is invoked by the Engine on
+	// explicit unsubscribe or session end.
+	Subscribe(ctx context.Context, session sessions.Session, uri string, emit NotifyResourceUpdatedFunc) (CancelSubscription, error)
 }
 
 // ResourceListChangedCapability provides list-changed notifications support.

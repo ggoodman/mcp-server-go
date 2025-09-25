@@ -1,7 +1,9 @@
 package redishost
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/ggoodman/mcp-server-go/sessions"
 	"github.com/ggoodman/mcp-server-go/sessions/sessionhosttest"
@@ -17,7 +19,9 @@ func TestRedisSessionHost(t *testing.T) {
 	_ = h.Close()
 
 	sessionhosttest.RunSessionHostTests(t, func(t *testing.T) sessions.SessionHost {
-		hh, err := New("localhost:6379", WithKeyPrefix("mcp:sessions:test:"))
+		// Unique prefix per test run to avoid interference across runs
+		prefix := fmt.Sprintf("mcp:sessions:test:%d:", time.Now().UnixNano())
+		hh, err := New("localhost:6379", WithKeyPrefix(prefix))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}

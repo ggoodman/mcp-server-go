@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -12,10 +14,25 @@ import (
 )
 
 // Host is a Redis-backed implementation of sessions.SessionHost using
-// Redis Streams for ordered messaging and Pub/Sub for events.
+// Redis Streams for ordered messaging and for server-internal events.
+//
+// Rationale:
+//   - Streams give us durable, ordered event delivery semantics and a simple
+//     polling API (XREAD) without managing consumer-group state for events.
+//   - We intentionally start new subscribers at "$" (the "now" snapshot) to only
+//     deliver events published after SubscribeEvents is called. Tests introduce a
+//     small handshake barrier to avoid racy first publishes; production does not
+//     require microsecond fidelity.
+//
+// Note: We trim streams approximately to cap growth, and we don't replay events
+// to new subscribers (late subscribers only see future events).
 type Host struct {
 	client    *redis.Client
 	keyPrefix string
+	// retention / recovery settings
+	streamMaxLen  int64         // approximate max stream length per session (0 = unbounded)
+	claimMinIdle  time.Duration // pending idle >= this become eligible for auto-claim
+	claimInterval time.Duration // how often to attempt auto-claim
 }
 
 // Option configures the Redis-backed host.
@@ -30,6 +47,24 @@ func WithKeyPrefix(prefix string) Option {
 	}
 }
 
+// WithStreamMaxLen sets an approximate upper bound for each session stream length.
+// When > 0, XADD uses MAXLEN ~ streamMaxLen to cap memory growth.
+func WithStreamMaxLen(n int64) Option { return func(h *Host) { h.streamMaxLen = n } }
+
+// WithClaimSettings configures auto-claim behavior for orphaned pending messages.
+// minIdle is the minimum idle time before a pending message becomes eligible;
+// interval controls how frequently auto-claim is attempted.
+func WithClaimSettings(minIdle, interval time.Duration) Option {
+	return func(h *Host) {
+		if minIdle > 0 {
+			h.claimMinIdle = minIdle
+		}
+		if interval > 0 {
+			h.claimInterval = interval
+		}
+	}
+}
+
 // New constructs a Host connecting to the provided Redis address (e.g. "localhost:6379").
 // Options can configure behavior such as key prefix. The connection is verified via PING.
 func New(redisAddr string, opts ...Option) (*Host, error) {
@@ -40,7 +75,13 @@ func New(redisAddr string, opts ...Option) (*Host, error) {
 	if err := cl.Ping(context.Background()).Err(); err != nil {
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
-	h := &Host{client: cl, keyPrefix: "mcp:sessions:"}
+	h := &Host{
+		client:        cl,
+		keyPrefix:     "mcp:sessions:",
+		streamMaxLen:  10000,
+		claimMinIdle:  5 * time.Second,
+		claimInterval: 1 * time.Second,
+	}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -54,42 +95,123 @@ func (h *Host) Close() error { return h.client.Close() }
 
 func (h *Host) streamKey(sessionID string) string { return h.keyPrefix + "stream:" + sessionID }
 func (h *Host) metaKey(sessionID string) string   { return h.keyPrefix + "meta:" + sessionID }
+func (h *Host) groupName() string                 { return h.keyPrefix + "cg" }
 func (h *Host) dataKey(sessionID, key string) string {
 	return h.keyPrefix + "data:" + sessionID + ":" + key
 }
 func (h *Host) dataScanPattern(sessionID string) string {
 	return h.keyPrefix + "data:" + sessionID + ":*"
 }
-func (h *Host) eventChannel(sessionID, topic string) string {
-	return h.keyPrefix + "evt:" + sessionID + ":" + topic
-}
+func (h *Host) eventStreamKey(topic string) string { return h.keyPrefix + "evtstream:" + topic }
 
 // --- Messaging via Redis Streams ---
 
 func (h *Host) PublishSession(ctx context.Context, sessionID string, data []byte) (string, error) {
-	id, err := h.client.XAdd(ctx, &redis.XAddArgs{Stream: h.streamKey(sessionID), Values: map[string]interface{}{"d": data}}).Result()
+	xargs := &redis.XAddArgs{Stream: h.streamKey(sessionID), Values: map[string]any{"d": data}}
+	if h.streamMaxLen > 0 {
+		xargs.Approx = true
+		xargs.MaxLen = h.streamMaxLen
+	}
+	id, err := h.client.XAdd(ctx, xargs).Result()
 	if err != nil {
 		return "", err
+	}
+	// Best-effort: align stream expiry with session metadata TTL
+	if ttl, terr := h.client.TTL(ctx, h.metaKey(sessionID)).Result(); terr == nil && ttl > 0 {
+		_ = h.client.Expire(ctx, h.streamKey(sessionID), ttl).Err()
 	}
 	return id, nil
 }
 
 func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEventID string, handler sessions.MessageHandlerFunction) error {
 	key := h.streamKey(sessionID)
-	start := lastEventID
-	if start == "" {
-		start = "$"
-	} // start from next message
+	group := h.groupName()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	// Create consumer group idempotently. Use lastEventID as the group's starting point if provided,
+	// otherwise use "$" to only see new entries after group creation. If the group already exists we do not
+	// adjust its start position.
+	startID := "$"
+	if lastEventID != "" {
+		startID = lastEventID
+	}
+	if err := h.client.XGroupCreateMkStream(ctx, key, group, startID).Err(); err != nil {
+		// go-redis returns BUSYGROUP string when group exists
+		if !strings.Contains(err.Error(), "BUSYGROUP") {
+			return err
 		}
-		res, err := h.client.XRead(ctx, &redis.XReadArgs{Streams: []string{key, start}, Count: 1, Block: 500 * time.Millisecond}).Result()
+	}
+
+	// Unique consumer per SubscribeSession call
+	consumer := fmt.Sprintf("c:%s:%d:%04x", sessionID, time.Now().UnixNano(), rand.Intn(0xffff))
+
+	decode := func(v any) []byte {
+		switch t := v.(type) {
+		case string:
+			return []byte(t)
+		case []byte:
+			return t
+		default:
+			return []byte(fmt.Sprintf("%v", t))
+		}
+	}
+
+	// Helper to process a batch of messages and ack on success.
+	process := func(msgs []redis.XMessage) error {
+		for _, m := range msgs {
+			payload := decode(m.Values["d"])
+			if err := handler(ctx, m.ID, payload); err != nil {
+				// Do not ACK on handler error; allow redelivery by another subscriber.
+				return err
+			}
+			// Best-effort ack; ignore ack error (will cause redelivery later).
+			_ = h.client.XAck(ctx, key, group, m.ID).Err()
+		}
+		return nil
+	}
+
+	// Main loop: consume new entries; periodically auto-claim orphaned pending entries
+	lastClaim := time.Now()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if h.claimInterval > 0 && h.claimMinIdle > 0 && time.Since(lastClaim) >= h.claimInterval {
+			lastClaim = time.Now()
+			// Iterate through claim batches until no more eligible messages
+			start := "0-0"
+			for {
+				msgs, next, err := h.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+					Stream:   key,
+					Group:    group,
+					Consumer: consumer,
+					MinIdle:  h.claimMinIdle,
+					Start:    start,
+					Count:    16,
+				}).Result()
+				if err != nil {
+					// ignore claim errors; try again later
+					break
+				}
+				if len(msgs) == 0 {
+					break
+				}
+				if err := process(msgs); err != nil {
+					return err
+				}
+				start = next
+			}
+		}
+
+		res, err := h.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    group,
+			Consumer: consumer,
+			Streams:  []string{key, ">"},
+			Count:    1,
+			Block:    500 * time.Millisecond,
+			NoAck:    false,
+		}).Result()
 		if err != nil {
-			if err == redis.Nil {
+			if err == redis.Nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				continue
 			}
 			return err
@@ -97,22 +219,8 @@ func (h *Host) SubscribeSession(ctx context.Context, sessionID string, lastEvent
 		if len(res) == 0 || len(res[0].Messages) == 0 {
 			continue
 		}
-		for _, m := range res[0].Messages {
-			start = m.ID
-			// Robust payload decoding: accept string or []byte
-			var payload []byte
-			switch v := m.Values["d"].(type) {
-			case string:
-				payload = []byte(v)
-			case []byte:
-				payload = v
-			default:
-				// Fallback: best-effort formatting
-				payload = []byte(fmt.Sprintf("%v", v))
-			}
-			if err := handler(ctx, m.ID, payload); err != nil {
-				return err
-			}
+		if err := process(res[0].Messages); err != nil {
+			return err
 		}
 	}
 }
@@ -236,6 +344,8 @@ func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
 		}
 		p := tx.TxPipeline()
 		p.Set(ctx, key, b, ttl)
+		// Best-effort: align stream TTL with metadata TTL
+		p.Expire(ctx, h.streamKey(sessionID), ttl)
 		_, err = p.Exec(ctx)
 		return err
 	}, key)
@@ -290,39 +400,74 @@ func (h *Host) deleteByPattern(ctx context.Context, pattern string) error {
 
 // --- Server-internal event pub/sub using Redis Pub/Sub ---
 
-func (h *Host) PublishEvent(ctx context.Context, sessionID, topic string, payload []byte) error {
-	ch := h.eventChannel(sessionID, topic)
-	// PUBLISH returns number of subscribers; we ignore it for best-effort delivery
-	return h.client.Publish(ctx, ch, payload).Err()
+func (h *Host) PublishEvent(ctx context.Context, topic string, payload []byte) error {
+	key := h.eventStreamKey(topic)
+	// minimal retention: rely on stream trimming (approximate) to cap size; we don't replay anyway.
+	// Use MAXLEN ~ 1000 (arbitrary) to avoid unbounded growth; config tweak later if needed.
+	// If trimming fails, still deliver event.
+	_, err := h.client.XAdd(ctx, &redis.XAddArgs{Stream: key, Values: map[string]any{"d": payload}, Approx: true, MaxLen: 1000}).Result()
+	return err
 }
 
-func (h *Host) SubscribeEvents(ctx context.Context, sessionID, topic string, handler sessions.EventHandlerFunction) (func(), error) {
-	ch := h.eventChannel(sessionID, topic)
-	sub := h.client.Subscribe(ctx, ch)
-	// Ensure subscription is active
-	if _, err := sub.Receive(ctx); err != nil {
-		_ = sub.Close()
-		return nil, err
-	}
-	// Consume messages
-	go func() {
-		defer func() {
-			_ = sub.Close()
-		}()
-		ch := sub.Channel()
+func (h *Host) SubscribeEvents(ctx context.Context, topic string, handler sessions.EventHandlerFunction) error {
+	key := h.eventStreamKey(topic)
+	// First read uses the special "$" ID to mean "only entries added after this call".
+	// Subsequent reads use the last delivered entry ID for strict ordering.
+	lastID := "$"
+	ready := make(chan struct{})
+	go func(start chan struct{}) {
+		first := true
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case msg, ok := <-ch:
-				if !ok {
+			default:
+			}
+			if first {
+				// Signal armed just before issuing the first blocking read
+				first = false
+				close(start)
+				start = nil // drop reference to allow GC
+			}
+			res, err := h.client.XRead(ctx, &redis.XReadArgs{Streams: []string{key, lastID}, Block: 500 * time.Millisecond}).Result()
+			if err != nil {
+				if err == redis.Nil || errors.Is(err, context.DeadlineExceeded) {
+					continue
+				}
+				select {
+				case <-time.After(100 * time.Millisecond):
+				case <-ctx.Done():
 					return
 				}
-				// Best-effort handler; ignore errors to keep subscription alive
-				_ = handler(ctx, []byte(msg.Payload))
+				continue
+			}
+			if len(res) == 0 || len(res[0].Messages) == 0 {
+				continue
+			}
+			for _, m := range res[0].Messages {
+				lastID = m.ID
+				var payload []byte
+				switch v := m.Values["d"].(type) {
+				case string:
+					payload = []byte(v)
+				case []byte:
+					payload = v
+				default:
+					payload = []byte(fmt.Sprintf("%v", v))
+				}
+				if err := handler(ctx, payload); err != nil {
+					return
+				}
 			}
 		}
-	}()
-	unsubscribe := func() { _ = sub.Close() }
-	return unsubscribe, nil
+	}(ready)
+	// Wait until the reader goroutine has armed its first blocking read,
+	// but don't block forever if the context is canceled early.
+	select {
+	case <-ready:
+		// armed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
 }
