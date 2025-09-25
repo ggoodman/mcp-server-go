@@ -3,6 +3,7 @@ package sessions
 import (
 	"context"
 
+	"github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 )
 
@@ -80,9 +81,14 @@ const (
 // Concurrency: Implementations MUST be safe for concurrent use. Each call derives its schema
 // from type metadata and does not mutate the target until after a successful round-trip.
 type ElicitationCapability interface {
-	// Elicit sends an elicitation request with the provided user-facing message text
-	// and decodes the response into target.
-	Elicit(ctx context.Context, text string, target any, opts ...ElicitOption) (ElicitAction, error)
+	// Elicit sends an elicitation request with the provided user-facing message text.
+	// The provided SchemaDecoder encapsulates both the schema (what is being asked)
+	// and the decoding logic (how to hydrate the destination). The destination is
+	// typically already bound inside the SchemaDecoder (e.g. via elicitation.BindStruct(&myStruct)),
+	// but implementations MAY allow Decode() to accept an alternate destination when
+	// invoked. The options control per-call validation semantics (like strict key
+	// enforcement) and raw capture.
+	Elicit(ctx context.Context, text string, decoder elicitation.SchemaDecoder, opts ...ElicitOption) (ElicitAction, error)
 }
 
 // ElicitOption configures an elicitation invocation (functional options pattern).
