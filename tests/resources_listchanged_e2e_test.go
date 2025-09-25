@@ -1,13 +1,11 @@
 package tests
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -127,26 +125,10 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 		t.Fatalf("get status: %d", getResp.StatusCode)
 	}
 
-	// 4) Read SSE until we see a JSON-RPC notification with method resources/list_changed.
-	defer getResp.Body.Close()
-	scanner := bufio.NewScanner(getResp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		var m map[string]any
-		if err := json.Unmarshal([]byte(payload), &m); err != nil {
-			continue
-		}
-		if method, _ := m["method"].(string); method == string(mcp.ResourcesListChangedNotificationMethod) {
-			return
-		}
+	// 4) Wait (bounded) for resources/list_changed notification
+	if err := waitForNotification(t.Context(), getResp.Body, string(mcp.ResourcesListChangedNotificationMethod), 8*time.Second); err != nil {
+		getResp.Body.Close()
+		t.Fatalf("waiting for list_changed: %v", err)
 	}
-	if err := scanner.Err(); err != nil {
-		t.Fatalf("scanner error while waiting for list_changed: %v", err)
-	}
-	t.Fatalf("SSE stream closed before receiving resources/list_changed")
+	getResp.Body.Close()
 }
