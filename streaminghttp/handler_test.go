@@ -97,8 +97,8 @@ func TestSingleInstance(t *testing.T) {
 
 	t.Run("Resources templates list over POST", func(t *testing.T) {
 		server := mcpservice.NewServer(
-			mcpservice.WithResourcesCapability(NewDynamicResources(
-				WithResourcesListTemplatesFunc(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+			mcpservice.WithResourcesCapability(mcpservice.NewDynamicResources(
+				mcpservice.WithResourcesListTemplatesFunc(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
 					return mcpservice.NewPage([]mcp.ResourceTemplate{{URITemplate: "file://{path}", Name: "file"}}), nil
 				}),
 			)),

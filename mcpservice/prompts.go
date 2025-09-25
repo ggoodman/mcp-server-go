@@ -10,7 +10,6 @@ import (
 )
 
 // Callback signatures for dynamic behavior.
-// --- New Prompts refactor: static container implements PromptsCapability; dynamic version via constructor ---
 
 type (
 	ListPromptsFunc func(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error)
@@ -66,8 +65,6 @@ func (d *dynamicPrompts) GetListChangedCapability(ctx context.Context, session s
 	}
 	return promptsListChangedFromSubscriber{sub: d.change}, true, nil
 }
-
-// PromptsContainer now implements PromptsCapability directly.
 
 // ListPrompts implements PromptsCapability for PromptsContainer
 func (sp *PromptsContainer) ListPrompts(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error) {
