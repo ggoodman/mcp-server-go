@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
@@ -426,6 +427,8 @@ func TestMultiInstance(t *testing.T) {
 		// Step 3: Start GET stream on instance 0 and read next SSE event asynchronously
 		respGet, eventsCh := startGetStreamOneEvent(t, srv, "Bearer test-token", sessID)
 		defer respGet.Body.Close()
+
+		<-time.After(10 * time.Millisecond) // give some time for GET to be fully established
 
 		// Step 4: Trigger a resources list change via the shared container
 		sharedSR.ReplaceResources(context.Background(), sharedSR.SnapshotResources())
@@ -1198,8 +1201,10 @@ func startGetStreamOneEvent(t *testing.T, srv *httptest.Server, authHeader, sess
 		// http may report StatusOK only after first write. We'll still proceed to read.
 	}
 	ch := make(chan sseEvent, 1)
+	readyCh := make(chan struct{})
 	go func() {
 		defer close(ch)
+		close(readyCh)
 		evt, err := readOneSSE(resp.Body)
 		if err != nil {
 			// signal error by sending an empty event with data set to error json
@@ -1208,6 +1213,7 @@ func startGetStreamOneEvent(t *testing.T, srv *httptest.Server, authHeader, sess
 		}
 		ch <- evt
 	}()
+	<-readyCh // ensure goroutine is running
 	return resp, ch
 }
 
