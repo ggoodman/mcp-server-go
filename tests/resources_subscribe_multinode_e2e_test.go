@@ -40,17 +40,17 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	}
 	defer h.Close()
 
-	// Shared StaticResources backing on handler A
-	static := mcpservice.NewStaticResources(
+	// Shared ResourcesContainer backing on handler A
+	static := mcpservice.NewResourcesContainer(
 		[]mcp.Resource{{URI: "res://x", Name: "x"}},
 		nil,
 		map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v1"}}},
 	)
 	srvCapsA := mcpservice.NewServer(
-		mcpservice.WithResourcesOptions(mcpservice.WithStaticResourceContainer(static)),
+		mcpservice.WithResourcesCapability(static),
 	)
 	srvCapsB := mcpservice.NewServer(
-		mcpservice.WithResourcesOptions(mcpservice.WithStaticResourceContainer(static)),
+		mcpservice.WithResourcesCapability(static),
 	)
 
 	// Start two independent HTTP servers (A, B) sharing the same session host

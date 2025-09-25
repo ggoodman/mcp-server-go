@@ -13,12 +13,12 @@ import (
 // Each user sees a single profile resource at res://user/<userID>/profile.
 func New() mcpservice.ServerCapabilities {
 	resourcesProvider := func(ctx context.Context, s sessions.Session) (mcpservice.ResourcesCapability, bool, error) {
-		cap := mcpservice.NewResourcesCapability(
-			mcpservice.WithListResources(func(ctx context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.Resource], error) {
+		cap := mcpservice.NewDynamicResources(
+			mcpservice.WithResourcesListFunc(func(ctx context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.Resource], error) {
 				uri := fmt.Sprintf("res://user/%s/profile", s.UserID())
 				return mcpservice.NewPage([]mcp.Resource{{URI: uri, Name: "profile", MimeType: "text/plain"}}), nil
 			}),
-			mcpservice.WithReadResource(func(ctx context.Context, _ sessions.Session, uri string) ([]mcp.ResourceContents, error) {
+			mcpservice.WithResourcesReadFunc(func(ctx context.Context, _ sessions.Session, uri string) ([]mcp.ResourceContents, error) {
 				return []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "hello, " + s.UserID()}}, nil
 			}),
 		)

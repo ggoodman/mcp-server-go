@@ -676,11 +676,3 @@ func testEventsCancellation(t *testing.T, factory HostFactory) {
 	// Just wait for context deadline
 	<-ctx.Done()
 }
-
-// --- Revocation tests (optional) ---
-
-// --- Manager integration tests ---
-
-// --- Helpers ---
-
-// NOTE: removed legacy cleanup/revocation/JWS manager integration tests as stateful sessions replaced them.

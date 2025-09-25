@@ -10,142 +10,100 @@ import (
 )
 
 // Callback signatures for dynamic behavior.
+
 type (
 	ListPromptsFunc func(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error)
 	GetPromptFunc   func(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error)
 )
 
-// PromptsOption is a functional option for configuring the prompts capability.
-type PromptsOption func(*promptsCapability)
-
-type promptsCapability struct {
-	// Optional dynamic behavior
-	listPromptsFn ListPromptsFunc
-	getPromptFn   GetPromptFunc
-
-	// Optional static prompts container
-	staticContainer *StaticPrompts
-
-	// Static paging
-	pageSize int
-
-	// Optional change notification subscriber (process-local)
-	changeSub ChangeSubscriber
+// Dynamic prompts implementation
+type dynamicPrompts struct {
+	listFn ListPromptsFunc
+	getFn  GetPromptFunc
+	change ChangeSubscriber
 }
 
-// NewPromptsCapability constructs a PromptsCapability using the provided options.
-// It supports both static and dynamic modes via functional options.
-func NewPromptsCapability(opts ...PromptsOption) PromptsCapability {
-	pc := &promptsCapability{pageSize: 50}
-	for _, opt := range opts {
-		opt(pc)
+type DynamicPromptsOption func(*dynamicPrompts)
+
+func NewDynamicPrompts(opts ...DynamicPromptsOption) PromptsCapability {
+	dp := &dynamicPrompts{}
+	for _, o := range opts {
+		o(dp)
 	}
-	return pc
+	return dp
 }
 
-// WithStaticPromptsContainer provides a static prompts container to advertise.
-// When present, the capability will automatically advertise listChanged support.
-func WithStaticPromptsContainer(sp *StaticPrompts) PromptsOption {
-	return func(pc *promptsCapability) {
-		pc.staticContainer = sp
-		pc.changeSub = sp
+func WithPromptsListFunc(fn ListPromptsFunc) DynamicPromptsOption {
+	return func(d *dynamicPrompts) { d.listFn = fn }
+}
+func WithPromptsGetFunc(fn GetPromptFunc) DynamicPromptsOption {
+	return func(d *dynamicPrompts) { d.getFn = fn }
+}
+func WithPromptsChangeSubscriber(sub ChangeSubscriber) DynamicPromptsOption {
+	return func(d *dynamicPrompts) { d.change = sub }
+}
+
+// dynamicPrompts implements PromptsCapability
+func (d *dynamicPrompts) ListPrompts(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error) {
+	if d.listFn == nil {
+		return NewPage[mcp.Prompt](nil), nil
 	}
+	return d.listFn(ctx, session, cursor)
 }
-
-// WithListPrompts sets a custom list-prompts function.
-func WithListPrompts(fn ListPromptsFunc) PromptsOption {
-	return func(pc *promptsCapability) { pc.listPromptsFn = fn }
-}
-
-// WithGetPrompt sets a custom get-prompt function.
-func WithGetPrompt(fn GetPromptFunc) PromptsOption {
-	return func(pc *promptsCapability) { pc.getPromptFn = fn }
-}
-
-// WithPromptsPageSize sets the page size for static pagination.
-func WithPromptsPageSize(n int) PromptsOption {
-	return func(pc *promptsCapability) {
-		if n > 0 {
-			pc.pageSize = n
-		}
-	}
-}
-
-// WithPromptsChangeNotification wires a ChangeSubscriber to enable list-changed notifications.
-func WithPromptsChangeNotification(sub ChangeSubscriber) PromptsOption {
-	return func(pc *promptsCapability) { pc.changeSub = sub }
-}
-
-// ListPrompts implements PromptsCapability.
-func (pc *promptsCapability) ListPrompts(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error) {
-	if pc.listPromptsFn != nil {
-		return pc.listPromptsFn(ctx, session, cursor)
-	}
-	if pc.staticContainer != nil {
-		return pc.pagePrompts(pc.staticContainer.Snapshot(), cursor), nil
-	}
-	return NewPage[mcp.Prompt](nil), nil
-}
-
-// GetPrompt implements PromptsCapability.
-func (pc *promptsCapability) GetPrompt(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
+func (d *dynamicPrompts) GetPrompt(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
 	if req == nil || req.Name == "" {
 		return nil, fmt.Errorf("invalid prompt request: missing name")
 	}
-	if pc.getPromptFn != nil {
-		return pc.getPromptFn(ctx, session, req)
+	if d.getFn == nil {
+		return nil, fmt.Errorf("prompt not found: %s", req.Name)
 	}
-	if pc.staticContainer != nil {
-		return pc.staticContainer.Get(ctx, session, req)
+	return d.getFn(ctx, session, req)
+}
+func (d *dynamicPrompts) GetListChangedCapability(ctx context.Context, session sessions.Session) (PromptListChangedCapability, bool, error) {
+	if d.change == nil {
+		return nil, false, nil
 	}
-	return nil, fmt.Errorf("prompt not found: %s", req.Name)
+	return promptsListChangedFromSubscriber{sub: d.change}, true, nil
 }
 
-// GetListChangedCapability advertises list-changed support when a change subscriber is configured.
-func (pc *promptsCapability) GetListChangedCapability(ctx context.Context, session sessions.Session) (PromptListChangedCapability, bool, error) {
-	if pc.staticContainer != nil {
-		return promptsListChangedFromSubscriber{pc: pc}, true, nil
-	}
-	if pc.changeSub != nil {
-		return promptsListChangedFromSubscriber{pc: pc}, true, nil
-	}
-	return nil, false, nil
-}
-
-// Helper: paginate static prompts
-func (pc *promptsCapability) pagePrompts(all []mcp.Prompt, cursor *string) Page[mcp.Prompt] {
+// ListPrompts implements PromptsCapability for PromptsContainer
+func (sp *PromptsContainer) ListPrompts(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Prompt], error) {
+	all := sp.Snapshot()
+	// reuse pagination logic inline (page size 50 for now; could add SetPageSize later if needed)
 	start := parseCursor(cursor)
 	if start < 0 || start > len(all) {
 		start = 0
 	}
-	end := start + pc.pageSize
+	pageSize := 50
+	end := start + pageSize
 	if end > len(all) {
 		end = len(all)
 	}
 	items := make([]mcp.Prompt, end-start)
 	copy(items, all[start:end])
 	if end < len(all) {
-		next := strconv.Itoa(end)
-		return NewPage(items, WithNextCursor[mcp.Prompt](next))
+		return NewPage(items, WithNextCursor[mcp.Prompt](strconv.Itoa(end))), nil
 	}
-	return NewPage(items)
+	return NewPage(items), nil
 }
 
-// promptsListChangedFromSubscriber adapts a ChangeSubscriber to PromptListChangedCapability.
-type promptsListChangedFromSubscriber struct{ pc *promptsCapability }
+// GetPrompt implements PromptsCapability for PromptsContainer
+func (sp *PromptsContainer) GetPrompt(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
+	return sp.Get(ctx, session, req)
+}
+
+// GetListChangedCapability implements PromptsCapability for PromptsContainer
+func (sp *PromptsContainer) GetListChangedCapability(ctx context.Context, session sessions.Session) (PromptListChangedCapability, bool, error) {
+	return promptsListChangedFromSubscriber{sub: sp}, true, nil
+}
+
+type promptsListChangedFromSubscriber struct{ sub ChangeSubscriber }
 
 func (p promptsListChangedFromSubscriber) Register(ctx context.Context, session sessions.Session, fn NotifyPromptsListChangedFunc) (bool, error) {
-	if p.pc == nil || fn == nil {
+	if p.sub == nil || fn == nil {
 		return false, nil
 	}
-	var ch <-chan struct{}
-	if p.pc.staticContainer != nil {
-		ch = p.pc.staticContainer.Subscriber()
-	} else if p.pc.changeSub != nil {
-		ch = p.pc.changeSub.Subscriber()
-	} else {
-		return false, nil
-	}
+	ch := p.sub.Subscriber()
 	go func() {
 		for {
 			select {

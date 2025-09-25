@@ -66,9 +66,6 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // Option configures the StreamingHTTPHandler.
 type Option func(*newConfig)
 
-// (no legacy config structs)
-// (no legacy manual OIDC config struct)
-
 // ManualOIDC provides manual OAuth/OIDC details and PRM fields when bypassing
 // OIDC discovery.
 type ManualOIDC struct {
@@ -152,7 +149,6 @@ type StreamingHTTPHandler struct {
 
 	// Per-session outbound dispatchers and their cancel/unsub handlers for
 	// long-lived subscriptions (e.g., notifications/cancelled).
-	// (outbound dispatcher removed in stateful refactor)
 
 }
 
@@ -822,8 +818,6 @@ func (h *StreamingHTTPHandler) handleOptionsAuthorizationServerMetadata(w http.R
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// (legacy handleResponse removed)
-
 func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.Request, w http.ResponseWriter) auth.UserInfo {
 	authHeader := r.Header.Get(authorizationHeader)
 
@@ -883,9 +877,7 @@ func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
 	return nil
 }
 
-// (sessionWithWriter wrapper removed; superseded by SessionHandle.SetDirectWriter)
-
-// (ensureSessionParentContext removed; it was unused after refactor)
+// Direct writer integration handled via SessionHandle.SetDirectWriter.
 
 // teardownSession cancels the per-session parent context (if any) and cancels
 // all per-URI forwarders. It also removes bookkeeping entries. This does not

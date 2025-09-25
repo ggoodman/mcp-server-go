@@ -27,9 +27,7 @@ func TestInitializeCapabilitiesAdvertisement(t *testing.T) {
 	mh := memoryhost.New()
 
 	server := mcpservice.NewServer(
-		mcpservice.WithResourcesOptions(), // none
-		mcpservice.WithPromptsOptions(),   // none
-		mcpservice.WithToolsOptions(),     // add an empty static container so listChanged=true
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()), // empty tools container
 	)
 
 	var handler http.Handler
@@ -90,9 +88,10 @@ func TestInitializeCapabilitiesAdvertisement(t *testing.T) {
 	if initRes.Capabilities.Tools == nil {
 		t.Fatalf("expected tools capability; got nil")
 	}
-	// With empty static tools container listChanged should be false (no dynamic change support yet)
-	if initRes.Capabilities.Tools.ListChanged {
-		t.Fatalf("expected tools.listChanged false with empty static container")
+	// Even with an empty tools container we advertise listChanged support because
+	// the container can mutate over time (add/remove/replace tools) and emits notifications.
+	if !initRes.Capabilities.Tools.ListChanged {
+		t.Fatalf("expected tools.listChanged true with empty tools container")
 	}
 	// Resources capability may be advertised with default false flags; ensure we don't wrongly assert it's absent.
 	// Prompts capability may similarly appear with default false flags.

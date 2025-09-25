@@ -231,7 +231,7 @@ func TestInitialize_HappyPath(t *testing.T) {
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "test", Version: "1.0.0"}),
 		mcpservice.WithPreferredProtocolVersion(defaultProtocolVersion),
 		mcpservice.WithInstructions("Have fun!"),
-		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools())),
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&slog.LevelVar{})),
 	)
 	th := newHarness(t, srv)
@@ -270,9 +270,9 @@ func TestTools_ListAndCall(t *testing.T) {
 		_ = mcpservice.ReportProgress(ctx, 0.25, 1)
 		return mcpservice.TextResult(args.Text), nil
 	}}
-	st := mcpservice.NewStaticTools(echo)
+	st := mcpservice.NewToolsContainer(echo)
 	srv := mcpservice.NewServer(
-		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)),
+		mcpservice.WithToolsCapability(st),
 	)
 	th := newHarness(t, srv)
 
@@ -330,7 +330,9 @@ func TestTools_ListAndCall(t *testing.T) {
 
 // Handshake gating: requests must fail until client sends notifications/initialized.
 func TestHandshake_PendingRejectsRequests(t *testing.T) {
-	srv := mcpservice.NewServer()
+	srv := mcpservice.NewServer(
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
+	)
 	th := newHarness(t, srv)
 
 	// Initialize session
@@ -386,12 +388,8 @@ func TestHandshake_InitializedAllowsRequests(t *testing.T) {
 // static tools container changes, and wiring should be idempotent even if initialized is sent twice.
 func TestEagerWiring_ToolsListChanged_IdempotentInitialized(t *testing.T) {
 	// Start with an empty static tools container that exposes listChanged via subscriber.
-	st := mcpservice.NewStaticTools()
-	srv := mcpservice.NewServer(
-		mcpservice.WithToolsOptions(
-			mcpservice.WithStaticToolsContainer(st),
-		),
-	)
+	st := mcpservice.NewToolsContainer()
+	srv := mcpservice.NewServer(mcpservice.WithToolsCapability(st))
 	th := newHarness(t, srv)
 
 	_ = th.initialize(t, "init-1", defaultInitializeRequest())
@@ -455,8 +453,8 @@ func TestCancellation_ToolsCall(t *testing.T) {
 		t.Logf("tool handler exiting due to cancellation: %v", ctx.Err())
 		return nil, ctx.Err()
 	}}
-	st := mcpservice.NewStaticTools(slow)
-	srv := mcpservice.NewServer(mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)))
+	st := mcpservice.NewToolsContainer(slow)
+	srv := mcpservice.NewServer(mcpservice.WithToolsCapability(st))
 	th := newHarness(t, srv)
 
 	// init and open
@@ -509,8 +507,8 @@ func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
 		}
 		return mcpservice.TextResult("ok"), nil
 	}}
-	st := mcpservice.NewStaticTools(tool)
-	srv := mcpservice.NewServer(mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)))
+	st := mcpservice.NewToolsContainer(tool)
+	srv := mcpservice.NewServer(mcpservice.WithToolsCapability(st))
 	th := newHarness(t, srv)
 
 	// init with sampling + elicitation client caps so engine sets up session writers
@@ -547,7 +545,7 @@ func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
 func TestResources_ListReadSubscribe(t *testing.T) {
 	// Static resources: one resource with initial contents
 	uri := "mem://a"
-	sr := mcpservice.NewStaticResources(
+	sr := mcpservice.NewResourcesContainer(
 		[]mcp.Resource{{URI: uri, Name: "A", MimeType: "text/plain"}},
 		nil,
 		map[string][]mcp.ResourceContents{
@@ -555,9 +553,7 @@ func TestResources_ListReadSubscribe(t *testing.T) {
 		},
 	)
 	srv := mcpservice.NewServer(
-		mcpservice.WithResourcesOptions(
-			mcpservice.WithStaticResourceContainer(sr),
-		),
+		mcpservice.WithResourcesCapability(sr),
 	)
 	th := newHarness(t, srv)
 
@@ -647,13 +643,13 @@ func TestResources_ListReadSubscribe(t *testing.T) {
 
 func TestPrompts_ListAndGet(t *testing.T) {
 	// One prompt with simple handler
-	sp := mcpservice.NewStaticPrompts(mcpservice.StaticPrompt{
+	sp := mcpservice.NewPromptsContainer(mcpservice.StaticPrompt{
 		Descriptor: mcp.Prompt{Name: "hello", Description: "say hi"},
 		Handler: func(ctx context.Context, _ sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
 			return &mcp.GetPromptResult{Description: "hi", Messages: []mcp.PromptMessage{{Role: mcp.RoleUser, Content: []mcp.ContentBlock{{Type: mcp.ContentTypeText, Text: "hello"}}}}}, nil
 		},
 	})
-	srv := mcpservice.NewServer(mcpservice.WithPromptsOptions(mcpservice.WithStaticPromptsContainer(sp)))
+	srv := mcpservice.NewServer(mcpservice.WithPromptsCapability(sp))
 	th := newHarness(t, srv)
 
 	_ = th.initialize(t, "init-1", defaultInitializeRequest())

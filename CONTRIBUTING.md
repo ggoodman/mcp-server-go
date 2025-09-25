@@ -38,7 +38,7 @@ We use `github.com/invopop/jsonschema` to reflect JSON Schemas from Go types and
 
 ## Change notifications
 
-Capabilities that support list-changed (like tools/resources) use a small in-process `ChangeNotifier` + `ChangeSubscriber` mechanism. Static containers (`StaticTools`, `StaticResources`) notify automatically on Replace/Add/Remove.
+Capabilities that support list-changed (like tools/resources) use a small in-process `ChangeNotifier` + `ChangeSubscriber` mechanism. Container types (`ToolsContainer`, `ResourcesContainer`) notify automatically on Replace/Add/Remove.
 
 ## Tests
 

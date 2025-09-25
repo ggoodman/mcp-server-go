@@ -3,151 +3,94 @@ package mcpservice
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
-// Callback signatures for dynamic behavior.
-type (
-	ListToolsFunc func(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Tool], error)
-	CallToolFunc  func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error)
-)
+// Dynamic constructor / option set for tools capability.
+// Static tools now implement ToolsCapability directly (see static_tools.go).
 
-// ToolsOption is a functional option for configuring the tools capability.
-type ToolsOption func(*toolsCapability)
+// ListToolsFunc returns a (possibly paginated) page of tools for the session.
+// The function MUST honor the context for cancellation.
+type ListToolsFunc func(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Tool], error)
 
-type toolsCapability struct {
-	// Optional dynamic behavior
-	listToolsFn ListToolsFunc
-	callToolFn  CallToolFunc
+// CallToolFunc executes a tool invocation.
+type CallToolFunc func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error)
 
-	// Optional static tools container
-	staticContainer *StaticTools
+// DynamicToolsOption configures a dynamically implemented tools capability.
+type DynamicToolsOption func(*dynamicTools)
 
-	// Static paging
-	pageSize int
-
-	// Optional change notification subscriber (process-local)
+// dynamicTools is the dynamic (function-backed) implementation of ToolsCapability.
+// It does NOT do paging itself beyond returning whatever ListFn supplies; callers
+// that want internal paging should implement it inside ListFn.
+type dynamicTools struct {
+	listFn    ListToolsFunc
+	callFn    CallToolFunc
 	changeSub ChangeSubscriber
 }
 
-// NewToolsCapability constructs a ToolsCapability using the provided options.
-// It supports both static and dynamic modes via functional options.
-func NewToolsCapability(opts ...ToolsOption) ToolsCapability {
-	tc := &toolsCapability{
-		pageSize: 50,
-	}
+// NewDynamicTools builds a dynamic tools capability from option functions.
+// If listFn is nil, ListTools returns an empty page. If callFn is nil, tool calls
+// result in a not-found error. changeSub enables listChanged notifications.
+func NewDynamicTools(opts ...DynamicToolsOption) ToolsCapability {
+	dt := &dynamicTools{}
 	for _, opt := range opts {
-		opt(tc)
+		opt(dt)
 	}
-	return tc
+	return dt
 }
 
-// WithListTools sets a custom list-tools function.
-func WithListTools(fn ListToolsFunc) ToolsOption {
-	return func(tc *toolsCapability) { tc.listToolsFn = fn }
+// WithToolsListFn sets the listing function for a dynamic tools capability.
+func WithToolsListFn(fn ListToolsFunc) DynamicToolsOption {
+	return func(d *dynamicTools) { d.listFn = fn }
 }
 
-// WithCallTool sets a custom call-tool function.
-func WithCallTool(fn CallToolFunc) ToolsOption {
-	return func(tc *toolsCapability) { tc.callToolFn = fn }
+// WithToolsCallFn sets the call function for a dynamic tools capability.
+func WithToolsCallFn(fn CallToolFunc) DynamicToolsOption {
+	return func(d *dynamicTools) { d.callFn = fn }
 }
 
-// WithStaticToolsContainer provides a static tool container to advertise.
-// When present, the capability will automatically advertise listChanged support.
-func WithStaticToolsContainer(st *StaticTools) ToolsOption {
-	return func(tc *toolsCapability) { tc.staticContainer = st }
+// WithToolsChangeSubscriber wires a ChangeSubscriber for listChanged notifications.
+func WithToolsChangeSubscriber(sub ChangeSubscriber) DynamicToolsOption {
+	return func(d *dynamicTools) { d.changeSub = sub }
 }
 
-// WithToolsPageSize sets the page size for static pagination.
-func WithToolsPageSize(n int) ToolsOption {
-	return func(tc *toolsCapability) {
-		if n > 0 {
-			tc.pageSize = n
-		}
+// ListTools implements ToolsCapability for dynamic tools.
+func (d *dynamicTools) ListTools(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Tool], error) {
+	if d.listFn == nil {
+		return NewPage[mcp.Tool](nil), nil
 	}
+	return d.listFn(ctx, session, cursor)
 }
 
-// WithToolsChangeNotification wires a ChangeSubscriber to enable list-changed notifications.
-func WithToolsChangeNotification(sub ChangeSubscriber) ToolsOption {
-	return func(tc *toolsCapability) { tc.changeSub = sub }
-}
-
-// ListTools implements ToolsCapability.
-func (tc *toolsCapability) ListTools(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Tool], error) {
-	if tc.listToolsFn != nil {
-		return tc.listToolsFn(ctx, session, cursor)
-	}
-	if tc.staticContainer != nil {
-		return tc.pageTools(tc.staticContainer.Snapshot(), cursor), nil
-	}
-	return NewPage[mcp.Tool](nil), nil
-}
-
-// CallTool implements ToolsCapability.
-func (tc *toolsCapability) CallTool(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+// CallTool implements ToolsCapability for dynamic tools.
+func (d *dynamicTools) CallTool(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
 	if req == nil || req.Name == "" {
 		return nil, fmt.Errorf("invalid tool request: missing name")
 	}
-	// Explicit override wins.
-	if tc.callToolFn != nil {
-		return tc.callToolFn(ctx, session, req)
+	if d.callFn == nil {
+		return nil, fmt.Errorf("tool not found: %s", req.Name)
 	}
-	// In static mode, delegate to the container's dispatcher if available.
-	if tc.staticContainer != nil {
-		return tc.staticContainer.Call(ctx, session, req)
-	}
-	return nil, fmt.Errorf("tool not found: %s", req.Name)
+	return d.callFn(ctx, session, req)
 }
 
-// GetListChangedCapability advertises list-changed support when a change subscriber is configured.
-func (tc *toolsCapability) GetListChangedCapability(ctx context.Context, session sessions.Session) (ToolListChangedCapability, bool, error) {
-	// If a static container is present, we automatically expose listChanged support.
-	if tc.staticContainer != nil {
-		return toolsListChangedFromSubscriber{tc: tc}, true, nil
+// GetListChangedCapability implements ToolsCapability listChanged advertisement.
+func (d *dynamicTools) GetListChangedCapability(ctx context.Context, session sessions.Session) (ToolListChangedCapability, bool, error) {
+	if d.changeSub == nil {
+		return nil, false, nil
 	}
-	if tc.changeSub != nil {
-		return toolsListChangedFromSubscriber{tc: tc}, true, nil
-	}
-	return nil, false, nil
-}
-
-// Helper: paginate static tools
-func (tc *toolsCapability) pageTools(all []mcp.Tool, cursor *string) Page[mcp.Tool] {
-	start := parseCursor(cursor)
-	if start < 0 || start > len(all) {
-		start = 0
-	}
-	end := start + tc.pageSize
-	if end > len(all) {
-		end = len(all)
-	}
-	items := make([]mcp.Tool, end-start)
-	copy(items, all[start:end])
-	if end < len(all) {
-		next := strconv.Itoa(end)
-		return NewPage(items, WithNextCursor[mcp.Tool](next))
-	}
-	return NewPage(items)
+	return toolsListChangedFromSubscriber{sub: d.changeSub}, true, nil
 }
 
 // toolsListChangedFromSubscriber adapts a ChangeSubscriber to ToolListChangedCapability.
-type toolsListChangedFromSubscriber struct{ tc *toolsCapability }
+type toolsListChangedFromSubscriber struct{ sub ChangeSubscriber }
 
 func (t toolsListChangedFromSubscriber) Register(ctx context.Context, session sessions.Session, fn NotifyToolsListChangedFunc) (bool, error) {
-	if t.tc == nil || fn == nil {
+	if t.sub == nil || fn == nil {
 		return false, nil
 	}
-	var ch <-chan struct{}
-	if t.tc.staticContainer != nil {
-		ch = t.tc.staticContainer.Subscriber()
-	} else if t.tc.changeSub != nil {
-		ch = t.tc.changeSub.Subscriber()
-	} else {
-		return false, nil
-	}
+	ch := t.sub.Subscriber()
 	go func() {
 		for {
 			select {
