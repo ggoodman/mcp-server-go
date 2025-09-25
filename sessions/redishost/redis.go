@@ -14,7 +14,18 @@ import (
 )
 
 // Host is a Redis-backed implementation of sessions.SessionHost using
-// Redis Streams for ordered messaging and Pub/Sub for events.
+// Redis Streams for ordered messaging and for server-internal events.
+//
+// Rationale:
+//   - Streams give us durable, ordered event delivery semantics and a simple
+//     polling API (XREAD) without managing consumer-group state for events.
+//   - We intentionally start new subscribers at "$" (the "now" snapshot) to only
+//     deliver events published after SubscribeEvents is called. Tests introduce a
+//     small handshake barrier to avoid racy first publishes; production does not
+//     require microsecond fidelity.
+//
+// Note: We trim streams approximately to cap growth, and we don't replay events
+// to new subscribers (late subscribers only see future events).
 type Host struct {
 	client    *redis.Client
 	keyPrefix string

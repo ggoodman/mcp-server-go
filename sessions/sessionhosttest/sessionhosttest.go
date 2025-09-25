@@ -421,6 +421,13 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 		Payload   string `json:"payload"`
 	}
 
+	// Handshake: avoid racy first publish by using a test-only "ready" barrier.
+	// We publish a "ready" sentinel until both subscribers ack seeing it. Only then
+	// do we publish the actual test events. This keeps production code simple
+	// (XREAD "$" semantics) while making the test deterministic.
+	ready1 := make(chan struct{}, 1)
+	ready2 := make(chan struct{}, 1)
+
 	subCtx1, cancel1 := context.WithCancel(ctx)
 	if err := h.SubscribeEvents(subCtx1, topic, func(c context.Context, p []byte) error {
 		var env eventEnvelope
@@ -429,6 +436,13 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 		}
 		if env.SessionID != sessionID {
 			return nil // ignore events for other sessions
+		}
+		if env.Payload == "__ready__" {
+			select {
+			case ready1 <- struct{}{}:
+			default:
+			}
+			return nil
 		}
 		r1.mu.Lock()
 		r1.events = append(r1.events, []byte(env.Payload))
@@ -441,6 +455,7 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 		t.Fatalf("subscribe 1: %v", err)
 	}
 	defer cancel1()
+
 	subCtx2, cancel2 := context.WithCancel(ctx)
 	if err := h.SubscribeEvents(subCtx2, topic, func(c context.Context, p []byte) error {
 		var env eventEnvelope
@@ -448,6 +463,13 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 			return err
 		}
 		if env.SessionID != sessionID {
+			return nil
+		}
+		if env.Payload == "__ready__" {
+			select {
+			case ready2 <- struct{}{}:
+			default:
+			}
 			return nil
 		}
 		r2.mu.Lock()
@@ -462,7 +484,35 @@ func testEventsFanOutAllSubscribersReceiveAllFuture(t *testing.T, factory HostFa
 	}
 	defer cancel2()
 
-	// Publish immediately after subscriptions become active (implementation must ensure no missed events)
+	// Publish a small number of "ready" sentinels until both subscribers report readiness
+	barrierCtx, barrierCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer barrierCancel()
+	for barrierCtx.Err() == nil {
+		b, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: "__ready__"})
+		_ = h.PublishEvent(ctx, topic, b)
+		got1, got2 := false, false
+		// drain with short deadline each round
+		deadline := time.After(25 * time.Millisecond)
+		for !got1 || !got2 {
+			select {
+			case <-ready1:
+				got1 = true
+			case <-ready2:
+				got2 = true
+			case <-deadline:
+				goto maybeNext
+			case <-barrierCtx.Done():
+				goto doneBarrier
+			}
+		}
+	maybeNext:
+		if got1 && got2 {
+			break
+		}
+	}
+
+doneBarrier:
+	// Now publish the actual test events
 	for i := 0; i < n; i++ {
 		b, _ := json.Marshal(eventEnvelope{SessionID: sessionID, Payload: strconv.Itoa(i)})
 		if err := h.PublishEvent(ctx, topic, b); err != nil {

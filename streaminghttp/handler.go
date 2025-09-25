@@ -762,7 +762,11 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 		logger.InfoContext(cbCtx, "sse.message.deliver")
 		return nil
 	}); err != nil {
-		logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
+		if errors.Is(err, context.Canceled) {
+			logger.InfoContext(ctx, "subscribe.session.done")
+		} else {
+			logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
+		}
 		return
 	}
 
