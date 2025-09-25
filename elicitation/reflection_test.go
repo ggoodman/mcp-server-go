@@ -190,3 +190,47 @@ func TestNumericCoercion(t *testing.T) {
 		t.Fatalf("expected 5 got %d", s.Count)
 	}
 }
+
+func TestSchema_WithTitleFormatEnumNamesIntegerBoolDefault(t *testing.T) {
+	var s struct {
+		Email string `json:"email" jsonschema:"title=Email Address,description=Primary email,format=email,minLength=3"`
+		Level int    `json:"level" jsonschema:"description=Access level,minimum=0,maximum=10"`
+		Mode  string `json:"mode" jsonschema:"enum=on|off,enumNames=Enabled|Disabled,description=Toggle mode"`
+		Flag  bool   `json:"flag" jsonschema:"default=true,description=Flag enabled"`
+	}
+	dec, err := BindStruct(&s)
+	if err != nil {
+		t.Fatalf("BindStruct: %v", err)
+	}
+	sch, _ := dec.Schema()
+	root, _ := extract(sch)
+	props := root["properties"].(map[string]any)
+	email := props["email"].(map[string]any)
+	if email["title"] != "Email Address" {
+		t.Fatalf("missing title")
+	}
+	if email["format"] != "email" {
+		t.Fatalf("expected format=email got %v", email["format"])
+	}
+	if email["type"] != "string" {
+		t.Fatalf("email type expected string")
+	}
+	level := props["level"].(map[string]any)
+	if level["type"] != "integer" {
+		t.Fatalf("expected integer type for level: %v", level["type"])
+	}
+	mode := props["mode"].(map[string]any)
+	if mode["type"] != "string" {
+		t.Fatalf("enum should still include type string")
+	}
+	if _, ok := mode["enum"]; !ok {
+		t.Fatalf("expected enum on mode")
+	}
+	if en, ok := mode["enumNames"].([]any); !ok || len(en) != 2 {
+		t.Fatalf("expected enumNames length 2")
+	}
+	flag := props["flag"].(map[string]any)
+	if flag["default"] != true {
+		t.Fatalf("expected default true for flag")
+	}
+}

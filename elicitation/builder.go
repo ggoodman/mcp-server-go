@@ -21,6 +21,16 @@ import (
 //	dec := b.MustBind(&dst) // or Build() then Bind(&dst)
 //
 // NOTE: This intentionally mirrors the reflection subset: flat primitives only.
+// Supported property attributes via PropOptions:
+//   - Title(string)
+//   - Description(string)
+//   - Format("email"|"uri"|"date"|"date-time") (strings only)
+//   - MinLength / MaxLength (strings)
+//   - Minimum / Maximum (number/integer)
+//   - EnumString + EnumNames(...display) for enums
+//   - DefaultBool for boolean default values
+//   - Integer() helper for integer typed numbers
+//
 // Future: nested objects (TODO: nested objects), arrays (TODO: arrays), defaults (TODO: defaults).
 // Keeping initial surface minimal aids client implementation cost.
 type Builder struct {
@@ -36,7 +46,11 @@ type bProperty struct {
 	required    bool
 	description string
 	enumVals    []string
+	enumNames   []string
 	constraints propertyConstraints
+	title       string
+	format      string // for strings only: email|uri|date|date-time
+	boolDefault *bool  // only for boolean
 }
 
 // NewBuilder returns a new Builder instance.
@@ -68,6 +82,11 @@ func (b *Builder) EnumString(name string, values []string, opts ...PropOption) *
 		}
 	}
 	return b
+}
+
+// Integer adds an integer property (schema type "integer").
+func (b *Builder) Integer(name string, opts ...PropOption) *Builder {
+	return b.add(name, "integer", opts...)
 }
 
 func (b *Builder) add(name, ptype string, opts ...PropOption) *Builder {
@@ -104,6 +123,38 @@ func Optional() PropOption { return func(p *bProperty) { p.required = false } }
 // Description adds human-readable description.
 func Description(desc string) PropOption { return func(p *bProperty) { p.description = desc } }
 
+// Title sets the display title.
+func Title(t string) PropOption { return func(p *bProperty) { p.title = t } }
+
+// Format sets a string format (email|uri|date|date-time). Invalid values ignored.
+func Format(f string) PropOption {
+	return func(p *bProperty) {
+		switch f {
+		case "email", "uri", "date", "date-time":
+			p.format = f
+		}
+	}
+}
+
+// EnumNames sets display names for enum values (must match length of enum).
+func EnumNames(names ...string) PropOption {
+	return func(p *bProperty) {
+		if len(p.enumVals) == 0 || len(names) != len(p.enumVals) {
+			return // ignore if mismatch
+		}
+		p.enumNames = append([]string(nil), names...)
+	}
+}
+
+// DefaultBool sets default for a boolean property.
+func DefaultBool(v bool) PropOption {
+	return func(p *bProperty) {
+		if p.ptype == "boolean" {
+			p.boolDefault = &v
+		}
+	}
+}
+
 // MinLength sets string minimum length.
 func MinLength(n int) PropOption { return func(p *bProperty) { p.constraints.MinLength = &n } }
 
@@ -135,15 +186,28 @@ func (b *Builder) Build() (Schema, error) {
 			return nil, fmt.Errorf("elicitation: property %s missing type", name)
 		}
 		m := map[string]any{}
+		m["type"] = p.ptype
 		if len(p.enumVals) > 0 {
 			vals := make([]string, len(p.enumVals))
 			copy(vals, p.enumVals)
 			m["enum"] = vals
-		} else {
-			m["type"] = p.ptype
+			if len(p.enumNames) == len(p.enumVals) && len(p.enumNames) > 0 {
+				en := make([]string, len(p.enumNames))
+				copy(en, p.enumNames)
+				m["enumNames"] = en
+			}
+		}
+		if p.title != "" {
+			m["title"] = p.title
 		}
 		if p.description != "" {
 			m["description"] = p.description
+		}
+		if p.format != "" {
+			m["format"] = p.format
+		}
+		if p.boolDefault != nil {
+			m["default"] = *p.boolDefault
 		}
 		if c := p.constraints; c.MinLength != nil {
 			m["minLength"] = *c.MinLength
@@ -348,6 +412,7 @@ func (d *dynamicStructDecoder) Decode(raw map[string]any, dst any) error {
 
 	fresh := reflect.New(target.Elem().Type()).Elem()
 
+	provided := make(map[string]struct{}, len(raw))
 	for name, val := range raw {
 		prop := d.schema.props[name]
 		if prop == nil {
@@ -370,6 +435,25 @@ func (d *dynamicStructDecoder) Decode(raw map[string]any, dst any) error {
 		assignStructPrimitive(field, val, prop.ptype)
 	}
 
+	// Apply boolean defaults for mapped optional pointer fields not provided
+	for name, prop := range d.schema.props {
+		if prop.ptype == "boolean" && prop.boolDefault != nil {
+			if _, ok := provided[name]; ok {
+				continue
+			}
+			fb, mapped := d.bindings[name]
+			if !mapped {
+				continue
+			}
+			field := fresh.Field(fb.index)
+			if fb.isPtr {
+				if field.IsNil() {
+					field.Set(reflect.New(field.Type().Elem()))
+				}
+				field.Elem().SetBool(*prop.boolDefault)
+			}
+		}
+	}
 	// Success
 	target.Elem().Set(fresh)
 	return nil
@@ -458,10 +542,17 @@ func (d *dynamicDecoder) Decode(raw map[string]any, dst any) error {
 			return fmt.Errorf("field %s: %w", name, err)
 		}
 	}
-	// Shallow copy into destination
+	// Shallow copy into destination and apply boolean defaults for omitted optional bools
 	copyMap := make(map[string]any, len(raw))
 	for k, v := range raw {
 		copyMap[k] = v
+	}
+	for name, bp := range d.schema.props {
+		if bp.ptype == "boolean" && bp.boolDefault != nil {
+			if _, present := copyMap[name]; !present {
+				copyMap[name] = *bp.boolDefault
+			}
+		}
 	}
 	*mp = copyMap
 	return nil

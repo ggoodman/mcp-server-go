@@ -21,8 +21,9 @@ import (
 //   - Field name comes from `json` tag (first segment before a comma) or the lower-camel field name
 //   - Pointer fields => optional (omitted from required set)
 //   - Non-pointer fields => required
-//   - jsonschema tag supports a tiny subset: description=...,enum=a|b|c,minLength=...,maxLength=...,minimum=...,maximum=...
-//     (values parsed best-effort; unknown tokens ignored). We keep the subset intentionally small to make
+//   - jsonschema tag supports: title=...,description=...,format=email|uri|date|date-time,enum=a|b|c,enumNames=DisplayA|DisplayB,
+//     minLength=...,maxLength=...,minimum=...,maximum=...,default=true|false (boolean fields only).
+//     (values parsed best-effort; unknown tokens ignored; enumNames length must match enum). We keep the subset intentionally small to make
 //     client implementations cheap. More complex constructs (nested objects, arrays, refs, composition) are rejected.
 //
 // Decoding strategy:
@@ -78,10 +79,16 @@ type reflectedProperty struct {
 	Name        string
 	Type        string // "string" | "number" | "boolean" | "enum" (enum still has an underlying primitive; simplified here)
 	Description string
+	Title       string
 	EnumValues  []string
+	EnumNames   []string
 	Constraints propertyConstraints
 	IsPointer   bool
 	FieldIndex  int
+	// Only for strings: format constraint (email|uri|date|date-time)
+	Format string
+	// Boolean default (only captured if field is boolean and tag supplies default=true/false)
+	BoolDefault *bool
 }
 
 type propertyConstraints struct {
@@ -134,8 +141,9 @@ func buildReflectedSchema(rt reflect.Type) *reflectedSchema {
 		case reflect.String:
 			pType = "string"
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-			reflect.Float32, reflect.Float64:
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			pType = "integer"
+		case reflect.Float32, reflect.Float64:
 			pType = "number"
 		case reflect.Bool:
 			pType = "boolean"
@@ -144,16 +152,31 @@ func buildReflectedSchema(rt reflect.Type) *reflectedSchema {
 			continue
 		}
 
-		desc, enumVals, constraints := parseJSONSchemaTag(f.Tag.Get("jsonschema"))
+		title, desc, enumVals, enumNames, format, boolDefault, constraints := parseJSONSchemaTag(f.Tag.Get("jsonschema"))
+
+		// If enumNames length mismatch, ignore them (enforce parity)
+		if len(enumNames) > 0 && len(enumNames) != len(enumVals) {
+			enumNames = nil
+		}
 
 		prop := reflectedProperty{
 			Name:        name,
 			Type:        pType,
 			Description: desc,
+			Title:       title,
 			EnumValues:  enumVals,
+			EnumNames:   enumNames,
 			Constraints: constraints,
 			IsPointer:   isPtr,
 			FieldIndex:  i,
+			Format:      format,
+		}
+		if pType == "boolean" && boolDefault != nil {
+			prop.BoolDefault = boolDefault
+		}
+		// format only meaningful for strings; drop otherwise
+		if format != "" && pType != "string" {
+			prop.Format = ""
 		}
 		props = append(props, prop)
 	}
@@ -190,13 +213,25 @@ func marshalSchemaJSON(props []reflectedProperty, required []string) []byte {
 	propsObj := make(map[string]any, len(props))
 	for _, p := range props {
 		m := map[string]any{}
+		// Always include type to align with EnumSchema definition.
+		m["type"] = p.Type
 		if len(p.EnumValues) > 0 {
 			m["enum"] = p.EnumValues
-		} else {
-			m["type"] = p.Type
+			if len(p.EnumNames) > 0 {
+				m["enumNames"] = p.EnumNames
+			}
+		}
+		if p.Title != "" {
+			m["title"] = p.Title
 		}
 		if p.Description != "" {
 			m["description"] = p.Description
+		}
+		if p.Format != "" {
+			m["format"] = p.Format
+		}
+		if p.BoolDefault != nil {
+			m["default"] = *p.BoolDefault
 		}
 		if c := p.Constraints; c.MinLength != nil {
 			m["minLength"] = *c.MinLength
@@ -264,6 +299,7 @@ func (b *boundReflectionDecoder) Decode(raw map[string]any, dst any) error {
 		requiredMissing[r] = struct{}{}
 	}
 
+	provided := make(map[string]struct{}, len(raw))
 	for k, v := range raw {
 		prop, ok := b.schema.propIndex[k]
 		if !ok {
@@ -271,6 +307,7 @@ func (b *boundReflectionDecoder) Decode(raw map[string]any, dst any) error {
 			continue
 		}
 		delete(requiredMissing, k)
+		provided[k] = struct{}{}
 
 		field := fresh.Field(prop.FieldIndex)
 		// Unwrap pointer field by allocating if necessary.
@@ -293,6 +330,23 @@ func (b *boundReflectionDecoder) Decode(raw map[string]any, dst any) error {
 		}
 		sort.Strings(keys)
 		return fmt.Errorf("elicitation: missing required fields: %s", strings.Join(keys, ","))
+	}
+
+	// Apply boolean defaults for optional (pointer) fields not provided.
+	for _, p := range b.schema.properties {
+		if p.Type == "boolean" && p.BoolDefault != nil {
+			if _, ok := provided[p.Name]; ok {
+				continue
+			}
+			if !p.IsPointer { // required non-pointer: skip (would have errored if missing)
+				continue
+			}
+			field := fresh.Field(p.FieldIndex)
+			if field.IsNil() {
+				field.Set(reflect.New(field.Type().Elem()))
+			}
+			field.Elem().SetBool(*p.BoolDefault)
+		}
 	}
 
 	// Success: copy fresh into target.
@@ -331,7 +385,7 @@ ENUMOK:
 			return fmt.Errorf("maxLength violation (%d)", *c.MaxLength)
 		}
 		dst.SetString(vs)
-	case "number":
+	case "number", "integer":
 		// JSON numbers decode as float64 by default.
 		f, ok := val.(float64)
 		if !ok {
@@ -373,7 +427,7 @@ func convertAssignNumber(dst reflect.Value, f float64) {
 	}
 }
 
-func parseJSONSchemaTag(tag string) (desc string, enumVals []string, c propertyConstraints) {
+func parseJSONSchemaTag(tag string) (title string, desc string, enumVals []string, enumNames []string, format string, boolDefault *bool, c propertyConstraints) {
 	if tag == "" {
 		return
 	}
@@ -389,11 +443,33 @@ func parseJSONSchemaTag(tag string) (desc string, enumVals []string, c propertyC
 			val = kv[1]
 		}
 		switch key {
+		case "title":
+			title = val
 		case "description":
 			desc = val
 		case "enum":
 			if val != "" {
 				enumVals = strings.Split(val, "|")
+			}
+		case "enumNames":
+			if val != "" {
+				enumNames = strings.Split(val, "|")
+			}
+		case "format":
+			// Accept only known formats; ignore invalid silently.
+			switch val {
+			case "email", "uri", "date", "date-time":
+				format = val
+			}
+		case "default":
+			// capture only if boolean; parse true/false
+			switch val {
+			case "true":
+				t := true
+				boolDefault = &t
+			case "false":
+				f := false
+				boolDefault = &f
 			}
 		case "minLength":
 			if iv, err := parseInt(val); err == nil {
