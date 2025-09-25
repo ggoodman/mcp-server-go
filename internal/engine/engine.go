@@ -383,16 +383,12 @@ func (e *Engine) handleResourcesSubscribe(ctx context.Context, sess *SessionHand
 	}
 	e.subMu.Unlock()
 
-	// Build emit closure: publishes notifications/resources/updated. With eventual
-	// consistency semantics, we do not fence delivery via shared tokens; we only
-	// check local subscription state to reduce local stragglers.
+	// Build emit closure: publishes notifications/resources/updated.
+	// We intentionally do not gate on local subscription bookkeeping to avoid
+	// races that could drop early updates emitted immediately after Subscribe
+	// returns but before subCancels is populated. Unsubscribe semantics are
+	// enforced by cancelling the provider's forwarder, which stops emissions.
 	emit := func(cbCtx context.Context, uri string) {
-		e.subMu.Lock()
-		_, still := e.subCancels[sess.SessionID()][uri]
-		e.subMu.Unlock()
-		if !still {
-			return
-		}
 		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesUpdatedNotificationMethod)}
 		// attach params
 		b, _ := json.Marshal(mcp.ResourceUpdatedNotification{URI: uri})
