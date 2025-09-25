@@ -6,6 +6,7 @@ Drop-in `http.Handler` for the Model Context Protocol (MCP) Streaming HTTP trans
 - First-class authorization and session lifecycle handling
 - Horizontal scale via a pluggable session host (memory or Redis)
 - Static and dynamic capabilities for tools and resources
+- Elicitation helpers: reflection-based and builder DSL for structured user input mid-flow
 
 ## Why this library
 
@@ -34,6 +35,7 @@ Drop-in `http.Handler` for the Model Context Protocol (MCP) Streaming HTTP trans
    - Layered API: start with the drop-in handler, grow into custom capabilities.
    - Pragmatic defaults; minimal opinions. Security and isolation are non-negotiable.
    - Designed around the hard cases first so simple cases stay simple.
+  - Progressive elicitation tooling: start with struct reflection, graduate to a fluent builder when you need dynamic or programmatic schemas.
 
 ## Install
 
@@ -65,7 +67,7 @@ import (
 
 type TranslateArgs struct {
     Text string `json:"text" jsonschema:"minLength=1,description=Text to translate"`
-    To   string `json:"to"   jsonschema:"enum=en,enum=fr,enum=es,description=Target language (ISO 639-1)"`
+    To   string `json:"to"   jsonschema:"enum=en|fr|es,description=Target language (ISO 639-1)"`
 }
 
 func main() {
@@ -301,10 +303,14 @@ resp, _ := sp.CreateMessage(ctx, req)
 
 ### Elicitation (reflective API)
 
-Elicitation lets the server request structured user input mid-flow. The
-`sessions.ElicitationCapability` turns a struct definition into a restricted
-schema (flat object; primitive properties) and decodes the response back into
-the same struct.
+Elicitation lets the server request structured user input mid-flow. Two authoring modes are provided:
+
+1. Reflection: pass a struct pointer and tags (`json` + `jsonschema`) are inspected to build a flat object schema.
+2. Builder DSL: construct a schema programmatically (useful when shape is not known at compile time) and optionally bind back into a struct.
+
+Supported primitives: `string`, `number`, `integer`, `boolean`, and string enums. No nesting (yet). Optional vs required is determined by pointer-ness (reflection) or `Optional()/Required()` (builder).
+
+Basic reflection example:
 
 ```go
 type LanguageChoice struct {
@@ -314,13 +320,39 @@ type LanguageChoice struct {
 el, ok := sess.GetElicitationCapability()
 if ok {
     var lc LanguageChoice
-    action, err := el.Elicit(ctx, &lc, sessions.WithMessage("Which language should I translate to?"))
-    if err != nil { /* handle transport/validation error */ }
+    dec, err := elicitation.BindStruct(&lc) // SchemaDecoder bound to &lc
+    if err != nil { /* handle */ }
+    action, err := el.Elicit(ctx, "Which language should I translate to?", dec, sessions.WithMessage("Which language should I translate to?"))
+    if err != nil { /* transport / validation error */ }
     if action == sessions.ElicitActionAccept {
-        // use lc.Language
+        // lc.Language populated
     }
 }
 ```
+
+Builder example with defaults and enum names:
+
+```go
+sch := elicitation.NewBuilder().
+    EnumString("tone", []string{"formal","casual"}, EnumNames("Formal","Casual"), Optional()).
+    String("audience", Optional(), Description("Intended audience"), MinLength(3), DefaultString("general")).
+    Boolean("proofread", Optional(), DefaultBool(true)).
+    MustBuild()
+
+var dst struct {
+    Tone *string
+    Audience *string
+    Proofread *bool
+}
+dec, _ := elicitation.NewBuilder(). // or reuse the builder above to BindStruct
+    EnumString("tone", []string{"formal","casual"}, EnumNames("Formal","Casual"), Optional()).
+    String("audience", Optional()).
+    Boolean("proofread", Optional()).
+    BindStruct(&dst)
+_ = dec.Decode(map[string]any{}, &dst) // applies defaults to optional pointers
+```
+
+Defaults (reflection & builder): optional-only properties may declare a single default (`default=...` tag or `Default*(...)` option). Supported for boolean, string, number, integer; validated against enum and constraints; applied only when the field is absent.
 
 Options:
 
@@ -342,10 +374,7 @@ Constraints (enforced server-side for now):
 3. Minimal API surface: helpers focus on reducing typos and repetition, not inventing new protocol concepts.
 4. Easy escape hatch: you can intermix manual and helper-constructed values freely.
 
-The earlier explicit request-building helper layer was removed in favor of the
-single reflective API above. If you need to hand-author a schema, you can still
-construct an `mcp.ElicitationSchema` directly and (in a future add-on) we may
-expose a low-level call, but the reflective path is the primary ergonomics story.
+The earlier one-off request-building layer was replaced by the reflection + builder pairing. Both produce canonical, fingerprinted schemas for stable client caching.
 
 ## Structured logging (concise)
 
