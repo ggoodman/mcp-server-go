@@ -50,8 +50,8 @@ func New() mcpservice.ServerCapabilities {
 		}, nil
 	}
 
-	// Wrap handler into StaticPrompts
-	sp := mcpservice.NewStaticPrompts(
+	// Wrap handler into PromptsContainer
+	sp := mcpservice.NewPromptsContainer(
 		mcpservice.StaticPrompt{Descriptor: greeting, Handler: func(_ context.Context, s sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
 			return greetingHandler(s, req)
 		}},
@@ -59,8 +59,6 @@ func New() mcpservice.ServerCapabilities {
 
 	return mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-prompts-static", Version: "0.1.0"}),
-		mcpservice.WithPromptsOptions(
-			mcpservice.WithStaticPromptsContainer(sp),
-		),
+		mcpservice.WithPromptsCapability(sp),
 	)
 }

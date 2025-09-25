@@ -324,12 +324,12 @@ func New(root string) mcpservice.ServerCapabilities {
 		mcpservice.WithToolDescription("Delete a file within the workspace."),
 	)
 
-	tools := mcpservice.NewStaticTools(readTool, writeTool, appendTool, moveTool, deleteTool)
+	tools := mcpservice.NewToolsContainer(readTool, writeTool, appendTool, moveTool, deleteTool)
 
 	return mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-workspace-fs", Version: "0.1.0", Title: "Workspace FS"}),
 		mcpservice.WithResourcesCapability(fsCap),
-		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
+		mcpservice.WithToolsCapability(tools),
 	)
 }
 

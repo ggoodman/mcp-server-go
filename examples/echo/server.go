@@ -27,7 +27,7 @@ func New() mcpservice.ServerCapabilities {
 		Message string `json:"message"`
 	}
 
-	tools := mcpservice.NewStaticTools(
+	tools := mcpservice.NewToolsContainer(
 		mcpservice.NewTool[EchoArgs](
 			"echo",
 			func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[EchoArgs]) error {
@@ -40,8 +40,6 @@ func New() mcpservice.ServerCapabilities {
 
 	return mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-echo", Version: "0.1.0"}),
-		mcpservice.WithToolsOptions(
-			mcpservice.WithStaticToolsContainer(tools),
-		),
+		mcpservice.WithToolsCapability(tools),
 	)
 }

@@ -88,11 +88,6 @@ func WithResourcesCapability(cap ResourcesCapability) ServerOption {
 	return func(s *server) { s.staticResourcesCap = cap }
 }
 
-// WithResourcesOptions constructs a static ResourcesCapability using NewResourcesCapability.
-func WithResourcesOptions(opts ...ResourcesOption) ServerOption {
-	return func(s *server) { s.staticResourcesCap = NewResourcesCapability(opts...) }
-}
-
 // WithResourcesProvider wires a per-session resources capability provider.
 func WithResourcesProvider(fn func(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error)) ServerOption {
 	return func(s *server) { s.resourcesProvider = fn }
@@ -103,11 +98,6 @@ func WithToolsCapability(cap ToolsCapability) ServerOption {
 	return func(s *server) { s.staticToolsCap = cap }
 }
 
-// WithToolsOptions constructs a static ToolsCapability using NewToolsCapability.
-func WithToolsOptions(opts ...ToolsOption) ServerOption {
-	return func(s *server) { s.staticToolsCap = NewToolsCapability(opts...) }
-}
-
 // WithToolsProvider wires a per-session tools capability provider.
 func WithToolsProvider(fn func(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error)) ServerOption {
 	return func(s *server) { s.toolsProvider = fn }
@@ -116,11 +106,6 @@ func WithToolsProvider(fn func(ctx context.Context, session sessions.Session) (T
 // WithPromptsCapability wires a static PromptsCapability (used for all sessions).
 func WithPromptsCapability(cap PromptsCapability) ServerOption {
 	return func(s *server) { s.staticPromptsCap = cap }
-}
-
-// WithPromptsOptions constructs a static PromptsCapability using NewPromptsCapability.
-func WithPromptsOptions(opts ...PromptsOption) ServerOption {
-	return func(s *server) { s.staticPromptsCap = NewPromptsCapability(opts...) }
 }
 
 // WithPromptsProvider wires a per-session prompts capability provider.

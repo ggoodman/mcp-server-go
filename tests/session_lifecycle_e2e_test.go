@@ -126,12 +126,11 @@ func TestSessionLifecycle_PostBoundToRequest_WriteFallback(t *testing.T) {
 
 	mh := memoryhost.New()
 	srvCaps := mcpservice.NewServer(
-		// Provide a trivial resources capability so we can make a small request
-		mcpservice.WithResourcesOptions(
-			mcpservice.WithListResources(func(ctx context.Context, s sessions.Session, c *string) (mcpservice.Page[mcp.Resource], error) {
+		mcpservice.WithResourcesCapability(mcpservice.NewDynamicResources(
+			mcpservice.WithResourcesListFunc(func(ctx context.Context, s sessions.Session, c *string) (mcpservice.Page[mcp.Resource], error) {
 				return mcpservice.NewPage([]mcp.Resource{}), nil
 			}),
-		),
+		)),
 	)
 
 	var handler http.Handler

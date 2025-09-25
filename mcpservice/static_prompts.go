@@ -19,31 +19,40 @@ type StaticPrompt struct {
 	Handler    PromptHandler
 }
 
-// StaticPrompts owns a mutable, threadsafe set of static prompt descriptors and handlers.
+// PromptsContainer owns a mutable, threadsafe set of prompt descriptors and handlers.
 // It allows simple servers to advertise a fixed (but updatable) set of prompts and
 // have the server dispatch get requests automatically.
 //
-// StaticPrompts also embeds a ChangeNotifier and implements ChangeSubscriber to
-// allow the prompts capability to automatically expose listChanged support when
-// a static container is used.
-type StaticPrompts struct {
+// PromptsContainer also embeds a ChangeNotifier and implements ChangeSubscriber to
+// automatically expose listChanged support.
+type PromptsContainer struct {
 	mu       sync.RWMutex
 	prompts  []mcp.Prompt
 	handlers map[string]PromptHandler // name -> handler
 
 	notifier ChangeNotifier
+	pageSize int // pagination size (default 50)
 }
 
-// NewStaticPrompts constructs a new StaticPrompts container with the given definitions.
-func NewStaticPrompts(defs ...StaticPrompt) *StaticPrompts {
-	sp := &StaticPrompts{}
+// NewPromptsContainer constructs a new PromptsContainer with the given definitions.
+func NewPromptsContainer(defs ...StaticPrompt) *PromptsContainer {
+	sp := &PromptsContainer{pageSize: 50}
 	// No parent context available here; Replace ignores ctx, so Background is fine.
 	sp.Replace(context.Background(), defs...)
 	return sp
 }
 
+// SetPageSize sets the pagination size for ListPrompts.
+func (sp *PromptsContainer) SetPageSize(n int) {
+	if n > 0 {
+		sp.mu.Lock()
+		sp.pageSize = n
+		sp.mu.Unlock()
+	}
+}
+
 // Snapshot returns a copy of the current prompt descriptors.
-func (sp *StaticPrompts) Snapshot() []mcp.Prompt {
+func (sp *PromptsContainer) Snapshot() []mcp.Prompt {
 	sp.mu.RLock()
 	defer sp.mu.RUnlock()
 	out := make([]mcp.Prompt, len(sp.prompts))
@@ -52,7 +61,7 @@ func (sp *StaticPrompts) Snapshot() []mcp.Prompt {
 }
 
 // Replace atomically replaces the entire prompt set.
-func (sp *StaticPrompts) Replace(_ context.Context, defs ...StaticPrompt) {
+func (sp *PromptsContainer) Replace(_ context.Context, defs ...StaticPrompt) {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	sp.prompts = sp.prompts[:0]
@@ -72,7 +81,7 @@ func (sp *StaticPrompts) Replace(_ context.Context, defs ...StaticPrompt) {
 
 // Add registers a new prompt if it doesn't duplicate an existing name.
 // Returns true if added.
-func (sp *StaticPrompts) Add(_ context.Context, def StaticPrompt) bool {
+func (sp *PromptsContainer) Add(_ context.Context, def StaticPrompt) bool {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	if sp.handlers == nil {
@@ -99,7 +108,7 @@ func (sp *StaticPrompts) Add(_ context.Context, def StaticPrompt) bool {
 }
 
 // Remove removes a prompt by name. Returns true if removed.
-func (sp *StaticPrompts) Remove(_ context.Context, name string) bool {
+func (sp *PromptsContainer) Remove(_ context.Context, name string) bool {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	n := 0
@@ -121,7 +130,7 @@ func (sp *StaticPrompts) Remove(_ context.Context, name string) bool {
 }
 
 // Get dispatches a prompt get to the named handler if present.
-func (sp *StaticPrompts) Get(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
+func (sp *PromptsContainer) Get(ctx context.Context, session sessions.Session, req *mcp.GetPromptRequestReceived) (*mcp.GetPromptResult, error) {
 	if req == nil || req.Name == "" {
 		return nil, fmt.Errorf("invalid prompt request: missing name")
 	}
@@ -136,7 +145,7 @@ func (sp *StaticPrompts) Get(ctx context.Context, session sessions.Session, req 
 
 // Subscriber implements ChangeSubscriber by returning a per-subscriber channel
 // that receives a signal whenever the prompt set changes.
-func (sp *StaticPrompts) Subscriber() <-chan struct{} { return sp.notifier.Subscriber() }
+func (sp *PromptsContainer) Subscriber() <-chan struct{} { return sp.notifier.Subscriber() }
 
 // JSON helper for building prompt messages easily
 func JSONMessages(msgs []mcp.PromptMessage) json.RawMessage {

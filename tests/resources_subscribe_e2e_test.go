@@ -31,15 +31,13 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	defer cancel()
 
 	// Static container with a single resource; updates come from ReplaceAllContents.
-	static := mcpservice.NewStaticResources(
+	static := mcpservice.NewResourcesContainer(
 		[]mcp.Resource{{URI: "res://x", Name: "x"}},
 		nil,
 		map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v1"}}},
 	)
 	srvCaps := mcpservice.NewServer(
-		mcpservice.WithResourcesOptions(
-			mcpservice.WithStaticResourceContainer(static),
-		),
+		mcpservice.WithResourcesCapability(static),
 	)
 
 	var handler http.Handler

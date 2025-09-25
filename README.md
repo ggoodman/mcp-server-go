@@ -91,12 +91,12 @@ func main() {
         },
         mcpservice.WithToolDescription("Translate text to a target language."),
     )
-    tools := mcpservice.NewStaticTools(translate)
+    tools := mcpservice.NewToolsContainer(translate)
 
     // 3) Server capabilities
     server := mcpservice.NewServer(
         mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
-        mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
+        mcpservice.WithToolsCapability(tools),
     )
 
     // 4) OAuth2/OIDC JWT access token validation (RFC 9068)
@@ -192,42 +192,37 @@ Prefer dynamic? Implement per-session providers and callbacks:
 
 ```go
 server := mcpservice.NewServer(
-    // Dynamic tools
-    mcpservice.WithToolsOptions(
-        mcpservice.WithListTools(func(ctx context.Context, s sessions.Session, cur *string) (mcpservice.Page[mcp.Tool], error) {
-            // e.g., query DB
+    // Dynamic tools (function-backed)
+    mcpservice.WithToolsCapability(mcpservice.NewDynamicTools(
+        mcpservice.WithToolsListFn(func(ctx context.Context, s sessions.Session, cur *string) (mcpservice.Page[mcp.Tool], error) {
             return mcpservice.NewPage([]mcp.Tool{{Name: "dbTool", InputSchema: mcp.ToolInputSchema{Type: "object"}}}), nil
         }),
-        mcpservice.WithCallTool(func(ctx context.Context, s sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
-            // route to your backend services
+        mcpservice.WithToolsCallFn(func(ctx context.Context, s sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
             return mcpservice.TextResult("ok"), nil
         }),
-    ),
+    )),
     // Dynamic resources
-    mcpservice.WithResourcesOptions(
-        mcpservice.WithListResources(func(ctx context.Context, s sessions.Session, cur *string) (mcpservice.Page[mcp.Resource], error) {
+    mcpservice.WithResourcesCapability(mcpservice.NewDynamicResources(
+        mcpservice.WithResourcesListFunc(func(ctx context.Context, s sessions.Session, cur *string) (mcpservice.Page[mcp.Resource], error) {
             return mcpservice.NewPage([]mcp.Resource{{URI: "res://1", Name: "R1"}}), nil
         }),
-        mcpservice.WithReadResource(func(ctx context.Context, s sessions.Session, uri string) ([]mcp.ResourceContents, error) {
+        mcpservice.WithResourcesReadFunc(func(ctx context.Context, s sessions.Session, uri string) ([]mcp.ResourceContents, error) {
             return []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "hello"}}, nil
         }),
-    ),
+    )),
 )
 ```
 
 Prefer static? Use the containers and still get listChanged and subscriptions:
 
 ```go
-sr := mcpservice.NewStaticResources(nil, nil, nil)
-rc := mcpservice.NewResourcesCapability(
-    mcpservice.WithStaticResourceContainer(sr),
-)
+sr := mcpservice.NewResourcesContainer(nil, nil, nil)
 
 type HelloArgs struct {
     Name string `json:"name"`
 }
 
-st := mcpservice.NewStaticTools(
+st := mcpservice.NewToolsContainer(
     mcpservice.NewTool[HelloArgs](
         "hello",
         func(ctx context.Context, _ sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[HelloArgs]) error {
@@ -237,8 +232,8 @@ st := mcpservice.NewStaticTools(
     ),
 )
 server := mcpservice.NewServer(
-    mcpservice.WithResourcesCapability(rc),
-    mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(st)),
+    mcpservice.WithResourcesCapability(sr),
+    mcpservice.WithToolsCapability(st),
 )
 ```
 

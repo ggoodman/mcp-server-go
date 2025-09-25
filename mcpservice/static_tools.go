@@ -286,30 +286,42 @@ func toMCPProperty(s *jsonschema.Schema) mcp.SchemaProperty {
 	return p
 }
 
-// StaticTools owns a mutable, threadsafe set of static tool descriptors and handlers.
-// It is intended for simple servers that want to advertise a fixed (but
-// updatable) set of tools and have the server dispatch calls automatically.
+// ToolsContainer owns a mutable, threadsafe set of tool descriptors and handlers.
+// It is intended for simple servers that want to advertise a collection of
+// tools and have the server dispatch calls automatically.
 //
-// StaticTools also embeds a ChangeNotifier and implements ChangeSubscriber to
-// allow the tools capability to automatically expose listChanged support when
-// a static container is used.
-type StaticTools struct {
+// ToolsContainer also embeds a ChangeNotifier and implements ChangeSubscriber to
+// allow the tools capability to automatically expose listChanged support.
+type ToolsContainer struct {
 	mu       sync.RWMutex
 	tools    []mcp.Tool             // descriptors for listing
 	handlers map[string]ToolHandler // name -> handler
 
 	notifier ChangeNotifier
+
+	pageSize int // pagination size for ListTools (default 50)
 }
 
-// NewStaticTools constructs a new StaticTools container with the given tool definitions.
-func NewStaticTools(defs ...StaticTool) *StaticTools {
-	st := &StaticTools{}
+// NewToolsContainer constructs a new ToolsContainer with the given tool definitions.
+func NewToolsContainer(defs ...StaticTool) *ToolsContainer {
+	st := &ToolsContainer{pageSize: 50}
 	st.Replace(context.Background(), defs...)
 	return st
 }
 
+// SetPageSize sets the pagination size used by ListTools for static tools.
+// A non-positive value is ignored.
+func (st *ToolsContainer) SetPageSize(n int) {
+	if n <= 0 {
+		return
+	}
+	st.mu.Lock()
+	st.pageSize = n
+	st.mu.Unlock()
+}
+
 // Snapshot returns a copy of the current tool descriptors.
-func (st *StaticTools) Snapshot() []mcp.Tool {
+func (st *ToolsContainer) Snapshot() []mcp.Tool {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 	out := make([]mcp.Tool, len(st.tools))
@@ -318,7 +330,7 @@ func (st *StaticTools) Snapshot() []mcp.Tool {
 }
 
 // Replace atomically replaces the entire tool set.
-func (st *StaticTools) Replace(_ context.Context, defs ...StaticTool) {
+func (st *ToolsContainer) Replace(_ context.Context, defs ...StaticTool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.tools = st.tools[:0]
@@ -339,7 +351,7 @@ func (st *StaticTools) Replace(_ context.Context, defs ...StaticTool) {
 
 // Add registers a new tool if it doesn't duplicate an existing name.
 // Returns true if added.
-func (st *StaticTools) Add(_ context.Context, def StaticTool) bool {
+func (st *ToolsContainer) Add(_ context.Context, def StaticTool) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.handlers == nil {
@@ -365,7 +377,7 @@ func (st *StaticTools) Add(_ context.Context, def StaticTool) bool {
 }
 
 // Remove removes a tool by name. Returns true if removed.
-func (st *StaticTools) Remove(_ context.Context, name string) bool {
+func (st *ToolsContainer) Remove(_ context.Context, name string) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	n := 0
@@ -388,7 +400,7 @@ func (st *StaticTools) Remove(_ context.Context, name string) bool {
 }
 
 // Call dispatches a request to the named tool if present.
-func (st *StaticTools) Call(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+func (st *ToolsContainer) Call(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
 	if req == nil || req.Name == "" {
 		return nil, fmt.Errorf("invalid tool request: missing name")
 	}
@@ -403,8 +415,45 @@ func (st *StaticTools) Call(ctx context.Context, session sessions.Session, req *
 
 // Subscriber implements ChangeSubscriber by returning a per-subscriber channel
 // that receives a signal whenever the tool set changes.
-func (st *StaticTools) Subscriber() <-chan struct{} {
+func (st *ToolsContainer) Subscriber() <-chan struct{} {
 	return st.notifier.Subscriber()
+}
+
+// --- ToolsCapability implementation ---
+
+// ListTools implements ToolsCapability (static mode with internal pagination).
+func (st *ToolsContainer) ListTools(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Tool], error) {
+	st.mu.RLock()
+	all := make([]mcp.Tool, len(st.tools))
+	copy(all, st.tools)
+	pageSize := st.pageSize
+	st.mu.RUnlock()
+
+	start := parseCursor(cursor)
+	if start < 0 || start > len(all) {
+		start = 0
+	}
+	end := start + pageSize
+	if end > len(all) {
+		end = len(all)
+	}
+	items := make([]mcp.Tool, end-start)
+	copy(items, all[start:end])
+	if end < len(all) {
+		next := fmt.Sprintf("%d", end)
+		return NewPage(items, WithNextCursor[mcp.Tool](next)), nil
+	}
+	return NewPage(items), nil
+}
+
+// CallTool implements ToolsCapability for static tools (delegates to Call).
+func (st *ToolsContainer) CallTool(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
+	return st.Call(ctx, session, req)
+}
+
+// GetListChangedCapability always returns support for listChanged in static mode.
+func (st *ToolsContainer) GetListChangedCapability(ctx context.Context, session sessions.Session) (ToolListChangedCapability, bool, error) {
+	return toolsListChangedFromSubscriber{sub: st}, true, nil
 }
 
 // TextResult is a small helper to build a text CallToolResult.

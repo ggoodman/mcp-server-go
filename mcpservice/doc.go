@@ -6,7 +6,7 @@
 // Quick start (static):
 //
 //	notifier := &mcpserver.ChangeNotifier{}
-//	staticRes := mcpserver.NewStaticResources(
+//	staticRes := mcpserver.NewResourcesContainer(
 //	    []mcp.Resource{{URI: "res://hello.txt", Name: "hello.txt"}},
 //	    nil,
 //	    map[string][]mcp.ResourceContents{
@@ -14,7 +14,7 @@
 //	    },
 //	)
 //	type EchoArgs struct { Message string `json:"message"` }
-//	staticTools := mcpserver.NewStaticTools(
+//	staticTools := mcpserver.NewToolsContainer(
 //	    mcpserver.TypedTool[EchoArgs](
 //	        mcp.Tool{
 //	            Name:        "echo",
@@ -35,13 +35,8 @@
 //
 //	srv := mcpserver.NewServer(
 //	    mcpserver.WithServerInfo(mcp.ImplementationInfo{Name: "example", Version: "1.0.0"}),
-//	    mcpserver.WithResourcesOptions(
-//	        mcpserver.WithStaticResourceContainer(staticRes),
-//	        mcpserver.WithChangeNotification(notifier),
-//	    ),
-//	    mcpserver.WithToolsOptions(
-//	        mcpserver.WithStaticToolsContainer(staticTools),
-//	    ),
+//	    mcpserver.WithResourcesCapability(staticRes),
+//	    mcpserver.WithToolsCapability(staticTools),
 //	)
 //
 // Dynamic per-session capabilities:
@@ -49,8 +44,8 @@
 //	srv := mcpserver.NewServer(
 //	    mcpserver.WithResourcesProvider(func(ctx context.Context, s sessions.Session) (mcpserver.ResourcesCapability, bool, error) {
 //	        if s.UserID() == "guest" { return nil, false, nil }
-//	        return mcpserver.NewResourcesCapability(
-//	            mcpserver.WithListResources(func(ctx context.Context, _ sessions.Session, c *string) (mcpserver.Page[mcp.Resource], error) {
+//	        return mcpserver.NewDynamicResources(
+//	            mcpserver.WithResourcesListFunc(func(ctx context.Context, _ sessions.Session, c *string) (mcpserver.Page[mcp.Resource], error) {
 //	                return mcpserver.NewPage([]mcp.Resource{{URI: "res://user/"+s.UserID()+"/profile"}}), nil
 //	            }),
 //	        ), true, nil

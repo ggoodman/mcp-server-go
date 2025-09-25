@@ -74,11 +74,11 @@ func NewExampleServer() mcpservice.ServerCapabilities {
 		mcpservice.WithToolDescription("Translate text to a target language."),
 	)
 
-	tools := mcpservice.NewStaticTools(translate)
+	tools := mcpservice.NewToolsContainer(translate)
 
 	server := mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
-		mcpservice.WithToolsOptions(mcpservice.WithStaticToolsContainer(tools)),
+		mcpservice.WithToolsCapability(tools),
 	)
 
 	return server

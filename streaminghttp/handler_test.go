@@ -44,9 +44,7 @@ func TestSingleInstance(t *testing.T) {
 	t.Run("Initialize returns session and capabilities", func(t *testing.T) {
 		// Explicit minimal server with empty static tools
 		server := mcpservice.NewServer(
-			mcpservice.WithToolsOptions(
-				mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
-			),
+			mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 		)
 		srv := mustServer(t, server)
 		defer srv.Close()
@@ -99,11 +97,11 @@ func TestSingleInstance(t *testing.T) {
 
 	t.Run("Resources templates list over POST", func(t *testing.T) {
 		server := mcpservice.NewServer(
-			mcpservice.WithResourcesOptions(
-				mcpservice.WithListResourceTemplates(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+			mcpservice.WithResourcesCapability(NewDynamicResources(
+				WithResourcesListTemplatesFunc(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
 					return mcpservice.NewPage([]mcp.ResourceTemplate{{URITemplate: "file://{path}", Name: "file"}}), nil
 				}),
-			),
+			)),
 		)
 		srv := mustServer(t, server)
 		defer srv.Close()
@@ -158,9 +156,7 @@ func TestSingleInstance(t *testing.T) {
 
 	t.Run("Tools list over POST is empty", func(t *testing.T) {
 		server := mcpservice.NewServer(
-			mcpservice.WithToolsOptions(
-				mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
-			),
+			mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 		)
 		srv := mustServer(t, server)
 		defer srv.Close()
@@ -212,9 +208,7 @@ func TestSingleInstance(t *testing.T) {
 	t.Run("Basic auth with invalid token", func(t *testing.T) {
 		auth := &noAuth{wantToken: "want-token"}
 		server := mcpservice.NewServer(
-			mcpservice.WithToolsOptions(
-				mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
-			),
+			mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 		)
 		srv := mustServer(t, server, withAuth(auth))
 		defer srv.Close()
@@ -373,14 +367,12 @@ func TestMultiInstance(t *testing.T) {
 		sharedHost := memoryhost.New()
 
 		// Shared static resources container across handler instances
-		sharedSR := mcpservice.NewStaticResources(nil, nil, nil)
+		sharedSR := mcpservice.NewResourcesContainer(nil, nil, nil)
 
 		// Distinct server instances per handler: share the static resources container
 		mcpFactory := func() mcpservice.ServerCapabilities {
 			return mcpservice.NewServer(
-				mcpservice.WithResourcesOptions(
-					mcpservice.WithStaticResourceContainer(sharedSR),
-				),
+				mcpservice.WithResourcesCapability(sharedSR),
 			)
 		}
 
@@ -440,14 +432,12 @@ func TestMultiInstance(t *testing.T) {
 		sharedHost := memoryhost.New()
 
 		// Shared static tools container across instances
-		sharedTools := mcpservice.NewStaticTools()
+		sharedTools := mcpservice.NewToolsContainer()
 
 		// Distinct server instances per handler: share tools container
 		mcpFactory := func() mcpservice.ServerCapabilities {
 			return mcpservice.NewServer(
-				mcpservice.WithToolsOptions(
-					mcpservice.WithStaticToolsContainer(sharedTools),
-				),
+				mcpservice.WithToolsCapability(sharedTools),
 			)
 		}
 
@@ -503,12 +493,10 @@ func TestMultiInstance(t *testing.T) {
 
 	t.Run("Prompts list_changed notification delivered when GET and POST hit different instances", func(t *testing.T) {
 		sharedHost := memoryhost.New()
-		sharedPrompts := mcpservice.NewStaticPrompts()
+		sharedPrompts := mcpservice.NewPromptsContainer()
 		mcpFactory := func() mcpservice.ServerCapabilities {
 			return mcpservice.NewServer(
-				mcpservice.WithPromptsOptions(
-					mcpservice.WithStaticPromptsContainer(sharedPrompts),
-				),
+				mcpservice.WithPromptsCapability(sharedPrompts),
 			)
 		}
 		router := func(r *http.Request, handlerCount int) int {
@@ -1217,9 +1205,7 @@ var (
 
 func TestAuthorizationServerMetadataMirror_ManualMode(t *testing.T) {
 	server := mcpservice.NewServer(
-		mcpservice.WithToolsOptions(
-			mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
-		),
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 	)
 	// Use explicit values so we can assert
 	issuer := "http://127.0.0.1:0"
@@ -1259,9 +1245,7 @@ func TestAuthorizationServerMetadataMirror_ManualMode(t *testing.T) {
 
 func TestAuthorizationServerMetadataMirror_CORS(t *testing.T) {
 	server := mcpservice.NewServer(
-		mcpservice.WithToolsOptions(
-			mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
-		),
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 	)
 	srv := mustServer(t, server)
 	defer srv.Close()
@@ -1303,9 +1287,7 @@ func TestAuthorizationServerMetadataMirror_CORS(t *testing.T) {
 
 func TestProtectedResourceMetadata_CORS(t *testing.T) {
 	server := mcpservice.NewServer(
-		mcpservice.WithToolsOptions(
-			mcpservice.WithStaticToolsContainer(mcpservice.NewStaticTools()),
-		),
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 	)
 	srv := mustServer(t, server)
 	defer srv.Close()

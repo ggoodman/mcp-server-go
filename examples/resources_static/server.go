@@ -17,12 +17,10 @@ func New() mcpservice.ServerCapabilities {
 		"res://readme.md": {{URI: "res://readme.md", MimeType: "text/markdown", Text: "# Readme\nThis is a test."}},
 	}
 
-	static := mcpservice.NewStaticResources(res, nil, contents)
+	static := mcpservice.NewResourcesContainer(res, nil, contents)
 
 	return mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-resources-static", Version: "0.1.0"}),
-		mcpservice.WithResourcesOptions(
-			mcpservice.WithStaticResourceContainer(static),
-		),
+		mcpservice.WithResourcesCapability(static),
 	)
 }
