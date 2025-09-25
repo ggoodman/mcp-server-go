@@ -34,7 +34,7 @@ jobs:
       - name: Run unit tests
         run: |
           set -euo pipefail
-          go test ./... -v -count=1 -race -coverprofile=coverage.out -covermode=atomic
+          go test ./... -v -count=1 -race -coverprofile=coverage.out -covermode=atomic -timeout=3m
 
       - name: Upload coverage artifact
         if: always()
