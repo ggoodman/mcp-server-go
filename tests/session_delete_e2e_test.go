@@ -118,8 +118,8 @@ func TestDeleteSession_ClosesStreamsAndRevokes(t *testing.T) {
 	select {
 	case <-scanDone:
 		// ok
-	case <-time.After(2 * time.Second):
-		t.Fatalf("GET stream did not close after delete")
+	case <-t.Context().Done():
+		t.Fatalf("context done waiting for GET stream to close after delete: %v", t.Context().Err())
 	}
 
 	// Subsequent POST with same session should now fail with 404

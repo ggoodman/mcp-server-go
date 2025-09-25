@@ -112,8 +112,8 @@ func TestSessionLifecycle_GetStreamBoundToRequest(t *testing.T) {
 	select {
 	case <-done:
 		// ok closed
-	case <-time.After(2 * time.Second):
-		t.Fatalf("GET stream did not close after request cancel")
+	case <-t.Context().Done():
+		t.Fatalf("context done waiting for GET stream close after request cancel: %v", t.Context().Err())
 	}
 }
 
@@ -206,7 +206,7 @@ func TestSessionLifecycle_PostBoundToRequest_WriteFallback(t *testing.T) {
 	select {
 	case <-done:
 		// success: handler returned promptly; underlying fallbacks handled any pending writes
-	case <-time.After(2 * time.Second):
-		t.Fatalf("POST did not finish promptly after cancel")
+	case <-t.Context().Done():
+		t.Fatalf("context done waiting for POST to finish after cancel: %v", t.Context().Err())
 	}
 }

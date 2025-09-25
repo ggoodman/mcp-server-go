@@ -120,8 +120,8 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	case e := <-errCh:
 		t.Fatalf("get: %v", e)
 	case getResp = <-respCh:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timeout waiting for GET response headers")
+	case <-t.Context().Done():
+		t.Fatalf("context done waiting for GET response headers: %v", t.Context().Err())
 	}
 	if getResp.StatusCode != http.StatusOK {
 		t.Fatalf("get status: %d", getResp.StatusCode)
@@ -131,12 +131,11 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	defer getResp.Body.Close()
 	scanner := bufio.NewScanner(getResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
+	ctxDeadline := t.Context()
 	for {
 		select {
-		case <-deadline.C:
-			t.Fatalf("timed out waiting for list_changed notification")
+		case <-ctxDeadline.Done():
+			t.Fatalf("context done waiting for list_changed notification: %v", ctxDeadline.Err())
 		default:
 		}
 		if !scanner.Scan() {

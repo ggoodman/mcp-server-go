@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
@@ -439,8 +438,8 @@ func TestMultiInstance(t *testing.T) {
 			if msg.Method != string(mcp.ResourcesListChangedNotificationMethod) {
 				t.Fatalf("unexpected method: want %q got %q", mcp.ResourcesListChangedNotificationMethod, msg.Method)
 			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("timed out waiting for list_changed notification")
+		case <-t.Context().Done():
+			t.Fatalf("context done: %v", t.Context().Err())
 		}
 	})
 
@@ -515,8 +514,8 @@ func TestMultiInstance(t *testing.T) {
 			if msg.Method != string(mcp.ToolsListChangedNotificationMethod) {
 				t.Fatalf("unexpected method: want %q got %q", mcp.ToolsListChangedNotificationMethod, msg.Method)
 			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("timed out waiting for tools list_changed notification")
+		case <-t.Context().Done():
+			t.Fatalf("context done: %v", t.Context().Err())
 		}
 	})
 
@@ -580,8 +579,8 @@ func TestMultiInstance(t *testing.T) {
 			if msg.Method != string(mcp.PromptsListChangedNotificationMethod) {
 				t.Fatalf("unexpected method: want %q got %q", mcp.PromptsListChangedNotificationMethod, msg.Method)
 			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("timed out waiting for prompts list_changed notification")
+		case <-t.Context().Done():
+			t.Fatalf("context done: %v", t.Context().Err())
 		}
 	})
 

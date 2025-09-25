@@ -485,8 +485,8 @@ func TestCancellation_ToolsCall(t *testing.T) {
 
 	select {
 	case <-cancelled:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("tool context was not cancelled")
+	case <-t.Context().Done():
+		t.Fatalf("tool context was not cancelled: %v", t.Context().Err())
 	}
 
 	res, err := th.expectResponse(time.Second)
