@@ -207,5 +207,4 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 
 	// Close stream and finish; subsequent updates may be observed briefly under eventual semantics.
 	getResp.Body.Close()
-	return
 }
