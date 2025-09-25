@@ -4,9 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"reflect"
 
-	"github.com/ggoodman/mcp-server-go/internal/elicitation"
+	pubelicit "github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -25,12 +24,11 @@ type elicitationCapability struct {
 }
 
 // Elicit implements sessions.ElicitationCapability.
-func (c *elicitationCapability) Elicit(ctx context.Context, text string, target any, opts ...sessions.ElicitOption) (sessions.ElicitAction, error) {
-	// Derive schema from target type and retain cached projection for decoding
-	t := reflect.TypeOf(target)
-	schema, cp, err := elicitation.ProjectSchema(t)
+func (c *elicitationCapability) Elicit(ctx context.Context, text string, decoder pubelicit.SchemaDecoder, opts ...sessions.ElicitOption) (sessions.ElicitAction, error) {
+	// Obtain schema (cached or constructed lazily by implementation)
+	sch, err := decoder.Schema()
 	if err != nil {
-		c.log.Error("elicitation.project.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.Error("elicitation.schema.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 
@@ -44,7 +42,18 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, target 
 
 	// Build client request
 	reqID := uuid.NewString()
-	params, err := json.Marshal(mcp.ElicitRequest{Message: text, RequestedSchema: *schema})
+	// Marshal schema JSON once
+	jsonBytes, err := sch.MarshalJSON()
+	if err != nil {
+		c.log.Error("elicitation.schema.marshal.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		return sessions.ElicitActionCancel, ErrInternal
+	}
+	var wireSchema mcp.ElicitationSchema
+	if err := json.Unmarshal(jsonBytes, &wireSchema); err != nil { // should not fail; defensive
+		c.log.Error("elicitation.schema.unmarshal.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		return sessions.ElicitActionCancel, ErrInternal
+	}
+	params, err := json.Marshal(mcp.ElicitRequest{Message: text, RequestedSchema: wireSchema})
 	if err != nil {
 		c.log.Error("elicitation.create.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
@@ -116,9 +125,9 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, target 
 			*cfg.RawDst = m
 		}
 
-		// Only decode into target on accept
+		// Only decode when accepted
 		if action == sessions.ElicitActionAccept {
-			if err := elicitation.DecodeForTyped(cp, target, er.Content, cfg.Strict); err != nil {
+			if err := decoder.Decode(er.Content, nil); err != nil { // nil => use bound destination if implementation supports it
 				c.log.Error("elicitation.create.decode.fail", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
 				return sessions.ElicitActionCancel, ErrInternal
 			}

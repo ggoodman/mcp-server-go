@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
@@ -40,18 +41,22 @@ func NewExampleServer() mcpservice.ServerCapabilities {
 				return fail(w, "Sampling capability not available in this session.")
 			}
 
-			var elicitation struct {
+			var elic struct {
 				Language string `json:"language" jsonschema:"minLength=1,description=Target language for translation (e.g. French, Spanish)"`
 			}
+			dec, derr := elicitation.BindStruct(&elic)
+			if derr != nil {
+				return fail(w, "Elicitation bind error: "+derr.Error())
+			}
 
-			action, err := el.Elicit(ctx, "Which language should I translate to?", &elicitation)
+			action, err := el.Elicit(ctx, "Which language should I translate to?", dec)
 			if err != nil {
 				return fail(w, "Elicitation error: "+err.Error())
 			}
 			if action != sessions.ElicitActionAccept {
 				return fail(w, "Elicitation not accepted.")
 			}
-			lang := elicitation.Language
+			lang := elic.Language
 			if lang == "" {
 				return fail(w, "Elicitation did not return a valid language.")
 			}
