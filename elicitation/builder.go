@@ -1,13 +1,12 @@
 package elicitation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 )
@@ -42,15 +41,17 @@ type Builder struct {
 
 type bProperty struct {
 	name        string
-	ptype       string // string|number|boolean or enum(string)
+	ptype       string // string|number|integer|boolean
 	required    bool
 	description string
 	enumVals    []string
 	enumNames   []string
 	constraints propertyConstraints
 	title       string
-	format      string // for strings only: email|uri|date|date-time
-	boolDefault *bool  // only for boolean
+	format      string
+	boolDefault *bool
+	strDefault  *string
+	numDefault  *float64
 }
 
 // NewBuilder returns a new Builder instance.
@@ -149,9 +150,76 @@ func EnumNames(names ...string) PropOption {
 // DefaultBool sets default for a boolean property.
 func DefaultBool(v bool) PropOption {
 	return func(p *bProperty) {
-		if p.ptype == "boolean" {
-			p.boolDefault = &v
+		if p.ptype != "boolean" {
+			return
 		}
+		if p.required {
+			panic("elicitation: default specified on required boolean property")
+		}
+		if p.strDefault != nil || p.numDefault != nil || p.boolDefault != nil {
+			panic("elicitation: multiple defaults on property")
+		}
+		p.boolDefault = &v
+	}
+}
+
+// DefaultString sets default for a string property (optional only; panics if required or already has a default).
+func DefaultString(v string) PropOption {
+	return func(p *bProperty) {
+		if p.ptype != "string" {
+			return
+		}
+		if p.required {
+			panic("elicitation: default specified on required string property")
+		}
+		if p.strDefault != nil || p.numDefault != nil || p.boolDefault != nil {
+			panic("elicitation: multiple defaults on property")
+		}
+		// enum + constraints validation deferred until Build so constraints set first? Here constraints may already be present; safe to validate now.
+		if len(p.enumVals) > 0 {
+			ok := false
+			for _, ev := range p.enumVals {
+				if ev == v {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				panic("elicitation: default string not in enum")
+			}
+		}
+		if c := p.constraints; c.MinLength != nil && len(v) < *c.MinLength {
+			panic("elicitation: default violates minLength")
+		}
+		if c := p.constraints; c.MaxLength != nil && len(v) > *c.MaxLength {
+			panic("elicitation: default violates maxLength")
+		}
+		p.strDefault = &v
+	}
+}
+
+// DefaultNumber sets default for a numeric (number or integer) property (optional only; panics if required or invalid).
+func DefaultNumber(v float64) PropOption {
+	return func(p *bProperty) {
+		if p.ptype != "number" && p.ptype != "integer" {
+			return
+		}
+		if p.required {
+			panic("elicitation: default specified on required number property")
+		}
+		if p.strDefault != nil || p.numDefault != nil || p.boolDefault != nil {
+			panic("elicitation: multiple defaults on property")
+		}
+		if p.ptype == "integer" && v != float64(int64(v)) {
+			panic("elicitation: non-integer default for integer property")
+		}
+		if c := p.constraints; c.Minimum != nil && v < *c.Minimum {
+			panic("elicitation: default below minimum")
+		}
+		if c := p.constraints; c.Maximum != nil && v > *c.Maximum {
+			panic("elicitation: default above maximum")
+		}
+		p.numDefault = &v
 	}
 }
 
@@ -175,9 +243,8 @@ func (b *Builder) Build() (Schema, error) {
 		return nil, errors.New("elicitation: builder reused after Build")
 	}
 	// Empty object schema is legal; nothing special required.
-	// Validate, normalize ordering
+	// Preserve insertion order (declaration order in builder usage)
 	names := append([]string(nil), b.order...)
-	sort.Strings(names)
 	var required []string
 	propsObj := make(map[string]any, len(names))
 	for _, name := range names {
@@ -206,6 +273,13 @@ func (b *Builder) Build() (Schema, error) {
 		if p.format != "" {
 			m["format"] = p.format
 		}
+		// single default emission selection
+		if p.strDefault != nil {
+			m["default"] = *p.strDefault
+		}
+		if p.numDefault != nil {
+			m["default"] = *p.numDefault
+		}
 		if p.boolDefault != nil {
 			m["default"] = *p.boolDefault
 		}
@@ -226,11 +300,7 @@ func (b *Builder) Build() (Schema, error) {
 			required = append(required, name)
 		}
 	}
-	root := map[string]any{"type": "object", "properties": propsObj}
-	if len(required) > 0 {
-		root["required"] = required
-	}
-	jsonBytes, _ := json.Marshal(root) // TODO: canonical encoder
+	jsonBytes := marshalBuilderCanonical(names, propsObj, required)
 	ds := &dynamicSchema{jsonBytes: jsonBytes}
 	ds.fingerprint = fingerprintBytes(jsonBytes)
 	// Retain metadata for decoding path
@@ -433,27 +503,61 @@ func (d *dynamicStructDecoder) Decode(raw map[string]any, dst any) error {
 			field = field.Elem()
 		}
 		assignStructPrimitive(field, val, prop.ptype)
+		provided[name] = struct{}{}
 	}
 
-	// Apply boolean defaults for mapped optional pointer fields not provided
+	// Apply defaults for optional pointer fields (string/number/integer/boolean) when absent
 	for name, prop := range d.schema.props {
-		if prop.ptype == "boolean" && prop.boolDefault != nil {
-			if _, ok := provided[name]; ok {
-				continue
-			}
-			fb, mapped := d.bindings[name]
-			if !mapped {
-				continue
-			}
-			field := fresh.Field(fb.index)
-			if fb.isPtr {
-				if field.IsNil() {
-					field.Set(reflect.New(field.Type().Elem()))
+		if _, ok := provided[name]; ok {
+			continue
+		}
+		fb, mapped := d.bindings[name]
+		if !mapped || !fb.isPtr {
+			continue
+		}
+		var haveDefault bool
+		var v any
+		if prop.boolDefault != nil {
+			haveDefault = true
+			v = *prop.boolDefault
+		}
+		if prop.strDefault != nil {
+			haveDefault = true
+			v = *prop.strDefault
+		}
+		if prop.numDefault != nil {
+			haveDefault = true
+			v = *prop.numDefault
+		}
+		if !haveDefault {
+			continue
+		}
+		field := fresh.Field(fb.index)
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+		fElem := field.Elem()
+		switch prop.ptype {
+		case "string":
+			fElem.SetString(v.(string))
+		case "number", "integer":
+			f := v.(float64)
+			switch fElem.Kind() {
+			case reflect.Float32, reflect.Float64:
+				fElem.SetFloat(f)
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				fElem.SetInt(int64(f))
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				if f < 0 {
+					f = 0
 				}
-				field.Elem().SetBool(*prop.boolDefault)
+				fElem.SetUint(uint64(f))
 			}
+		case "boolean":
+			fElem.SetBool(v.(bool))
 		}
 	}
+
 	// Success
 	target.Elem().Set(fresh)
 	return nil
@@ -476,6 +580,8 @@ func assignStructPrimitive(dst reflect.Value, val any, ptype string) {
 				f = 0
 			}
 			dst.SetUint(uint64(f))
+		case reflect.Bool:
+			dst.SetBool(f != 0)
 		}
 	case "boolean":
 		dst.SetBool(val.(bool))
@@ -537,21 +643,32 @@ func (d *dynamicDecoder) Decode(raw map[string]any, dst any) error {
 		bp := d.schema.props[name]
 		if bp == nil {
 			continue
-		} // unknown keys left to outer strictness
+		}
 		if err := validateDynamicValue(bp, val); err != nil {
 			return fmt.Errorf("field %s: %w", name, err)
 		}
 	}
-	// Shallow copy into destination and apply boolean defaults for omitted optional bools
+	// Shallow copy and apply defaults
 	copyMap := make(map[string]any, len(raw))
 	for k, v := range raw {
 		copyMap[k] = v
 	}
 	for name, bp := range d.schema.props {
-		if bp.ptype == "boolean" && bp.boolDefault != nil {
-			if _, present := copyMap[name]; !present {
-				copyMap[name] = *bp.boolDefault
-			}
+		if _, present := copyMap[name]; present {
+			continue
+		}
+		// apply default if any
+		if bp.boolDefault != nil {
+			copyMap[name] = *bp.boolDefault
+			continue
+		}
+		if bp.strDefault != nil {
+			copyMap[name] = *bp.strDefault
+			continue
+		}
+		if bp.numDefault != nil {
+			copyMap[name] = *bp.numDefault
+			continue
 		}
 	}
 	*mp = copyMap
@@ -610,3 +727,89 @@ ENUMOK:
 }
 
 func fingerprintBytes(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
+
+// marshalBuilderCanonical renders the builder-produced schema deterministically.
+// Key order mirrors reflection canonical encoder.
+func marshalBuilderCanonical(order []string, props map[string]any, required []string) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	buf.WriteString("\"type\":\"object\",\"properties\":{")
+	for i, name := range order {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		encJSONString(&buf, name)
+		buf.WriteByte(':')
+		pm := props[name].(map[string]any)
+		buf.WriteByte('{')
+		buf.WriteString("\"type\":")
+		encJSONString(&buf, pm["type"].(string))
+		if v, ok := pm["title"].(string); ok {
+			buf.WriteString(",\"title\":")
+			encJSONString(&buf, v)
+		}
+		if v, ok := pm["description"].(string); ok {
+			buf.WriteString(",\"description\":")
+			encJSONString(&buf, v)
+		}
+		if v, ok := pm["format"].(string); ok {
+			buf.WriteString(",\"format\":")
+			encJSONString(&buf, v)
+		}
+		if ev, ok := pm["enum"].([]string); ok {
+			buf.WriteString(",\"enum\":")
+			writeStringArray(&buf, ev)
+			if en, ok2 := pm["enumNames"].([]string); ok2 && len(en) > 0 {
+				buf.WriteString(",\"enumNames\":")
+				writeStringArray(&buf, en)
+			}
+		}
+		if dv, ok := pm["default"]; ok {
+			switch dval := dv.(type) {
+			case bool:
+				buf.WriteString(",\"default\":")
+				if dval {
+					buf.WriteString("true")
+				} else {
+					buf.WriteString("false")
+				}
+			case string:
+				buf.WriteString(",\"default\":")
+				encJSONString(&buf, dval)
+			case float64:
+				buf.WriteString(",\"default\":")
+				buf.WriteString(floatToString(dval))
+			}
+		}
+		if v, ok := pm["minLength"].(int); ok {
+			buf.WriteString(",\"minLength\":")
+			buf.WriteString(fmt.Sprintf("%d", v))
+		}
+		if v, ok := pm["maxLength"].(int); ok {
+			buf.WriteString(",\"maxLength\":")
+			buf.WriteString(fmt.Sprintf("%d", v))
+		}
+		if v, ok := pm["minimum"].(float64); ok {
+			buf.WriteString(",\"minimum\":")
+			buf.WriteString(floatToString(v))
+		}
+		if v, ok := pm["maximum"].(float64); ok {
+			buf.WriteString(",\"maximum\":")
+			buf.WriteString(floatToString(v))
+		}
+		buf.WriteByte('}')
+	}
+	buf.WriteByte('}')
+	if len(required) > 0 {
+		buf.WriteString(",\"required\":[")
+		for i, r := range required {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			encJSONString(&buf, r)
+		}
+		buf.WriteByte(']')
+	}
+	buf.WriteByte('}')
+	return buf.Bytes()
+}

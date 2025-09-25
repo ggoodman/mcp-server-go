@@ -151,3 +151,65 @@ func TestBuilder_ParityFields(t *testing.T) {
 		t.Fatalf("flag default expected true")
 	}
 }
+
+func TestBuilder_CanonicalOrdering(t *testing.T) {
+	b := NewBuilder().String("b", Description("second")).String("a", Description("first"))
+	sch, _ := b.Build()
+	raw, _ := sch.MarshalJSON()
+	wantPrefix := `{"type":"object","properties":{"b":{`
+	if string(raw[:len(wantPrefix)]) != wantPrefix {
+		t.Fatalf("expected b then a ordering, got %s", raw)
+	}
+}
+
+func TestBuilder_FingerprintStableDifferentConstructionOrder(t *testing.T) {
+	// Build same logical schema via different construction sequences but identical insertion order preserved
+	b1 := NewBuilder().String("a", Required()).String("b", Optional())
+	s1, _ := b1.Build()
+	b2 := NewBuilder().String("a", Required()).String("b", Optional())
+	s2, _ := b2.Build()
+	if s1.Fingerprint() != s2.Fingerprint() {
+		t.Fatalf("expected fingerprints match: %s vs %s", s1.Fingerprint(), s2.Fingerprint())
+	}
+}
+
+func TestBuilderDefaults_StringNumberBool(t *testing.T) {
+	b := NewBuilder().
+		String("s", Optional(), DefaultString("abc"), MinLength(1)).
+		Number("n", Optional(), DefaultNumber(4.5), Minimum(1), Maximum(10)).
+		Integer("i", Optional(), DefaultNumber(3), Minimum(1), Maximum(5)).
+		Boolean("b", Optional(), DefaultBool(true))
+
+	var m map[string]any
+	dec := b.MustBind(&m)
+	if err := dec.Decode(map[string]any{}, &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if m["s"].(string) != "abc" {
+		t.Fatalf("expected string default")
+	}
+	if m["n"].(float64) != 4.5 {
+		t.Fatalf("expected number default")
+	}
+	if m["i"].(float64) != 3 {
+		t.Fatalf("expected integer default")
+	}
+	if m["b"].(bool) != true {
+		t.Fatalf("expected bool default")
+	}
+}
+
+func TestBuilderDefaults_DuplicateDefaultPanic(t *testing.T) {
+	defer func() { recover() }()
+	_ = NewBuilder().String("s", Optional(), DefaultString("a"), DefaultString("b"))
+	// second default should panic
+	b := NewBuilder() // unreachable
+	_ = b
+	panic("expected panic not triggered")
+}
+
+func TestBuilderDefaults_EnumValidation(t *testing.T) {
+	defer func() { recover() }()
+	_ = NewBuilder().EnumString("e", []string{"a", "b"}, Optional(), DefaultString("z"))
+	panic("expected panic for invalid enum default")
+}

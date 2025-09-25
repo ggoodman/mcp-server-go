@@ -1,6 +1,7 @@
 package elicitation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -88,7 +89,9 @@ type reflectedProperty struct {
 	// Only for strings: format constraint (email|uri|date|date-time)
 	Format string
 	// Boolean default (only captured if field is boolean and tag supplies default=true/false)
-	BoolDefault *bool
+	BoolDefault   *bool
+	StringDefault *string  // optional string default
+	NumberDefault *float64 // optional number/integer default
 }
 
 type propertyConstraints struct {
@@ -152,7 +155,7 @@ func buildReflectedSchema(rt reflect.Type) *reflectedSchema {
 			continue
 		}
 
-		title, desc, enumVals, enumNames, format, boolDefault, constraints := parseJSONSchemaTag(f.Tag.Get("jsonschema"))
+		title, desc, enumVals, enumNames, format, defaultLiteral, constraints := parseJSONSchemaTagExtended(f.Tag.Get("jsonschema"))
 
 		// If enumNames length mismatch, ignore them (enforce parity)
 		if len(enumNames) > 0 && len(enumNames) != len(enumVals) {
@@ -171,8 +174,57 @@ func buildReflectedSchema(rt reflect.Type) *reflectedSchema {
 			FieldIndex:  i,
 			Format:      format,
 		}
-		if pType == "boolean" && boolDefault != nil {
-			prop.BoolDefault = boolDefault
+		// Interpret default literal now that we know type and pointer-ness
+		if defaultLiteral != nil {
+			// Allow boolean defaults on required (non-pointer) fields for backward compatibility
+			// but forbid defaults on other required primitive types.
+			if !isPtr && pType != "boolean" {
+				panic(fmt.Sprintf("elicitation: default specified on required %s field %s", pType, f.Name))
+			}
+			switch pType {
+			case "boolean":
+				if *defaultLiteral == "true" || *defaultLiteral == "false" {
+					b := *defaultLiteral == "true"
+					prop.BoolDefault = &b
+				} else {
+					panic(fmt.Sprintf("elicitation: invalid boolean default %q for field %s", *defaultLiteral, f.Name))
+				}
+			case "string":
+				if len(enumVals) > 0 {
+					found := false
+					for _, ev := range enumVals {
+						if ev == *defaultLiteral {
+							found = true
+							break
+						}
+					}
+					if !found {
+						panic(fmt.Sprintf("elicitation: default %q not in enum for field %s", *defaultLiteral, f.Name))
+					}
+				}
+				if constraints.MinLength != nil && len(*defaultLiteral) < *constraints.MinLength {
+					panic(fmt.Sprintf("elicitation: default violates minLength for field %s", f.Name))
+				}
+				if constraints.MaxLength != nil && len(*defaultLiteral) > *constraints.MaxLength {
+					panic(fmt.Sprintf("elicitation: default violates maxLength for field %s", f.Name))
+				}
+				prop.StringDefault = defaultLiteral
+			case "number", "integer":
+				var nf float64
+				if _, err := fmt.Sscanf(*defaultLiteral, "%f", &nf); err != nil {
+					panic(fmt.Sprintf("elicitation: invalid number default %q for field %s", *defaultLiteral, f.Name))
+				}
+				if pType == "integer" && nf != float64(int64(nf)) {
+					panic(fmt.Sprintf("elicitation: non-integer default %q for integer field %s", *defaultLiteral, f.Name))
+				}
+				if constraints.Minimum != nil && nf < *constraints.Minimum {
+					panic(fmt.Sprintf("elicitation: default below minimum for field %s", f.Name))
+				}
+				if constraints.Maximum != nil && nf > *constraints.Maximum {
+					panic(fmt.Sprintf("elicitation: default above maximum for field %s", f.Name))
+				}
+				prop.NumberDefault = &nf
+			}
 		}
 		// format only meaningful for strings; drop otherwise
 		if format != "" && pType != "string" {
@@ -181,9 +233,7 @@ func buildReflectedSchema(rt reflect.Type) *reflectedSchema {
 		props = append(props, prop)
 	}
 
-	// Sort properties by name for deterministic ordering.
-	sort.Slice(props, func(i, j int) bool { return props[i].Name < props[j].Name })
-
+	// Preserve declaration order (struct field order) rather than sorting.
 	var required []string
 	for _, p := range props {
 		if !p.IsPointer { // non-pointer => required
@@ -207,56 +257,123 @@ func buildReflectedSchema(rt reflect.Type) *reflectedSchema {
 	}
 }
 
+// marshalSchemaJSON produces a canonical JSON representation with deterministic ordering.
+// Ordering rules:
+//   - Root object keys in order: type, properties, required (required omitted if empty)
+//   - Properties retain insertion order from struct definition
+//   - Within each property object keys appear in fixed order: type, title, description, format, enum, enumNames, default, minLength, maxLength, minimum, maximum
 func marshalSchemaJSON(props []reflectedProperty, required []string) []byte {
-	// Produce minimal object schema reflecting allowed primitives.
-	// {"type":"object","properties":{...},"required":[...]} (omit required if empty)
-	propsObj := make(map[string]any, len(props))
-	for _, p := range props {
-		m := map[string]any{}
-		// Always include type to align with EnumSchema definition.
-		m["type"] = p.Type
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	// type
+	buf.WriteString("\"type\":\"object\",")
+	// properties
+	buf.WriteString("\"properties\":{")
+	for i, p := range props {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		encJSONString(&buf, p.Name)
+		buf.WriteByte(':')
+		buf.WriteByte('{')
+		// fixed key order
+		// type (always)
+		buf.WriteString("\"type\":")
+		encJSONString(&buf, p.Type)
+		// title
+		if p.Title != "" {
+			buf.WriteString(",\"title\":")
+			encJSONString(&buf, p.Title)
+		}
+		// description
+		if p.Description != "" {
+			buf.WriteString(",\"description\":")
+			encJSONString(&buf, p.Description)
+		}
+		// format
+		if p.Format != "" {
+			buf.WriteString(",\"format\":")
+			encJSONString(&buf, p.Format)
+		}
+		// enum
 		if len(p.EnumValues) > 0 {
-			m["enum"] = p.EnumValues
+			buf.WriteString(",\"enum\":")
+			writeStringArray(&buf, p.EnumValues)
 			if len(p.EnumNames) > 0 {
-				m["enumNames"] = p.EnumNames
+				buf.WriteString(",\"enumNames\":")
+				writeStringArray(&buf, p.EnumNames)
 			}
 		}
-		if p.Title != "" {
-			m["title"] = p.Title
-		}
-		if p.Description != "" {
-			m["description"] = p.Description
-		}
-		if p.Format != "" {
-			m["format"] = p.Format
-		}
 		if p.BoolDefault != nil {
-			m["default"] = *p.BoolDefault
+			buf.WriteString(",\"default\":")
+			if *p.BoolDefault {
+				buf.WriteString("true")
+			} else {
+				buf.WriteString("false")
+			}
+		}
+		if p.StringDefault != nil {
+			buf.WriteString(",\"default\":")
+			encJSONString(&buf, *p.StringDefault)
+		}
+		if p.NumberDefault != nil {
+			buf.WriteString(",\"default\":")
+			buf.WriteString(floatToString(*p.NumberDefault))
 		}
 		if c := p.Constraints; c.MinLength != nil {
-			m["minLength"] = *c.MinLength
+			buf.WriteString(",\"minLength\":")
+			buf.WriteString(intToString(*c.MinLength))
 		}
 		if c := p.Constraints; c.MaxLength != nil {
-			m["maxLength"] = *c.MaxLength
+			buf.WriteString(",\"maxLength\":")
+			buf.WriteString(intToString(*c.MaxLength))
 		}
 		if c := p.Constraints; c.Minimum != nil {
-			m["minimum"] = *c.Minimum
+			buf.WriteString(",\"minimum\":")
+			buf.WriteString(floatToString(*c.Minimum))
 		}
 		if c := p.Constraints; c.Maximum != nil {
-			m["maximum"] = *c.Maximum
+			buf.WriteString(",\"maximum\":")
+			buf.WriteString(floatToString(*c.Maximum))
 		}
-		propsObj[p.Name] = m
+		buf.WriteByte('}')
 	}
-	root := map[string]any{
-		"type":       "object",
-		"properties": propsObj,
-	}
+	buf.WriteByte('}')
 	if len(required) > 0 {
-		root["required"] = required
+		buf.WriteString(",\"required\":")
+		// required array order matches declaration order
+		buf.WriteByte('[')
+		for i, r := range required {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			encJSONString(&buf, r)
+		}
+		buf.WriteByte(']')
 	}
-	b, _ := json.Marshal(root) // NOTE: map iteration order is randomized across Go versions; for absolute stability implement custom canonical encoder (TODO: canonical encoder).
-	return b
+	buf.WriteByte('}')
+	return buf.Bytes()
 }
+
+func encJSONString(buf *bytes.Buffer, s string) {
+	b, _ := json.Marshal(s) // uses encoding/json string escaper
+	buf.Write(b)
+}
+
+func writeStringArray(buf *bytes.Buffer, arr []string) {
+	buf.WriteByte('[')
+	for i, v := range arr {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		encJSONString(buf, v)
+	}
+	buf.WriteByte(']')
+}
+
+func intToString(i int) string       { return fmt.Sprintf("%d", i) }
+func floatToString(f float64) string { return trimFloat(fmt.Sprintf("%g", f)) }
+func trimFloat(s string) string      { return s }
 
 func computeFingerprint(b []byte) string {
 	sum := sha256.Sum256(b)
@@ -334,18 +451,42 @@ func (b *boundReflectionDecoder) Decode(raw map[string]any, dst any) error {
 
 	// Apply boolean defaults for optional (pointer) fields not provided.
 	for _, p := range b.schema.properties {
-		if p.Type == "boolean" && p.BoolDefault != nil {
-			if _, ok := provided[p.Name]; ok {
-				continue
-			}
-			if !p.IsPointer { // required non-pointer: skip (would have errored if missing)
-				continue
-			}
-			field := fresh.Field(p.FieldIndex)
-			if field.IsNil() {
-				field.Set(reflect.New(field.Type().Elem()))
-			}
-			field.Elem().SetBool(*p.BoolDefault)
+		if _, ok := provided[p.Name]; ok {
+			continue
+		}
+		if !p.IsPointer {
+			continue
+		}
+		var hasDefault bool
+		var dv any
+		if p.BoolDefault != nil {
+			hasDefault = true
+			dv = *p.BoolDefault
+		}
+		if p.StringDefault != nil {
+			hasDefault = true
+			dv = *p.StringDefault
+		}
+		if p.NumberDefault != nil {
+			hasDefault = true
+			dv = *p.NumberDefault
+		}
+		if !hasDefault {
+			continue
+		}
+		field := fresh.Field(p.FieldIndex)
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+		fe := field.Elem()
+		switch p.Type {
+		case "boolean":
+			fe.SetBool(dv.(bool))
+		case "string":
+			fe.SetString(dv.(string))
+		case "number", "integer":
+			f := dv.(float64)
+			convertAssignNumber(fe, f)
 		}
 	}
 
@@ -427,11 +568,13 @@ func convertAssignNumber(dst reflect.Value, f float64) {
 	}
 }
 
-func parseJSONSchemaTag(tag string) (title string, desc string, enumVals []string, enumNames []string, format string, boolDefault *bool, c propertyConstraints) {
+// parseJSONSchemaTagExtended returns core metadata plus the raw default literal (if any).
+func parseJSONSchemaTagExtended(tag string) (title string, desc string, enumVals []string, enumNames []string, format string, defaultLiteral *string, c propertyConstraints) {
 	if tag == "" {
 		return
 	}
 	parts := strings.Split(tag, ",")
+	seenDefault := false
 	for _, p := range parts {
 		if p == "" {
 			continue
@@ -456,21 +599,17 @@ func parseJSONSchemaTag(tag string) (title string, desc string, enumVals []strin
 				enumNames = strings.Split(val, "|")
 			}
 		case "format":
-			// Accept only known formats; ignore invalid silently.
 			switch val {
 			case "email", "uri", "date", "date-time":
 				format = val
 			}
 		case "default":
-			// capture only if boolean; parse true/false
-			switch val {
-			case "true":
-				t := true
-				boolDefault = &t
-			case "false":
-				f := false
-				boolDefault = &f
+			if seenDefault {
+				panic("elicitation: multiple default values specified in tag")
 			}
+			seenDefault = true
+			v := val
+			defaultLiteral = &v
 		case "minLength":
 			if iv, err := parseInt(val); err == nil {
 				c.MinLength = &iv
@@ -488,7 +627,7 @@ func parseJSONSchemaTag(tag string) (title string, desc string, enumVals []strin
 				c.Maximum = &fv
 			}
 		default:
-			// ignore unknown tokens for forward compat
+			// ignore unknown
 		}
 	}
 	return

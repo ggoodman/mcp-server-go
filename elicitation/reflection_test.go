@@ -234,3 +234,78 @@ func TestSchema_WithTitleFormatEnumNamesIntegerBoolDefault(t *testing.T) {
 		t.Fatalf("expected default true for flag")
 	}
 }
+
+func TestReflection_CanonicalOrdering(t *testing.T) {
+	var s struct {
+		B string `json:"b" jsonschema:"description=second"`
+		A string `json:"a" jsonschema:"description=first"`
+	}
+	dec, _ := BindStruct(&s)
+	sch, _ := dec.Schema()
+	raw, _ := sch.MarshalJSON()
+	// Expect properties appear in declaration order: b then a
+	wantPrefix := `{"type":"object","properties":{"b":{` // b first
+	if string(raw[:len(wantPrefix)]) != wantPrefix {
+		t.Fatalf("expected canonical ordering with b first, got %s", raw)
+	}
+}
+
+func TestReflectionDefaults_StringAndNumber(t *testing.T) {
+	type Input struct {
+		S *string  `jsonschema:"default=hello"`
+		N *int     `jsonschema:"default=5,minimum=1,maximum=10"`
+		F *float64 `jsonschema:"default=2.5,minimum=1,maximum=3"`
+		B *bool    `jsonschema:"default=true"`
+	}
+	var dst Input
+	dec, err := BindStruct(&dst)
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if err := dec.Decode(map[string]any{}, &dst); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dst.S == nil || *dst.S != "hello" {
+		t.Fatalf("expected string default applied")
+	}
+	if dst.N == nil || *dst.N != 5 {
+		t.Fatalf("expected int default applied")
+	}
+	if dst.F == nil || *dst.F != 2.5 {
+		t.Fatalf("expected float default applied")
+	}
+	if dst.B == nil || *dst.B != true {
+		t.Fatalf("expected bool default applied")
+	}
+}
+
+func TestReflectionDefaults_EnumValidation(t *testing.T) {
+	defer func() { recover() }()
+	type Bad struct {
+		E *string `jsonschema:"enum=a|b|c,default=z"`
+	}
+	var x Bad
+	// should panic during schema build
+	_, _ = BindStruct(&x)
+	t.Fatalf("expected panic for invalid enum default")
+}
+
+func TestReflectionDefaults_ConstraintViolation(t *testing.T) {
+	defer func() { recover() }()
+	type Bad struct {
+		S *string `jsonschema:"minLength=3,default=hi"`
+	}
+	var x Bad
+	_, _ = BindStruct(&x)
+	t.Fatalf("expected panic for minLength violation default")
+}
+
+func TestReflectionDefaults_RequiredFieldDefault(t *testing.T) {
+	defer func() { recover() }()
+	type Bad struct {
+		V string `jsonschema:"default=foo"`
+	}
+	var x Bad
+	_, _ = BindStruct(&x)
+	t.Fatalf("expected panic for default on required field")
+}
