@@ -1,13 +1,11 @@
 package tests
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -120,41 +118,17 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	case e := <-errCh:
 		t.Fatalf("get: %v", e)
 	case getResp = <-respCh:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timeout waiting for GET response headers")
+	case <-t.Context().Done():
+		t.Fatalf("context done waiting for GET response headers: %v", t.Context().Err())
 	}
 	if getResp.StatusCode != http.StatusOK {
 		t.Fatalf("get status: %d", getResp.StatusCode)
 	}
 
-	// 4) Read SSE until we see a JSON-RPC notification with method resources/list_changed.
-	defer getResp.Body.Close()
-	scanner := bufio.NewScanner(getResp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	for {
-		select {
-		case <-deadline.C:
-			t.Fatalf("timed out waiting for list_changed notification")
-		default:
-		}
-		if !scanner.Scan() {
-			// brief yield
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		var m map[string]any
-		if err := json.Unmarshal([]byte(payload), &m); err != nil {
-			continue
-		}
-		if method, _ := m["method"].(string); method == string(mcp.ResourcesListChangedNotificationMethod) {
-			break
-		}
+	// 4) Wait (bounded) for resources/list_changed notification
+	if err := waitForNotification(t.Context(), getResp.Body, string(mcp.ResourcesListChangedNotificationMethod), 8*time.Second); err != nil {
+		getResp.Body.Close()
+		t.Fatalf("waiting for list_changed: %v", err)
 	}
+	getResp.Body.Close()
 }

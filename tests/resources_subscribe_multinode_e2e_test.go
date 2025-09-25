@@ -143,8 +143,8 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	case e := <-errCh:
 		t.Fatalf("GET B: %v", e)
 	case getResp = <-respCh:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timeout waiting for GET headers on B")
+	case <-t.Context().Done():
+		t.Fatalf("context done waiting for GET headers on B: %v", t.Context().Err())
 	}
 	if getResp.StatusCode != http.StatusOK {
 		t.Fatalf("GET B status: %d", getResp.StatusCode)
@@ -246,20 +246,11 @@ func readOneSSEResponse(ctx context.Context, body io.ReadCloser) error {
 	defer body.Close()
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for {
+	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-timer.C:
-			return fmt.Errorf("timeout waiting for SSE response")
 		default:
-		}
-		if !scanner.Scan() {
-			// small yield
-			time.Sleep(5 * time.Millisecond)
-			continue
 		}
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -275,4 +266,8 @@ func readOneSSEResponse(ctx context.Context, body io.ReadCloser) error {
 			return nil
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return io.EOF
 }

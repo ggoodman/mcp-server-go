@@ -1,14 +1,14 @@
 package tests
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/mcp"
@@ -153,38 +153,21 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	_ = subResp.Body.Close()
+	// Barrier: read entire response body to ensure server processed subscription before mutation
+	respBytes, _ := io.ReadAll(subResp.Body)
+	subResp.Body.Close()
+	if !bytes.Contains(respBytes, []byte(`"id":"2"`)) {
+		// Not strictly required but good sanity check
+		t.Fatalf("unexpected subscribe response: %s", string(respBytes))
+	}
 
 	// 4) Trigger an update via ReplaceAllContents (which marks updated on res://x)
 	static.ReplaceAllContents(ctx, map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v2"}}})
 
-	// 5) Expect a notifications/resources/updated on SSE
-	scanner := bufio.NewScanner(getResp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for {
-		select {
-		case <-t.Context().Done():
-			t.Fatalf("context done scanning GET /mcp response: %v", t.Context().Err())
-		default:
-		}
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				t.Fatalf("scanner: %v", err)
-			}
-			break // EOF
-		}
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		var m map[string]any
-		if err := json.Unmarshal([]byte(payload), &m); err != nil {
-			continue
-		}
-		if method, _ := m["method"].(string); method == string(mcp.ResourcesUpdatedNotificationMethod) {
-			break
-		}
+	// 5) Expect a notifications/resources/updated on SSE with bounded wait via helper
+	if err := waitForNotification(t.Context(), getResp.Body, string(mcp.ResourcesUpdatedNotificationMethod), 8*time.Second); err != nil {
+		getResp.Body.Close()
+		t.Fatalf("waiting for resources/updated: %v", err)
 	}
 
 	// 6) Unsubscribe via POST JSON-RPC; do not assert immediate quiescence (eventual semantics)
