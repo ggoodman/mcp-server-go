@@ -1,29 +1,3 @@
-// Package elicitation provides building blocks for constructing schemas used in
-// the MCP Elicit request/response flow.
-//
-// Design goals:
-//  1. Keep the *ergonomic* reflection path (give us a struct pointer and we
-//     derive a flat JSON Schema) while allowing more explicit / dynamic paths.
-//  2. Decouple schema construction from value decoding so that callers can
-//     reuse a compiled schema with multiple decode strategies (e.g. applying
-//     defaults, strict business validation, instrumentation, projections).
-//  3. Preserve space for future optimizations (schema fingerprint based caching
-//     / registration) and richer features without locking the public API into
-//     a monolith today.
-//
-// Layering rationale:
-//
-//	SchemaProvider --> describes *what* we will ask the client for.
-//	ValueDecoder   --> describes *how* to take the returned raw object and
-//	                   populate a destination value, enforcing validation rules.
-//	SchemaDecoder  --> simple composite that satisfies both; the most common
-//	                   thing users interact with. Splitting the two lower-level
-//	                   concerns keeps advanced scenarios possible without
-//	                   forcing complexity onto the default path.
-//
-// A server normally just passes a SchemaDecoder to Elicit(). The reflection
-// helper (added separately) returns one. More advanced use cases can build a
-// dynamic schema struct directly and implement a custom ValueDecoder.
 package elicitation
 
 // Schema is an immutable, in-memory representation of a JSON schema fragment

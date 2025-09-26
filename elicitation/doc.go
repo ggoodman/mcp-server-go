@@ -1,68 +1,84 @@
-// Package elicitation provides primitives for defining and decoding flat elicitation
-// schemas (restricted JSON Schema subset) for MCP 'elicitation/create' requests.
+// Package elicitation provides a small, purpose-built subset of JSON Schema
+// for gathering structured user input via the MCP elicitation/create flow.
+// It lets servers define a flat object schema (string, number, integer,
+// boolean and string enums) plus basic constraints and defaults, then decode
+// the client's response into an application struct or dynamic map.
 //
-// Two authoring modes:
-//  1. Reflection: BindStruct(&T{}) derives schema from a struct.
-//  2. Builder: NewBuilder() + fluent property methods.
+// The design separates two concerns:
+//  1. Schema construction (what to ask the user for)
+//  2. Value decoding (how to validate + hydrate a destination on return)
 //
-// Supported primitive types: string, number, integer, boolean, and string enums.
-// Nested objects / arrays intentionally omitted (simplifies initial client surface).
+// This separation enables reuse of a compiled schema with different decode
+// strategies (e.g. strict vs relaxed unknown key handling) and leaves headroom
+// for future enhancements (projections, metrics) without bloating the common path.
 //
-// Reflection jsonschema tag keys (all optional unless noted):
+// Authoring Modes
 //
-//	title=Text                -> property title
-//	description=Text          -> description
-//	format=email|uri|date|date-time (string only)
-//	enum=a|b|c                -> string enum values
-//	enumNames=A|B|C           -> display names (length must match enum)
-//	minLength=N               -> string minimum length
-//	maxLength=N               -> string maximum length
-//	minimum=F                 -> numeric/integer minimum
-//	maximum=F                 -> numeric/integer maximum
-//	default=true|false        -> boolean default (optional pointer field only applied if omitted)
+//	Reflection  BindStruct(&T{}) derives a schema from a struct type. Exported
+//	            fields become properties. Pointer fields are optional; value
+//	            fields are required. A `jsonschema` struct tag supplies title,
+//	            description, format, enum, enumNames, min/max constraints and
+//	            optional defaults.
+//	Builder     NewBuilder() with fluent property methods offers a programmatic
+//	            alternative for dynamic scenarios. It mirrors the reflection
+//	            feature set while remaining explicit.
 //
-// Unknown tokens ignored for forward compatibility.
+// Supported `jsonschema` tag tokens (reflection):
 //
-// Builder PropOptions mirror the above:
+//	title=Text
+//	description=Text
+//	format=email|uri|date|date-time         (string only)
+//	enum=a|b|c                              (string enums)
+//	enumNames=A|B|C                         (display names; length must match enum)
+//	minLength=N / maxLength=N               (strings)
+//	minimum=F / maximum=F                   (number / integer)
+//	default=literal                         (bool|string|number; optional fields only except bool)
 //
-//	Required(), Optional()
-//	Title(string), Description(string)
-//	Format(string) // validated against allowed set for strings
-//	MinLength(int), MaxLength(int)
-//	Minimum(float64), Maximum(float64)
-//	EnumString(name, values, EnumNames(...), ...options)
-//	EnumNames(displayValues...)
-//	DefaultBool(bool) // only for boolean
-//	Integer(name, opts...) for integer type
+// Builder PropOptions supply the same capabilities: Required, Optional, Title,
+// Description, Format, MinLength, MaxLength, Minimum, Maximum, EnumString,
+// EnumNames, DefaultBool, DefaultString, DefaultNumber, Integer.
 //
-// Decoding:
-//   - Unknown keys ignored (strictness enforced at higher layer).
-//   - Type coercion minimal; JSON numbers (float64) cast to integer/float targets.
-//   - Enum validation performed before assignment.
-//   - Boolean defaults applied when property marked optional (pointer in reflection or absent in map) and not present in input.
+// Constraints & Validation
 //
-// Canonical Encoding & Fingerprints:
+// Decoding enforces:
+//   - Required presence for non-pointer (reflection) or Required() (builder) properties
+//   - Type correctness (no coercion besides integer check on numbers)
+//   - Enum membership
+//   - Min/Max string length & numeric range
+//   - Default application when key absent and a default exists
 //
-//	Schemas are marshaled with a custom canonical encoder ensuring deterministic ordering:
-//	  Root keys: type, properties, required (if any)
-//	  Property order: struct field order (reflection) or insertion order (builder)
-//	  Property key order: type, title, description, format, enum, enumNames, default, minLength, maxLength, minimum, maximum
-//	The fingerprint is SHA-256 over the canonical bytes.
+// Unknown keys are ignored by default; the higher-level elicitation
+// capability can enable strict mode to reject them.
 //
-// Future extensions (not yet implemented): defaults for other types, nested objects, arrays, custom validators.
+// Canonical Encoding & Fingerprints
 //
-// # Update documentation to reflect new default semantics
+// Both reflection and builder produce a canonical JSON encoding with stable
+// key ordering, enabling deterministic SHA-256 fingerprints for caching or
+// change detection. Any semantic change (including defaults) produces a new
+// fingerprint string.
 //
-// Defaults:
-//   - Supported for boolean, string, number, integer.
-//   - Reflection: `default=literal` in jsonschema tag. For numbers/integers the literal is parsed with %f.
-//   - Builder: DefaultBool, DefaultString, DefaultNumber PropOptions.
-//   - Exactly one default per property (panic on multiples).
-//   - Defaults only allowed on optional (pointer in reflection / Optional() in builder) properties.
-//   - Validation at schema build time: enum membership, min/max length, min/max numeric, integer integral check.
-//   - Defaults applied only when the property key is absent in decode input.
-//   - Required+default panics (early feedback, avoids silent shadowing of provided values).
-//   - Reflection tag defaults cannot contain commas (tag token separator). Use builder if needed.
+// Example (reflection):
 //
-// Fingerprint impact: adding or changing a default changes canonical schema bytes -> new fingerprint.
+//	type Input struct {
+//	    Name  string `json:"name" jsonschema:"minLength=1,description=Your name"`
+//	    Email *string `json:"email,omitempty" jsonschema:"format=email"`
+//	}
+//	var in Input
+//	dec, _ := elicitation.BindStruct(&in) // SchemaDecoder
+//	// pass dec to sessions.Elicit(...)
+//
+// Example (builder):
+//
+//	var raw map[string]any
+//	dec := elicitation.NewBuilder().
+//	    String("name", elicitation.Required(), elicitation.MinLength(1)).
+//	    String("email", elicitation.Optional(), elicitation.Format("email")).
+//	    MustBind(&raw)
+//
+//	// pass dec to sessions.Elicit(...)
+//
+// # Future Work
+//
+// The package intentionally omits nested objects, arrays and composition.
+// These can be added later once the client UX contract stabilizes.
 package elicitation
