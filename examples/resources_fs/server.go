@@ -1,7 +1,6 @@
 package resources_fs
 
 import (
-	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 )
 
@@ -16,7 +15,7 @@ func New(root string) mcpservice.ServerCapabilities {
 	)
 
 	return mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-resources-fs", Version: "0.1.0"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("examples-resources-fs", "0.1.0")),
 		mcpservice.WithResourcesCapability(fsCap),
 	)
 }

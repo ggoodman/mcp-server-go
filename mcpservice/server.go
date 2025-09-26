@@ -10,37 +10,21 @@ import (
 // ServerOption configures a concrete ServerCapabilities implementation.
 type ServerOption func(*server)
 
+// server holds only provider interfaces (no duplicate static fields). A single
+// pattern: each WithXCapability takes an XCapabilityProvider. Static values use
+// StaticX helpers; dynamic cases use XProviderFunc.
 type server struct {
-	// server info
-	staticInfo   *mcp.ImplementationInfo
-	infoProvider func(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error)
-
-	// protocol version and instructions
-	staticProtocolVersion string
-	protocolProvider      func(ctx context.Context) (string, bool, error)
-	staticInstructions    *string
-	instructionsProvider  func(ctx context.Context, session sessions.Session) (string, bool, error)
-
-	// resources capability
-	staticResourcesCap ResourcesCapability
-	resourcesProvider  func(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error)
-
-	// tools capability
-	staticToolsCap ToolsCapability
-	toolsProvider  func(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error)
-
-	// prompts capability
-	staticPromptsCap PromptsCapability
-	promptsProvider  func(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error)
-
-	// logging capability
-	staticLoggingCap LoggingCapability
-	loggingProvider  func(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error)
-
-	// completions capability
-	staticCompletionsCap CompletionsCapability
-	completionsProvider  func(ctx context.Context, session sessions.Session) (CompletionsCapability, bool, error)
+	infoProv         ServerInfoProvider
+	protocolProv     ProtocolVersionProvider
+	instructionsProv InstructionsProvider
+	resourcesProv    ResourcesCapabilityProvider
+	toolsProv        ToolsCapabilityProvider
+	promptsProv      PromptsCapabilityProvider
+	loggingProv      LoggingCapabilityProvider
+	completionsProv  CompletionsCapabilityProvider
 }
+
+// Provider interfaces and static helper constructors have moved to providers.go for clarity.
 
 // NewServer builds a ServerCapabilities using functional options. Options allow
 // configuring static fields or per-session providers for info, protocol
@@ -53,171 +37,110 @@ func NewServer(opts ...ServerOption) ServerCapabilities {
 	return s
 }
 
-// WithServerInfo sets a static server info value.
-func WithServerInfo(info mcp.ImplementationInfo) ServerOption {
-	return func(s *server) { s.staticInfo = &info }
+// WithServerInfo sets a provider for server info (usually StaticServerInfo).
+func WithServerInfo(p ServerInfoProvider) ServerOption { return func(s *server) { s.infoProv = p } }
+
+// WithProtocolVersion sets a provider for the preferred protocol version.
+func WithProtocolVersion(p ProtocolVersionProvider) ServerOption {
+	return func(s *server) { s.protocolProv = p }
 }
 
-// WithServerInfoProvider sets a provider for per-session server info.
-func WithServerInfoProvider(fn func(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error)) ServerOption {
-	return func(s *server) { s.infoProvider = fn }
+// WithInstructions sets a provider for human-readable instructions returned
+// during initialize.
+func WithInstructions(p InstructionsProvider) ServerOption {
+	return func(s *server) { s.instructionsProv = p }
 }
 
-// WithPreferredProtocolVersion sets a static preferred protocol version string.
-func WithPreferredProtocolVersion(version string) ServerOption {
-	return func(s *server) { s.staticProtocolVersion = version }
+// WithResourcesCapability wires the resources capability provider.
+func WithResourcesCapability(p ResourcesCapabilityProvider) ServerOption {
+	return func(s *server) { s.resourcesProv = p }
 }
 
-// WithPreferredProtocolVersionProvider sets a per-session provider for preferred protocol version.
-func WithPreferredProtocolVersionProvider(fn func(ctx context.Context) (string, bool, error)) ServerOption {
-	return func(s *server) { s.protocolProvider = fn }
+// WithToolsCapability wires the tools capability provider.
+func WithToolsCapability(p ToolsCapabilityProvider) ServerOption {
+	return func(s *server) { s.toolsProv = p }
 }
 
-// WithInstructions sets static human-readable instructions returned during initialize.
-func WithInstructions(instr string) ServerOption {
-	return func(s *server) { s.staticInstructions = &instr }
+// WithPromptsCapability wires the prompts capability provider.
+func WithPromptsCapability(p PromptsCapabilityProvider) ServerOption {
+	return func(s *server) { s.promptsProv = p }
 }
 
-// WithInstructionsProvider sets a per-session provider for instructions.
-func WithInstructionsProvider(fn func(ctx context.Context, session sessions.Session) (string, bool, error)) ServerOption {
-	return func(s *server) { s.instructionsProvider = fn }
+// WithLoggingCapability wires the logging capability provider.
+func WithLoggingCapability(p LoggingCapabilityProvider) ServerOption {
+	return func(s *server) { s.loggingProv = p }
 }
 
-// WithResourcesCapability wires a static ResourcesCapability (used for all sessions).
-func WithResourcesCapability(cap ResourcesCapability) ServerOption {
-	return func(s *server) { s.staticResourcesCap = cap }
-}
-
-// WithResourcesProvider wires a per-session resources capability provider.
-func WithResourcesProvider(fn func(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error)) ServerOption {
-	return func(s *server) { s.resourcesProvider = fn }
-}
-
-// WithToolsCapability wires a static ToolsCapability (used for all sessions).
-func WithToolsCapability(cap ToolsCapability) ServerOption {
-	return func(s *server) { s.staticToolsCap = cap }
-}
-
-// WithToolsProvider wires a per-session tools capability provider.
-func WithToolsProvider(fn func(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error)) ServerOption {
-	return func(s *server) { s.toolsProvider = fn }
-}
-
-// WithPromptsCapability wires a static PromptsCapability (used for all sessions).
-func WithPromptsCapability(cap PromptsCapability) ServerOption {
-	return func(s *server) { s.staticPromptsCap = cap }
-}
-
-// WithPromptsProvider wires a per-session prompts capability provider.
-func WithPromptsProvider(fn func(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error)) ServerOption {
-	return func(s *server) { s.promptsProvider = fn }
-}
-
-// WithLoggingCapability wires a static LoggingCapability (used for all sessions).
-func WithLoggingCapability(cap LoggingCapability) ServerOption {
-	return func(s *server) { s.staticLoggingCap = cap }
-}
-
-// WithLoggingProvider wires a per-session logging capability provider.
-func WithLoggingProvider(fn func(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error)) ServerOption {
-	return func(s *server) { s.loggingProvider = fn }
-}
-
-// WithCompletionsCapability wires a static CompletionsCapability (used for all sessions).
-func WithCompletionsCapability(cap CompletionsCapability) ServerOption {
-	return func(s *server) { s.staticCompletionsCap = cap }
-}
-
-// WithCompletionsProvider wires a per-session completions capability provider.
-func WithCompletionsProvider(fn func(ctx context.Context, session sessions.Session) (CompletionsCapability, bool, error)) ServerOption {
-	return func(s *server) { s.completionsProvider = fn }
+// WithCompletionsCapability wires the completions capability provider.
+func WithCompletionsCapability(p CompletionsCapabilityProvider) ServerOption {
+	return func(s *server) { s.completionsProv = p }
 }
 
 // GetServerInfo implements ServerCapabilities.
 func (s *server) GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error) {
-	if s.infoProvider != nil {
-		return s.infoProvider(ctx, session)
+	if s.infoProv == nil {
+		return mcp.ImplementationInfo{}, nil
 	}
-	if s.staticInfo != nil {
-		return *s.staticInfo, nil
+	info, ok, err := s.infoProv.ProvideServerInfo(ctx, session)
+	if err != nil || !ok {
+		return mcp.ImplementationInfo{}, err
 	}
-	// Zero value if not configured; handler may still proceed.
-	return mcp.ImplementationInfo{}, nil
+	return info, nil
 }
 
 // GetPreferredProtocolVersion implements ServerCapabilities.
 func (s *server) GetPreferredProtocolVersion(ctx context.Context) (string, bool, error) {
-	if s.protocolProvider != nil {
-		return s.protocolProvider(ctx)
+	if s.protocolProv == nil {
+		return "", false, nil
 	}
-	if s.staticProtocolVersion != "" {
-		return s.staticProtocolVersion, true, nil
-	}
-	return "", false, nil
+	// Pass a nil session; protocol currently session-agnostic. Could supply a dummy.
+	return s.protocolProv.ProvideProtocolVersion(ctx, nil)
 }
 
 // GetInstructions implements ServerCapabilities.
 func (s *server) GetInstructions(ctx context.Context, session sessions.Session) (string, bool, error) {
-	if s.instructionsProvider != nil {
-		return s.instructionsProvider(ctx, session)
+	if s.instructionsProv == nil {
+		return "", false, nil
 	}
-	if s.staticInstructions != nil {
-		return *s.staticInstructions, true, nil
-	}
-	return "", false, nil
+	return s.instructionsProv.ProvideInstructions(ctx, session)
 }
 
 // GetResourcesCapability implements ServerCapabilities.
 func (s *server) GetResourcesCapability(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error) {
-	if s.resourcesProvider != nil {
-		return s.resourcesProvider(ctx, session)
+	if s.resourcesProv == nil {
+		return nil, false, nil
 	}
-	if s.staticResourcesCap != nil {
-		return s.staticResourcesCap, true, nil
-	}
-	return nil, false, nil
+	return s.resourcesProv.ProvideResources(ctx, session)
 }
 
 // GetToolsCapability implements ServerCapabilities.
 func (s *server) GetToolsCapability(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error) {
-	if s.toolsProvider != nil {
-		return s.toolsProvider(ctx, session)
+	if s.toolsProv == nil {
+		return nil, false, nil
 	}
-	if s.staticToolsCap != nil {
-		return s.staticToolsCap, true, nil
-	}
-	return nil, false, nil
+	return s.toolsProv.ProvideTools(ctx, session)
 }
 
 // GetPromptsCapability implements ServerCapabilities.
 func (s *server) GetPromptsCapability(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error) {
-	if s.promptsProvider != nil {
-		return s.promptsProvider(ctx, session)
+	if s.promptsProv == nil {
+		return nil, false, nil
 	}
-	if s.staticPromptsCap != nil {
-		return s.staticPromptsCap, true, nil
-	}
-	return nil, false, nil
+	return s.promptsProv.ProvidePrompts(ctx, session)
 }
 
 // GetLoggingCapability implements ServerCapabilities.
 func (s *server) GetLoggingCapability(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error) {
-	if s.loggingProvider != nil {
-		return s.loggingProvider(ctx, session)
+	if s.loggingProv == nil {
+		return nil, false, nil
 	}
-	if s.staticLoggingCap != nil {
-		return s.staticLoggingCap, true, nil
-	}
-	return nil, false, nil
+	return s.loggingProv.ProvideLogging(ctx, session)
 }
 
 // GetCompletionsCapability implements ServerCapabilities.
 func (s *server) GetCompletionsCapability(ctx context.Context, session sessions.Session) (CompletionsCapability, bool, error) {
-	if s.completionsProvider != nil {
-		return s.completionsProvider(ctx, session)
+	if s.completionsProv == nil {
+		return nil, false, nil
 	}
-	if s.staticCompletionsCap != nil {
-		return s.staticCompletionsCap, true, nil
-	}
-	return nil, false, nil
+	return s.completionsProv.ProvideCompletions(ctx, session)
 }

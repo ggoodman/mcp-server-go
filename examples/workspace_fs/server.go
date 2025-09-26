@@ -327,7 +327,7 @@ func New(root string) mcpservice.ServerCapabilities {
 	tools := mcpservice.NewToolsContainer(readTool, writeTool, appendTool, moveTool, deleteTool)
 
 	return mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-workspace-fs", Version: "0.1.0", Title: "Workspace FS"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("examples-workspace-fs", "0.1.0", mcpservice.WithServerInfoTitle("Workspace FS"))),
 		mcpservice.WithResourcesCapability(fsCap),
 		mcpservice.WithToolsCapability(tools),
 	)

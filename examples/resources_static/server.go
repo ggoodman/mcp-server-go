@@ -20,7 +20,7 @@ func New() mcpservice.ServerCapabilities {
 	static := mcpservice.NewResourcesContainer(res, nil, contents)
 
 	return mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-resources-static", Version: "0.1.0"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("examples-resources-static", "0.1.0")),
 		mcpservice.WithResourcesCapability(static),
 	)
 }

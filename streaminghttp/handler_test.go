@@ -40,6 +40,11 @@ func (c testToolsCap) GetListChangedCapability(ctx context.Context, s sessions.S
 	return nil, false, nil
 }
 
+// ProvideTools allows testToolsCap to satisfy ToolsCapabilityProvider directly.
+func (c testToolsCap) ProvideTools(ctx context.Context, s sessions.Session) (mcpservice.ToolsCapability, bool, error) {
+	return c, true, nil
+}
+
 func TestSingleInstance(t *testing.T) {
 	t.Run("Initialize returns session and capabilities", func(t *testing.T) {
 		// Explicit minimal server with empty static tools
@@ -97,11 +102,13 @@ func TestSingleInstance(t *testing.T) {
 
 	t.Run("Resources templates list over POST", func(t *testing.T) {
 		server := mcpservice.NewServer(
-			mcpservice.WithResourcesCapability(mcpservice.NewDynamicResources(
-				mcpservice.WithResourcesListTemplatesFunc(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
-					return mcpservice.NewPage([]mcp.ResourceTemplate{{URITemplate: "file://{path}", Name: "file"}}), nil
-				}),
-			)),
+			mcpservice.WithResourcesCapability(
+				mcpservice.NewDynamicResources(
+					mcpservice.WithResourcesListTemplatesFunc(func(_ context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.ResourceTemplate], error) {
+						return mcpservice.NewPage([]mcp.ResourceTemplate{{URITemplate: "file://{path}", Name: "file"}}), nil
+					}),
+				),
+			),
 		)
 		srv := mustServer(t, server)
 		defer srv.Close()
@@ -236,8 +243,8 @@ func TestSingleInstance(t *testing.T) {
 		lv.Set(slog.LevelInfo)
 
 		server := mcpservice.NewServer(
-			mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "http-logging", Version: "0.1.0"}),
-			mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+			mcpservice.WithServerInfo(mcpservice.StaticServerInfo("http-logging", "0.1.0")),
+			mcpservice.WithLoggingCapability(mcpservice.StaticLogging(mcpservice.NewSlogLevelVarLogging(&lv))),
 		)
 		srv := mustServer(t, server)
 		defer srv.Close()
@@ -288,8 +295,8 @@ func TestSingleInstance(t *testing.T) {
 		lv.Set(slog.LevelInfo)
 
 		server := mcpservice.NewServer(
-			mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "http-logging", Version: "0.1.0"}),
-			mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)),
+			mcpservice.WithServerInfo(mcpservice.StaticServerInfo("http-logging", "0.1.0")),
+			mcpservice.WithLoggingCapability(mcpservice.StaticLogging(mcpservice.NewSlogLevelVarLogging(&lv))),
 		)
 		srv := mustServer(t, server)
 		defer srv.Close()
@@ -557,10 +564,8 @@ func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) 
 	// Use the real mcpservice.NewServer to align with production wiring.
 	server := mcpservice.NewServer(
 		mcpservice.WithToolsCapability(testToolsCap{}),
-		// Provide a preferred protocol version to match test expectations.
-		mcpservice.WithPreferredProtocolVersion("2025-06-18"),
-		// Keep server info minimal; not essential to this test.
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "test", Version: "0.0.1"}),
+		mcpservice.WithProtocolVersion(mcpservice.StaticProtocolVersion("2025-06-18")),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("test", "0.0.1")),
 	)
 	h, err := streaminghttp.New(context.Background(), "http://example.com/mcp", host, server, &noAuth{wantToken: "test-token"}, streaminghttp.WithServerName("t"), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "https://issuer", JwksURI: "https://issuer/jwks"}))
 	if err != nil {

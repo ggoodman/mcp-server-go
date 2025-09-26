@@ -42,6 +42,12 @@ func NewPromptsContainer(defs ...StaticPrompt) *PromptsContainer {
 	return sp
 }
 
+// ProvidePrompts implements PromptsCapabilityProvider for the static container.
+// Always reports present (ok=true).
+func (sp *PromptsContainer) ProvidePrompts(ctx context.Context, session sessions.Session) (PromptsCapability, bool, error) {
+	return sp, true, nil
+}
+
 // SetPageSize sets the pagination size for ListPrompts.
 func (sp *PromptsContainer) SetPageSize(n int) {
 	if n > 0 {

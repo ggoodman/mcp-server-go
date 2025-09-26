@@ -12,7 +12,7 @@ import (
 // New constructs a server whose resources vary per session/user.
 // Each user sees a single profile resource at res://user/<userID>/profile.
 func New() mcpservice.ServerCapabilities {
-	resourcesProvider := func(ctx context.Context, s sessions.Session) (mcpservice.ResourcesCapability, bool, error) {
+	provider := mcpservice.ResourcesCapabilityProviderFunc(func(ctx context.Context, s sessions.Session) (mcpservice.ResourcesCapability, bool, error) {
 		cap := mcpservice.NewDynamicResources(
 			mcpservice.WithResourcesListFunc(func(ctx context.Context, _ sessions.Session, _ *string) (mcpservice.Page[mcp.Resource], error) {
 				uri := fmt.Sprintf("res://user/%s/profile", s.UserID())
@@ -23,10 +23,10 @@ func New() mcpservice.ServerCapabilities {
 			}),
 		)
 		return cap, true, nil
-	}
+	})
 
 	return mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-resources-per-session", Version: "0.1.0"}),
-		mcpservice.WithResourcesProvider(resourcesProvider),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("examples-resources-per-session", "0.1.0")),
+		mcpservice.WithResourcesCapability(provider),
 	)
 }

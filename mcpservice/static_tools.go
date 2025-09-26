@@ -309,6 +309,14 @@ func NewToolsContainer(defs ...StaticTool) *ToolsContainer {
 	return st
 }
 
+// ProvideTools makes *ToolsContainer satisfy ToolsCapabilityProvider. It always
+// returns itself as the ToolsCapability with ok=true (present) even if it has
+// zero tools; an empty container is a present-but-empty capability rather than
+// an absent one.
+func (st *ToolsContainer) ProvideTools(ctx context.Context, session sessions.Session) (ToolsCapability, bool, error) {
+	return st, true, nil
+}
+
 // SetPageSize sets the pagination size used by ListTools for static tools.
 // A non-positive value is ignored.
 func (st *ToolsContainer) SetPageSize(n int) {

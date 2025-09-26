@@ -215,10 +215,21 @@ func (rootsTriggerToolsCap) GetListChangedCapability(ctx context.Context, s sess
 	return nil, false, nil
 }
 
+// ProvideTools allows rootsTriggerToolsCap to satisfy the ToolsCapabilityProvider interface directly
+// so it can be supplied to WithToolsCapability without wrapping.
+func (r rootsTriggerToolsCap) ProvideTools(ctx context.Context, s sessions.Session) (mcpservice.ToolsCapability, bool, error) {
+	return r, true, nil
+}
+
 // fakeCompletions is a simple completions capability for tests.
 type fakeCompletions struct{}
 
 var _ mcpservice.CompletionsCapability = (*fakeCompletions)(nil)
+
+// ProvideCompletions allows fakeCompletions to satisfy CompletionsCapabilityProvider directly.
+func (f fakeCompletions) ProvideCompletions(ctx context.Context, s sessions.Session) (mcpservice.CompletionsCapability, bool, error) {
+	return f, true, nil
+}
 
 func (fakeCompletions) Complete(ctx context.Context, _ sessions.Session, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
 	return &mcp.CompleteResult{Completion: mcp.Completion{Values: []string{"one", "two"}, Total: 2}}, nil
@@ -228,11 +239,11 @@ func (fakeCompletions) Complete(ctx context.Context, _ sessions.Session, req *mc
 
 func TestInitialize_HappyPath(t *testing.T) {
 	srv := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "test", Version: "1.0.0"}),
-		mcpservice.WithPreferredProtocolVersion(defaultProtocolVersion),
-		mcpservice.WithInstructions("Have fun!"),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("test", "1.0.0")),
+		mcpservice.WithProtocolVersion(mcpservice.StaticProtocolVersion(defaultProtocolVersion)),
+		mcpservice.WithInstructions(mcpservice.StaticInstructions("Have fun!")),
 		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
-		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&slog.LevelVar{})),
+		mcpservice.WithLoggingCapability(mcpservice.StaticLogging(mcpservice.NewSlogLevelVarLogging(&slog.LevelVar{}))),
 	)
 	th := newHarness(t, srv)
 
@@ -773,7 +784,7 @@ func TestCompletion_Complete(t *testing.T) {
 func TestLogging_SetLevelAndMessages(t *testing.T) {
 	var lv slog.LevelVar
 	lv.Set(slog.LevelInfo)
-	srv := mcpservice.NewServer(mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)))
+	srv := mcpservice.NewServer(mcpservice.WithLoggingCapability(mcpservice.StaticLogging(mcpservice.NewSlogLevelVarLogging(&lv))))
 	th := newHarness(t, srv)
 
 	_ = th.initialize(t, "init-1", defaultInitializeRequest())

@@ -59,96 +59,77 @@ type ReverseOut struct {
 
 func main() {
 	// Define a typed tool in one go (input + output schemas are reflected).
-	reverseTool := mcpservice.NewToolWithOutput[ReverseArgs, ReverseOut](
-		"reverse", // tool name
-		func(ctx context.Context, _ mcpservice.ToolResponseWriterTyped[ReverseOut], w mcpservice.ToolResponseWriterTyped[ReverseOut], r *mcpservice.ToolRequest[ReverseArgs]) error {
-			in := r.Args().Text
-			rs := []rune(in)
-			for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
-				rs[i], rs[j] = rs[j], rs[i]
-			}
-			out := string(rs)
-			_ = w.AppendText("reversed: " + out) // plain content block
-			w.SetStructured(ReverseOut{Reversed: out, Length: len(rs)})
-			return nil
-		},
-		mcpservice.WithToolDescription("Reverse a string (demo)"),
-	)
+		tools := mcpservice.NewToolsContainer(reverseTool)
 
-	tools := mcpservice.NewToolsContainer(reverseTool)
+		server := mcpservice.NewServer(
+			mcpservice.WithServerInfo(mcpservice.StaticServerInfo("reverse-cli", "0.0.1")),
+			mcpservice.WithToolsCapability(tools),
+		)
 
-	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "reverse-cli", Version: "0.0.1"}),
-		mcpservice.WithToolsCapability(tools),
-	)
-
-	// Stdio handler spins up an in‑memory SessionHost automatically.
-	h := stdio.NewHandler(server)
-	if err := h.Serve(context.Background()); err != nil {
-		log.Println("server exited:", err)
-		os.Exit(1)
+		// Stdio handler spins up an in‑memory SessionHost automatically.
+		h := stdio.NewHandler(server)
+		if err := h.Serve(context.Background()); err != nil {
+			log.Println("server exited:", err)
+			os.Exit(1)
+		}
 	}
-}
-```
+	```
 
-Upgrade path: swap the transport + host; your `server` stays the same.
+	Upgrade path: swap the transport + host; your `server` stays the same.
 
-```go
-// (Sketch – not a full program)
-host := redishost.New(redisClient) // or your implementation of sessions.SessionHost
-authn, _ := auth.NewFromDiscovery(ctx, issuerURL, auth.WithExpectedAudience(publicURL))
-httpHandler, _ := streaminghttp.New(ctx, publicURL, host, server, authn,
-	streaminghttp.WithAuthorizationServerDiscovery(issuerURL),
-	streaminghttp.WithServerName("reverse-prod"),
-)
-http.Handle("/mcp", httpHandler)
-```
+	```go
+	// (Sketch – not a full program)
+	host := redishost.New(redisClient) // or your implementation of sessions.SessionHost
+	authn, _ := auth.NewFromDiscovery(ctx, issuerURL, auth.WithExpectedAudience(publicURL))
+	httpHandler, _ := streaminghttp.New(ctx, publicURL, host, server, authn,
+		streaminghttp.WithAuthorizationServerDiscovery(issuerURL),
+		streaminghttp.WithServerName("reverse-prod"),
+	)
+	http.Handle("/mcp", httpHandler)
+	```
 
----
+	---
 
-## Capability Model (Server Side)
+	## Capability Model (Server Side)
 
-At initialization the client sends its `ClientCapabilities`; the server responds with `ServerCapabilities`. Each negotiated capability unlocks a method set (see `mcp/messages.go`). Server implementations choose between:
+	At initialization the client sends its `ClientCapabilities`; the server responds with `ServerCapabilities`. Each negotiated capability unlocks a method set (see `mcp/messages.go`). Server implementations choose between:
 
-1. **Containers (static sets)** – simple, mutation helpers, built‑in pagination and change notifications.
-2. **Callbacks / Providers (dynamic)** – per session logic via option providers (`WithToolsProvider`, etc.).
+	1. **Containers (static sets)** – simple, mutation helpers, built‑in pagination and change notifications.
+	2. **Provider funcs (dynamic)** – per session logic (return (cap, ok, err)).
 
-### Summary Table
+	Each capability is configured by a single `With*Capability` option that accepts a provider:
 
-| Domain | Methods (list/read/call) | Change Notifications | Container Helper | Dynamic Hook |
-|--------|--------------------------|----------------------|------------------|--------------|
-| Tools | `tools/list`, `tools/call` | `notifications/tools/list_changed` | `NewToolsContainer` + `NewTool*` | `WithToolsProvider` |
-| Resources | `resources/list`, `resources/read`, templates | `notifications/resources/list_changed`, `notifications/resources/updated` | `NewResourcesContainer` | `WithResourcesProvider` |
-| Prompts | `prompts/list`, `prompts/get` | `notifications/prompts/list_changed` | (inline: build your own) | `WithPromptsProvider` |
-| Logging | `logging/setLevel` | `notifications/message` | (implement interface) | `WithLoggingProvider` |
-| Completions | `completion/complete` | — | (implement interface) | `WithCompletionsProvider` |
-| Sampling | `sampling/createMessage` | — | (implement using `mcp/sampling` helpers) | — |
-| Elicitation | `elicitation/create` | — | Use `elicitation.Builder` | — |
-| Roots | `roots/list` | `notifications/roots/list_changed` | (implement interface) | (future) |
+	* Pass a container (e.g. `NewToolsContainer`) directly – containers self‑implement the provider.
+	* Or pass an `XCapabilityProviderFunc` for per‑session logic.
 
-### Tools via Container
+## Authorization and discovery
 
-```go
-tools := mcpservice.NewToolsContainer(
-	mcpservice.NewTool[MyArgs]("do_stuff", func(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[MyArgs]) error {
-		_ = w.AppendText("done")
-		return nil
-	}, mcpservice.WithToolDescription("Does stuff")),
-)
-server := mcpservice.NewServer(mcpservice.WithToolsCapability(tools))
-```
+When you enable discovery with `WithAuthorizationServerDiscovery(issuer)`, the handler:
 
-### Tools Dynamically (Per Session)
+- Validates tokens using JWKS from your issuer (via `auth.NewFromDiscovery`).
+- Serves Protected Resource Metadata at `/.well-known/oauth-protected-resource/`.
+- Mirrors Authorization Server Metadata at `/.well-known/oauth-authorization-server`.
+- Responds to unauthorized requests with a standards-compliant `WWW-Authenticate` header that points at the resource metadata.
 
-```go
-server := mcpservice.NewServer(
-	mcpservice.WithToolsProvider(func(ctx context.Context, sess sessions.Session) (mcpservice.ToolsCapability, bool, error) {
-		if sess.UserID() == "restricted" { return nil, false, nil }
-		tc := mcpservice.NewToolsContainer(/* build based on session */)
-		return tc, true, nil
-	}),
-)
-```
+See the spec documents under `specs/` for details.
+
+## Capability providers (static & dynamic)
+
+Every capability is configured via exactly one option: `WithResourcesCapability`, `WithToolsCapability`, `WithPromptsCapability`, `WithLoggingCapability`, etc. Each option takes a provider – something implementing the corresponding `XCapabilityProvider` interface.
+
+Three ergonomic patterns:
+
+1. Static constant: use the `StaticX` helpers, e.g. `WithProtocolVersion(StaticProtocolVersion("2025-06-18"))` or `WithServerInfo(StaticServerInfo("name", "version", WithServerInfoTitle("Nice Title")))`.
+2. Self-providing container: pass a container directly. `NewToolsContainer(...)` and `NewResourcesContainer(...)` implement both the capability and its provider; just do `WithToolsCapability(tools)`.
+3. Per-session dynamic logic: provide an `XCapabilityProviderFunc` closure. It receives context + session and can return a tailored capability (or `ok=false` to omit it for that session).
+
+Return `(value, ok=true, nil)` to advertise a capability even if its list is empty. Return `ok=false` to *omit* that capability altogether.
+
+ListChanged notifications are emitted when underlying containers signal a change (e.g. `Replace` / `ReplaceResources`). This works uniformly for static containers and dynamic implementations.
+
+## Dynamic capabilities (and static containers)
+
+Prefer dynamic? Provide an `XCapabilityProviderFunc` closure when constructing the server.
 
 ---
 

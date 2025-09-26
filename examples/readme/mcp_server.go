@@ -82,7 +82,7 @@ func NewExampleServer() mcpservice.ServerCapabilities {
 	tools := mcpservice.NewToolsContainer(translate)
 
 	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "my-mcp", Version: "1.0.0"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("my-mcp", "1.0.0")),
 		mcpservice.WithToolsCapability(tools),
 	)
 

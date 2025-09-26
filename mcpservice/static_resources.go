@@ -66,6 +66,12 @@ func NewResourcesContainer(resources []mcp.Resource, templates []mcp.ResourceTem
 	return sr
 }
 
+// ProvideResources implements ResourcesCapabilityProvider for a static container.
+// Always returns itself as present (ok=true) even if empty.
+func (sr *ResourcesContainer) ProvideResources(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error) {
+	return sr, true, nil
+}
+
 // SnapshotResources returns a copy of the current resources slice.
 func (sr *ResourcesContainer) SnapshotResources() []mcp.Resource {
 	sr.mu.RLock()
