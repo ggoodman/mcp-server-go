@@ -5,11 +5,11 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	// Removed unused import of elicitation
 )
 
 func fail(w mcpservice.ToolResponseWriter, msg string) error {
@@ -44,12 +44,8 @@ func NewExampleServer() mcpservice.ServerCapabilities {
 			var elic struct {
 				Language string `json:"language" jsonschema:"minLength=1,description=Target language for translation (e.g. French, Spanish)"`
 			}
-			dec, derr := elicitation.BindStruct(&elic)
-			if derr != nil {
-				return fail(w, "Elicitation bind error: "+derr.Error())
-			}
 
-			action, err := el.Elicit(ctx, "Which language should I translate to?", dec)
+			action, err := el.Elicit(ctx, "Which language should I translate to?", &elic)
 			if err != nil {
 				return fail(w, "Elicitation error: "+err.Error())
 			}

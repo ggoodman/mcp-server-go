@@ -38,12 +38,16 @@
 // ElicitationCapability.Elicit. They modify ElicitConfig through functional
 // options; additional options can be added without breaking callers.
 //
-// Example (strict elicitation):
+// Example (strict elicitation, shorthand pointer form):
 //
 //	var input struct { Name string `json:"name" jsonschema:"minLength=1"` }
-//	dec, _ := elicitation.BindStruct(&input)
-//	action, err := session.GetElicitationCapability().Elicit(ctx, "Who are you?", dec, sessions.WithStrictKeys())
+//	action, err := session.GetElicitationCapability().Elicit(ctx, "Who are you?", &input, sessions.WithStrictKeys())
 //	if err != nil { return err }
 //	if action != sessions.ElicitActionAccept { return }
 //	// use input.Name
+//
+// Advanced: You can still pre-build a decoder:
+//
+//	dec, _ := elicitation.BindStruct(&input)
+//	action, err := session.GetElicitationCapability().Elicit(ctx, "Who are you?", dec)
 package sessions

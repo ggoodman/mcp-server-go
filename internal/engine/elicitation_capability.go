@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"reflect"
 
 	pubelicit "github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
@@ -24,7 +26,36 @@ type elicitationCapability struct {
 }
 
 // Elicit implements sessions.ElicitationCapability.
-func (c *elicitationCapability) Elicit(ctx context.Context, text string, decoder pubelicit.SchemaDecoder, opts ...sessions.ElicitOption) (sessions.ElicitAction, error) {
+func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject any, opts ...sessions.ElicitOption) (sessions.ElicitAction, error) {
+	// Accept either a SchemaDecoder or a *struct (pointer). Bind on-demand for the latter.
+	var decoder pubelicit.SchemaDecoder
+	switch v := subject.(type) {
+	case pubelicit.SchemaDecoder:
+		decoder = v
+	default:
+		// If it's a pointer to struct, attempt binding.
+		rv := reflect.ValueOf(subject)
+		if rv.IsValid() && rv.Kind() == reflect.Ptr && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+			var bindErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						bindErr = errors.New("elicitation: panic during schema reflection")
+						c.log.Error("elicitation.bind.panic", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.Any("recover", r))
+					}
+				}()
+				decoder, bindErr = pubelicit.BindStruct(subject)
+			}()
+			if bindErr != nil {
+				c.log.Error("elicitation.bind.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", bindErr.Error()))
+				return sessions.ElicitActionCancel, bindErr
+			}
+		} else {
+			c.log.Error("elicitation.subject.invalid", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+			return sessions.ElicitActionCancel, sessions.ErrInvalidElicitSubject
+		}
+	}
+
 	// Obtain schema (cached or constructed lazily by implementation)
 	sch, err := decoder.Schema()
 	if err != nil {

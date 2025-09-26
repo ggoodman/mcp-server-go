@@ -2,8 +2,8 @@ package sessions
 
 import (
 	"context"
+	"errors"
 
-	"github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/mcp"
 )
 
@@ -82,14 +82,33 @@ const (
 // from type metadata and does not mutate the target until after a successful round-trip.
 type ElicitationCapability interface {
 	// Elicit sends an elicitation request with the provided user-facing message text.
-	// The provided SchemaDecoder encapsulates both the schema (what is being asked)
-	// and the decoding logic (how to hydrate the destination). The destination is
-	// typically already bound inside the SchemaDecoder (e.g. via elicitation.BindStruct(&myStruct)),
-	// but implementations MAY allow Decode() to accept an alternate destination when
-	// invoked. The options control per-call validation semantics (like strict key
-	// enforcement) and raw capture.
-	Elicit(ctx context.Context, text string, decoder elicitation.SchemaDecoder, opts ...ElicitOption) (ElicitAction, error)
+	// subject may be either:
+	//   1. an elicitation.SchemaDecoder (advanced / pre-built form), OR
+	//   2. a non-nil pointer to a struct (shorthand). In this case the implementation
+	//      will internally call elicitation.BindStruct(subject) to derive a schema
+	//      and bind the decoder to that pointer.
+	//
+	// Most callers should simply pass &MyStruct{} (or a pointer they keep around)
+	// directly:
+	//
+	//  type Input struct { Name string `json:"name" jsonschema:"minLength=1"` }
+	//  var in Input
+	//  action, err := elicCap.Elicit(ctx, "Who are you?", &in)
+	//
+	// Backwards-compatible usage with an explicit SchemaDecoder still works:
+	//
+	//  dec, _ := elicitation.BindStruct(&in)
+	//  action, err := elicCap.Elicit(ctx, "Who are you?", dec)
+	//
+	// If binding / schema construction fails (e.g. subject not a *struct), the
+	// returned action will be ElicitActionCancel along with a descriptive error.
+	Elicit(ctx context.Context, text string, subject any, opts ...ElicitOption) (ElicitAction, error)
 }
+
+// ErrInvalidElicitSubject is returned by ElicitationCapability.Elicit when the
+// provided subject value is neither a SchemaDecoder nor a non-nil pointer to a struct.
+// Callers can test errors.Is(err, ErrInvalidElicitSubject) to branch.
+var ErrInvalidElicitSubject = errors.New("sessions: invalid elicitation subject; must be SchemaDecoder or *struct")
 
 // ElicitOption configures an elicitation invocation (functional options pattern).
 type ElicitOption func(*ElicitConfig)
