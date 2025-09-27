@@ -6,10 +6,9 @@ import (
 	"os"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
-	// Removed unused import of elicitation
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 )
 
 func fail(w mcpservice.ToolResponseWriter, msg string) error {
@@ -57,19 +56,18 @@ func NewExampleServer() mcpservice.ServerCapabilities {
 				return fail(w, "Elicitation did not return a valid language.")
 			}
 
-			sres, err := sp.CreateMessage(ctx, sampling.NewCreateMessage(
-				[]mcp.SamplingMessage{
-					sampling.UserText("Translate the following text to " + lang),
-					sampling.UserText(a.Text),
-				},
-				sampling.WithSystemPrompt("You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else."),
-				sampling.WithMaxTokens(100),
-			))
+			sres, err := sp.CreateMessage(ctx,
+				"You're a helpful assistant that translates text into the requested language. You respond with the translated message and nothing else.",
+				// Provide user message conveying intent + input.
+				sampling.UserText("Translate the following text to "+lang+"\n"+a.Text),
+			)
 			if err != nil {
 				return fail(w, "Sampling error: "+err.Error())
 			}
 
-			_ = w.AppendBlocks(sres.Content)
+			if txt, ok := sres.Message.Content.(sampling.Text); ok {
+				_ = w.AppendBlocks(mcp.ContentBlock{Type: mcp.ContentTypeText, Text: txt.Text})
+			}
 			return nil
 		},
 		mcpservice.WithToolDescription("Translate text to a target language."),

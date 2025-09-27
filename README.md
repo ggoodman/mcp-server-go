@@ -40,73 +40,75 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 
-	"github.com/ggoodman/mcp-server-go/elicitation"
-	"github.com/ggoodman/mcp-server-go/mcp"
-	"github.com/ggoodman/mcp-server-go/mcp/sampling"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 	"github.com/ggoodman/mcp-server-go/stdio"
 )
 
 // Minimal args: none needed to start the interaction.
 type VibeArgs struct{}
 
-func main() {
-	tool := mcpservice.NewTool("vibe_check", func(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[VibeArgs]) error {
-		_ = w.AppendBlocks(mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "Initiating vibe check…"})
+type VibePrompt struct {
+	Phrase string `json:"phrase" jsonschema:"minLength=3,description=How are you feeling?,title=Vibe"`
+}
 
-		el, ok := s.GetElicitationCapability()
-		if !ok {
-			w.AppendText("Not feeling the vibes on this client.")
-			w.SetError(true)
-			return nil
-		}
+func vibeCheck(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[VibeArgs]) error {
+	el, ok := s.GetElicitationCapability()
+	if !ok {
+		return fmt.Errorf("elicitation capability not available in this session")
+	}
 
-		type Phrase struct {
-			Phrase string `json:"phrase" jsonschema:"minLength=3,description=Your current vibe in a few words"`
-		}
-		var p Phrase
-		dec, err := elicitation.BindStruct(&p)
-		if err != nil {
-			return err
-		}
+	var prompt VibePrompt
 
-		phraseText := "not feeling it"
-
-		action, err := el.Elicit(ctx, "What's the vibe?", dec)
-		if err == nil && action == sessions.ElicitActionAccept {
-			phraseText = p.Phrase
-		}
-
-		samp, ok := s.GetSamplingCapability()
-		if !ok {
-			w.AppendText("can't feel the vibes")
-			w.SetError(true)
-			return nil
-		}
-
-		// Sample host LLM for a single whimsical word.
-		res, err := samp.CreateMessage(ctx, sampling.NewCreateMessage([]mcp.SamplingMessage{{
-			Role:    mcp.RoleUser,
-			Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: phraseText},
-		}}, sampling.WithSystemPrompt("Respond with short phrase, capturing the emotional vibe of the submitted message with a touch of whimsy."),
-			sampling.WithMaxTokens(40),
-		))
-		if err != nil {
-			return err
-		}
-
-		w.AppendBlocks(res.Content)
-
+	// Below, the reference to prompt both documents the expected response shape
+	// and populates it when the user accepts the elicitation.
+	action, err := el.Elicit(ctx, "What's the vibe?", &prompt)
+	if err != nil {
+		return err
+	}
+	if action != sessions.ElicitActionAccept {
+		w.AppendText("the user is not feeling it")
+		w.SetError(true)
 		return nil
-	}, mcpservice.WithToolDescription("Elicits a phrase then performs a playful LLM-powered vibe check."))
+	}
 
-	tools := mcpservice.NewToolsContainer(tool)
+	samp, ok := s.GetSamplingCapability()
+	if !ok {
+		return fmt.Errorf("sampling capability not available in this session")
+	}
+
+	// Sample host LLM for a single whimsical word (new ergonomic API).
+	res, err := samp.CreateMessage(ctx,
+		"Respond with short phrase, capturing the emotional vibe of the submitted message with a touch of whimsy.",
+		sampling.UserText(prompt.Phrase),
+		sampling.WithMaxTokens(50),
+	)
+	if err != nil {
+		return err
+	}
+
+	w.AppendBlocks(res.Message.Content.AsContentBlock())
+
+	if txt, ok := res.Message.Content.(sampling.Text); ok {
+		w.AppendText(txt.Text)
+	}
+
+	return nil
+}
+
+func main() {
+	tools := mcpservice.NewToolsContainer(
+		mcpservice.NewTool("vibe_check", vibeCheck, mcpservice.WithToolDescription("Herein lies the answer when the question is vibe.")),
+	)
+
 	server := mcpservice.NewServer(
 		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("vibe-check-demo", "0.0.1")),
 		mcpservice.WithToolsCapability(tools),
+		mcpservice.WithInstructions(mcpservice.StaticInstructions("Your finger is on the pulse of the inter-webs. You can feel it. You can help others feel it too.")),
 	)
 
 	h := stdio.NewHandler(server)
@@ -114,6 +116,7 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
 ```
 
 Upgrade path: swap the transport + host; your `server` stays the same.
@@ -225,13 +228,17 @@ Use when you need the client (or host application) to produce a model-generated 
 
 ```go
 if samp, ok := sess.GetSamplingCapability(); ok {
-	req := sampling.NewCreateMessage([]mcp.SamplingMessage{
-		{Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "Summarize current plan"}},
-	}, sampling.WithSystemPrompt("Be concise"), sampling.WithMaxTokens(256))
-	if err := sampling.ValidateCreateMessage(req); err != nil { return err }
-	res, err := samp.CreateMessage(ctx, req)
+	res, err := samp.CreateMessage(
+		ctx,
+		"Be concise",                          // system prompt
+		sampling.UserText("Summarize current plan"), // user message
+		sampling.WithMaxTokens(256),
+	)
 	if err != nil { return err }
-	log.Printf("model=%s reply=%s", res.Model, res.Content.Text)
+	// The returned assistant message is in res.Message
+	if txt, ok := res.Message.Content.(sampling.Text); ok {
+		log.Printf("model=%s reply=%s", res.Model, txt.Text)
+	}
 }
 ```
 
@@ -333,7 +340,7 @@ Long running tool calls can emit `notifications/progress` (server -> client) and
 
 ### Sampling & Elicitation Helpers
 
-Package `mcp/sampling` provides ergonomic helpers for building sampling messages; `elicitation` provides a builder for collecting structured values from the client. They layer cleanly atop the same session and transport plumbing.
+Use `sessions/sampling` for constructing user / assistant / system messages with exactly one content block (e.g. `UserText("hello")`). Invoke `SamplingCapability.CreateMessage` with the system prompt, the current user message, and option helpers (e.g. `sessions.WithMaxTokens`). The `elicitation` package provides a reflective schema-driven workflow for gathering structured user input mid-tool.
 
 ---
 

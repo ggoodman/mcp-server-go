@@ -16,19 +16,18 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 )
 
-// testHarness wires a Handler to an in-memory stdio pair with helpers to send/recv messages.
+// testHarness encapsulates pipes and collected output for stdio handler tests.
 type testHarness struct {
-	t      *testing.T
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	stdinW  io.WriteCloser
+	t       *testing.T
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stdinW  io.Writer
 	stdoutR *bufio.Scanner
-
-	outMu sync.Mutex
-	lines []string
+	outMu   sync.Mutex
+	lines   []string
 }
 
 const defaultProtocolVersion = "2024-11-05"
@@ -513,8 +512,7 @@ func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
 	roundtripDesc := mcp.Tool{Name: "roundtrip", InputSchema: mcp.ToolInputSchema{Type: "object"}}
 	tool := mcpservice.StaticTool{Descriptor: roundtripDesc, Handler: func(ctx context.Context, session sessions.Session, _ *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
 		if smp, ok := session.GetSamplingCapability(); ok {
-			req := &mcp.CreateMessageRequest{Messages: []mcp.SamplingMessage{{Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "hi"}}}}
-			go func() { _, _ = smp.CreateMessage(ctx, req) }()
+			go func() { _, _ = smp.CreateMessage(ctx, "", sampling.UserText("hi")) }()
 		}
 		return mcpservice.TextResult("ok"), nil
 	}}

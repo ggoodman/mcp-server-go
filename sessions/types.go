@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 )
 
 // Session represents a negotiated MCP session and exposes optional
@@ -32,11 +33,30 @@ type ClientInfo struct {
 
 // SamplingCapability when present on a session, enables the sampling surface area.
 type SamplingCapability interface {
-	CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error)
+	// CreateMessage requests the client host sample a single assistant message.
+	// system: required system prompt string (may be empty for no system context).
+	// user: the current user-authored message (RoleUser; exactly one content block).
+	// opts: functional options configuring model preferences, history, streaming, etc.
+	CreateMessage(ctx context.Context, system string, user sampling.Message, opts ...sampling.Option) (*SampleResult, error)
 }
 
 // RootsListChangedListener is invoked when the set of workspace roots changes.
 type RootsListChangedListener func(ctx context.Context) error
+
+// SampleResult is the ergonomic return type for SamplingCapability.CreateMessage.
+// It intentionally mirrors the wire result shape while leaving room for future
+// metadata without forcing callers onto protocol types.
+type SampleResult struct {
+	Message sampling.Message
+	// Usage, Model, StopReason etc. can be added once surfaced by the engine.
+	Model      string
+	StopReason string
+	Meta       map[string]any
+}
+
+// (sampling options relocated to sessions/sampling)
+
+// (sampling builder logic moved to internal/sampling)
 
 // RootsCapability when present, exposes workspace roots and change notifications.
 type RootsCapability interface {

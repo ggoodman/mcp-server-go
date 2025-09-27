@@ -2,12 +2,16 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 
+	"github.com/ggoodman/mcp-server-go/internal/createmessage"
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 	"github.com/google/uuid"
 )
 
@@ -23,9 +27,40 @@ type samplingCapabilty struct {
 }
 
 // CreateMessage implements sessions.SamplingCapability.
-func (s *samplingCapabilty) CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
-	reqID := uuid.NewString()
+func (s *samplingCapabilty) CreateMessage(ctx context.Context, system string, user sampling.Message, opts ...sampling.Option) (*sessions.SampleResult, error) {
+	spec := sampling.CreateSpec{}.Compile(opts...)
+	cfg := &createmessage.Config{System: system, User: user}
+	if spec.ModelPrefs != nil {
+		cfg.ModelPrefs = spec.ModelPrefs
+	}
+	if spec.Temperature != nil {
+		cfg.Temperature = *spec.Temperature
+	}
+	if spec.MaxTokens != nil {
+		cfg.MaxTokens = *spec.MaxTokens
+	}
+	if len(spec.History) > 0 {
+		cfg.History = spec.History
+	}
+	if len(spec.StopSequences) > 0 {
+		cfg.StopSequences = spec.StopSequences
+	}
+	if spec.Metadata != nil {
+		cfg.Metadata = spec.Metadata
+	}
+	if spec.IncludeContext != "" {
+		cfg.IncludeContext = spec.IncludeContext
+	}
+	req, err := createmessage.BuildCreateMessageRequest(cfg)
+	if err != nil {
+		return nil, err
+	}
 
+	if user.Role != sampling.RoleUser {
+		return nil, errors.New("sampling: user message role must be 'user'")
+	}
+
+	reqID := uuid.NewString()
 	params, err := json.Marshal(req)
 	if err != nil {
 		s.log.Error("sampling.create_message.err", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
@@ -80,9 +115,33 @@ func (s *samplingCapabilty) CreateMessage(ctx context.Context, req *mcp.CreateMe
 			return nil, ErrInternal
 		}
 
-		return &res, nil
+		// Inline mapping (was sessions.FromProtocolResult previously).
+		sampledMsg := sampling.Message{Role: sampling.Role(res.Role)}
+		switch res.Content.Type {
+		case mcp.ContentTypeText:
+			sampledMsg.Content = sampling.Text{Text: res.Content.Text}
+		case mcp.ContentTypeImage:
+			data, _ := base64.StdEncoding.DecodeString(res.Content.Data)
+			sampledMsg.Content = sampling.Image{MIMEType: res.Content.MimeType, Data: data}
+		case mcp.ContentTypeAudio:
+			data, _ := base64.StdEncoding.DecodeString(res.Content.Data)
+			sampledMsg.Content = sampling.Audio{MIMEType: res.Content.MimeType, Data: data}
+		default:
+			sampledMsg.Content = sampling.Text{Text: ""}
+		}
+		var meta map[string]any
+		if res.Meta != nil {
+			cp := make(map[string]any, len(res.Meta))
+			for k, v := range res.Meta {
+				cp[k] = v
+			}
+			meta = cp
+		}
+		return &sessions.SampleResult{Message: sampledMsg, Model: res.Model, StopReason: res.StopReason, Meta: meta}, nil
 	case <-ctx.Done():
 		s.log.Error("sampling.create_message.err", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", "context done before response received"))
 		return nil, ctx.Err()
 	}
 }
+
+// (legacy helper code removed; conversion handled in sessions package)
