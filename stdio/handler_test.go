@@ -16,19 +16,18 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 )
 
-// testHarness wires a Handler to an in-memory stdio pair with helpers to send/recv messages.
+// testHarness encapsulates pipes and collected output for stdio handler tests.
 type testHarness struct {
-	t      *testing.T
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	stdinW  io.WriteCloser
+	t       *testing.T
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stdinW  io.Writer
 	stdoutR *bufio.Scanner
-
-	outMu sync.Mutex
-	lines []string
+	outMu   sync.Mutex
+	lines   []string
 }
 
 const defaultProtocolVersion = "2024-11-05"
@@ -215,10 +214,21 @@ func (rootsTriggerToolsCap) GetListChangedCapability(ctx context.Context, s sess
 	return nil, false, nil
 }
 
+// ProvideTools allows rootsTriggerToolsCap to satisfy the ToolsCapabilityProvider interface directly
+// so it can be supplied to WithToolsCapability without wrapping.
+func (r rootsTriggerToolsCap) ProvideTools(ctx context.Context, s sessions.Session) (mcpservice.ToolsCapability, bool, error) {
+	return r, true, nil
+}
+
 // fakeCompletions is a simple completions capability for tests.
 type fakeCompletions struct{}
 
 var _ mcpservice.CompletionsCapability = (*fakeCompletions)(nil)
+
+// ProvideCompletions allows fakeCompletions to satisfy CompletionsCapabilityProvider directly.
+func (f fakeCompletions) ProvideCompletions(ctx context.Context, s sessions.Session) (mcpservice.CompletionsCapability, bool, error) {
+	return f, true, nil
+}
 
 func (fakeCompletions) Complete(ctx context.Context, _ sessions.Session, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
 	return &mcp.CompleteResult{Completion: mcp.Completion{Values: []string{"one", "two"}, Total: 2}}, nil
@@ -228,11 +238,11 @@ func (fakeCompletions) Complete(ctx context.Context, _ sessions.Session, req *mc
 
 func TestInitialize_HappyPath(t *testing.T) {
 	srv := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "test", Version: "1.0.0"}),
-		mcpservice.WithPreferredProtocolVersion(defaultProtocolVersion),
-		mcpservice.WithInstructions("Have fun!"),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("test", "1.0.0")),
+		mcpservice.WithProtocolVersion(mcpservice.StaticProtocolVersion(defaultProtocolVersion)),
+		mcpservice.WithInstructions(mcpservice.StaticInstructions("Have fun!")),
 		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
-		mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&slog.LevelVar{})),
+		mcpservice.WithLoggingCapability(mcpservice.StaticLogging(mcpservice.NewSlogLevelVarLogging(&slog.LevelVar{}))),
 	)
 	th := newHarness(t, srv)
 
@@ -502,8 +512,7 @@ func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
 	roundtripDesc := mcp.Tool{Name: "roundtrip", InputSchema: mcp.ToolInputSchema{Type: "object"}}
 	tool := mcpservice.StaticTool{Descriptor: roundtripDesc, Handler: func(ctx context.Context, session sessions.Session, _ *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
 		if smp, ok := session.GetSamplingCapability(); ok {
-			req := &mcp.CreateMessageRequest{Messages: []mcp.SamplingMessage{{Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "hi"}}}}
-			go func() { _, _ = smp.CreateMessage(ctx, req) }()
+			go func() { _, _ = smp.CreateMessage(ctx, "", sampling.UserText("hi")) }()
 		}
 		return mcpservice.TextResult("ok"), nil
 	}}
@@ -773,7 +782,7 @@ func TestCompletion_Complete(t *testing.T) {
 func TestLogging_SetLevelAndMessages(t *testing.T) {
 	var lv slog.LevelVar
 	lv.Set(slog.LevelInfo)
-	srv := mcpservice.NewServer(mcpservice.WithLoggingCapability(mcpservice.NewSlogLevelVarLogging(&lv)))
+	srv := mcpservice.NewServer(mcpservice.WithLoggingCapability(mcpservice.StaticLogging(mcpservice.NewSlogLevelVarLogging(&lv))))
 	th := newHarness(t, srv)
 
 	_ = th.initialize(t, "init-1", defaultInitializeRequest())

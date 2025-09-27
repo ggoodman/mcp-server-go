@@ -2,9 +2,10 @@ package sessions
 
 import (
 	"context"
+	"errors"
 
-	"github.com/ggoodman/mcp-server-go/elicitation"
 	"github.com/ggoodman/mcp-server-go/mcp"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 )
 
 // Session represents a negotiated MCP session and exposes optional
@@ -32,11 +33,30 @@ type ClientInfo struct {
 
 // SamplingCapability when present on a session, enables the sampling surface area.
 type SamplingCapability interface {
-	CreateMessage(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error)
+	// CreateMessage requests the client host sample a single assistant message.
+	// system: required system prompt string (may be empty for no system context).
+	// user: the current user-authored message (RoleUser; exactly one content block).
+	// opts: functional options configuring model preferences, history, streaming, etc.
+	CreateMessage(ctx context.Context, system string, user sampling.Message, opts ...sampling.Option) (*SampleResult, error)
 }
 
 // RootsListChangedListener is invoked when the set of workspace roots changes.
 type RootsListChangedListener func(ctx context.Context) error
+
+// SampleResult is the ergonomic return type for SamplingCapability.CreateMessage.
+// It intentionally mirrors the wire result shape while leaving room for future
+// metadata without forcing callers onto protocol types.
+type SampleResult struct {
+	Message sampling.Message
+	// Usage, Model, StopReason etc. can be added once surfaced by the engine.
+	Model      string
+	StopReason string
+	Meta       map[string]any
+}
+
+// (sampling options relocated to sessions/sampling)
+
+// (sampling builder logic moved to internal/sampling)
 
 // RootsCapability when present, exposes workspace roots and change notifications.
 type RootsCapability interface {
@@ -82,14 +102,33 @@ const (
 // from type metadata and does not mutate the target until after a successful round-trip.
 type ElicitationCapability interface {
 	// Elicit sends an elicitation request with the provided user-facing message text.
-	// The provided SchemaDecoder encapsulates both the schema (what is being asked)
-	// and the decoding logic (how to hydrate the destination). The destination is
-	// typically already bound inside the SchemaDecoder (e.g. via elicitation.BindStruct(&myStruct)),
-	// but implementations MAY allow Decode() to accept an alternate destination when
-	// invoked. The options control per-call validation semantics (like strict key
-	// enforcement) and raw capture.
-	Elicit(ctx context.Context, text string, decoder elicitation.SchemaDecoder, opts ...ElicitOption) (ElicitAction, error)
+	// subject may be either:
+	//   1. an elicitation.SchemaDecoder (advanced / pre-built form), OR
+	//   2. a non-nil pointer to a struct (shorthand). In this case the implementation
+	//      will internally call elicitation.BindStruct(subject) to derive a schema
+	//      and bind the decoder to that pointer.
+	//
+	// Most callers should simply pass &MyStruct{} (or a pointer they keep around)
+	// directly:
+	//
+	//  type Input struct { Name string `json:"name" jsonschema:"minLength=1"` }
+	//  var in Input
+	//  action, err := elicCap.Elicit(ctx, "Who are you?", &in)
+	//
+	// Backwards-compatible usage with an explicit SchemaDecoder still works:
+	//
+	//  dec, _ := elicitation.BindStruct(&in)
+	//  action, err := elicCap.Elicit(ctx, "Who are you?", dec)
+	//
+	// If binding / schema construction fails (e.g. subject not a *struct), the
+	// returned action will be ElicitActionCancel along with a descriptive error.
+	Elicit(ctx context.Context, text string, subject any, opts ...ElicitOption) (ElicitAction, error)
 }
+
+// ErrInvalidElicitSubject is returned by ElicitationCapability.Elicit when the
+// provided subject value is neither a SchemaDecoder nor a non-nil pointer to a struct.
+// Callers can test errors.Is(err, ErrInvalidElicitSubject) to branch.
+var ErrInvalidElicitSubject = errors.New("sessions: invalid elicitation subject; must be SchemaDecoder or *struct")
 
 // ElicitOption configures an elicitation invocation (functional options pattern).
 type ElicitOption func(*ElicitConfig)

@@ -136,6 +136,14 @@ func NewFSResources(opts ...FSOption) *FSResources {
 	return r
 }
 
+// ProvideResources allows *FSResources to satisfy ResourcesCapabilityProvider.
+func (r *FSResources) ProvideResources(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error) {
+	if r == nil {
+		return nil, false, nil
+	}
+	return r, true, nil
+}
+
 // ListResources implements ResourcesCapability.
 func (r *FSResources) ListResources(ctx context.Context, _ sessions.Session, cursor *string) (Page[mcp.Resource], error) {
 	if r.fsys == nil {

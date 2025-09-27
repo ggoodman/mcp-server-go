@@ -39,7 +39,7 @@ func New() mcpservice.ServerCapabilities {
 	)
 
 	return mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-echo", Version: "0.1.0"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("examples-echo", "0.1.0")),
 		mcpservice.WithToolsCapability(tools),
 	)
 }

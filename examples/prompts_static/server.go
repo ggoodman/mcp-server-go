@@ -58,7 +58,7 @@ func New() mcpservice.ServerCapabilities {
 	)
 
 	return mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "examples-prompts-static", Version: "0.1.0"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("examples-prompts-static", "0.1.0")),
 		mcpservice.WithPromptsCapability(sp),
 	)
 }

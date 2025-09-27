@@ -27,12 +27,21 @@ type dynamicResources struct {
 	changeSub ChangeSubscriber
 }
 
-func NewDynamicResources(opts ...DynamicResourcesOption) ResourcesCapability {
+func NewDynamicResources(opts ...DynamicResourcesOption) *dynamicResources {
 	dr := &dynamicResources{}
 	for _, opt := range opts {
 		opt(dr)
 	}
 	return dr
+}
+
+// ProvideResources allows *dynamicResources to satisfy ResourcesCapabilityProvider so
+// it can be passed directly to WithResourcesCapability without wrapping.
+func (d *dynamicResources) ProvideResources(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error) {
+	if d == nil {
+		return nil, false, nil
+	}
+	return d, true, nil
 }
 
 func WithResourcesListFunc(fn ListResourcesFunc) DynamicResourcesOption {

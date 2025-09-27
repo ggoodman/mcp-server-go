@@ -33,62 +33,90 @@ Minimum Go version: as declared in `go.mod` (currently 1.24). The module follows
 
 ## TL;DR Quickstart (stdio CLI)
 
-Below is a tiny CLI MCP server exposing a single structured tool that reverses user input and emits both plain text and structured output. Run it under any MCP client that speaks stdio.
+Below is a tiny CLI MCP server exposing a single vibe-checking tool. The tool demonstrates using sampling and elicitation. It also shows how a response can be constructed through a `http.ResponseWriter`-like API.
 
 ```go
 package main
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"os"
 
-	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
+	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/ggoodman/mcp-server-go/sessions/sampling"
 	"github.com/ggoodman/mcp-server-go/stdio"
 )
 
-type ReverseArgs struct {
-	Text string `json:"text"`
+// Minimal args: none needed to start the interaction.
+type VibeArgs struct{}
+
+type VibePrompt struct {
+	Phrase string `json:"phrase" jsonschema:"minLength=3,description=How are you feeling?,title=Vibe"`
 }
 
-type ReverseOut struct {
-	Reversed string `json:"reversed"`
-	Length   int    `json:"length"`
+func vibeCheck(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[VibeArgs]) error {
+	el, ok := s.GetElicitationCapability()
+	if !ok {
+		return fmt.Errorf("elicitation capability not available in this session")
+	}
+
+	var prompt VibePrompt
+
+	// Below, the reference to prompt both documents the expected response shape
+	// and populates it when the user accepts the elicitation.
+	action, err := el.Elicit(ctx, "What's the vibe?", &prompt)
+	if err != nil {
+		return err
+	}
+	if action != sessions.ElicitActionAccept {
+		w.AppendText("the user is not feeling it")
+		w.SetError(true)
+		return nil
+	}
+
+	samp, ok := s.GetSamplingCapability()
+	if !ok {
+		return fmt.Errorf("sampling capability not available in this session")
+	}
+
+	// Sample host LLM for a single whimsical word (new ergonomic API).
+	res, err := samp.CreateMessage(ctx,
+		"Respond with short phrase, capturing the emotional vibe of the submitted message with a touch of whimsy.",
+		sampling.UserText(prompt.Phrase),
+		sampling.WithMaxTokens(50),
+	)
+	if err != nil {
+		return err
+	}
+
+	w.AppendBlocks(res.Message.Content.AsContentBlock())
+
+	if txt, ok := res.Message.Content.(sampling.Text); ok {
+		w.AppendText(txt.Text)
+	}
+
+	return nil
 }
 
 func main() {
-	// Define a typed tool in one go (input + output schemas are reflected).
-	reverseTool := mcpservice.NewToolWithOutput[ReverseArgs, ReverseOut](
-		"reverse", // tool name
-		func(ctx context.Context, _ mcpservice.ToolResponseWriterTyped[ReverseOut], w mcpservice.ToolResponseWriterTyped[ReverseOut], r *mcpservice.ToolRequest[ReverseArgs]) error {
-			in := r.Args().Text
-			rs := []rune(in)
-			for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
-				rs[i], rs[j] = rs[j], rs[i]
-			}
-			out := string(rs)
-			_ = w.AppendText("reversed: " + out) // plain content block
-			w.SetStructured(ReverseOut{Reversed: out, Length: len(rs)})
-			return nil
-		},
-		mcpservice.WithToolDescription("Reverse a string (demo)"),
+	tools := mcpservice.NewToolsContainer(
+		mcpservice.NewTool("vibe_check", vibeCheck, mcpservice.WithToolDescription("Herein lies the answer when the question is vibe.")),
 	)
-
-	tools := mcpservice.NewToolsContainer(reverseTool)
 
 	server := mcpservice.NewServer(
-		mcpservice.WithServerInfo(mcp.ImplementationInfo{Name: "reverse-cli", Version: "0.0.1"}),
+		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("vibe-check-demo", "0.0.1")),
 		mcpservice.WithToolsCapability(tools),
+		mcpservice.WithInstructions(mcpservice.StaticInstructions("Your finger is on the pulse of the inter-webs. You can feel it. You can help others feel it too.")),
 	)
 
-	// Stdio handler spins up an in‑memory SessionHost automatically.
 	h := stdio.NewHandler(server)
 	if err := h.Serve(context.Background()); err != nil {
-		log.Println("server exited:", err)
-		os.Exit(1)
+		log.Fatal(err)
 	}
 }
+
 ```
 
 Upgrade path: swap the transport + host; your `server` stays the same.
@@ -98,8 +126,8 @@ Upgrade path: swap the transport + host; your `server` stays the same.
 host := redishost.New(redisClient) // or your implementation of sessions.SessionHost
 authn, _ := auth.NewFromDiscovery(ctx, issuerURL, auth.WithExpectedAudience(publicURL))
 httpHandler, _ := streaminghttp.New(ctx, publicURL, host, server, authn,
-	streaminghttp.WithAuthorizationServerDiscovery(issuerURL),
-	streaminghttp.WithServerName("reverse-prod"),
+    streaminghttp.WithAuthorizationServerDiscovery(issuerURL),
+    streaminghttp.WithServerName("reverse-prod"),
 )
 http.Handle("/mcp", httpHandler)
 ```
@@ -111,44 +139,66 @@ http.Handle("/mcp", httpHandler)
 At initialization the client sends its `ClientCapabilities`; the server responds with `ServerCapabilities`. Each negotiated capability unlocks a method set (see `mcp/messages.go`). Server implementations choose between:
 
 1. **Containers (static sets)** – simple, mutation helpers, built‑in pagination and change notifications.
-2. **Callbacks / Providers (dynamic)** – per session logic via option providers (`WithToolsProvider`, etc.).
+2. **Provider funcs (dynamic)** – per session logic (return (cap, ok, err)).
 
-### Summary Table
+Each capability is configured by a single `With*Capability` option that accepts a provider:
 
-| Domain | Methods (list/read/call) | Change Notifications | Container Helper | Dynamic Hook |
-|--------|--------------------------|----------------------|------------------|--------------|
-| Tools | `tools/list`, `tools/call` | `notifications/tools/list_changed` | `NewToolsContainer` + `NewTool*` | `WithToolsProvider` |
-| Resources | `resources/list`, `resources/read`, templates | `notifications/resources/list_changed`, `notifications/resources/updated` | `NewResourcesContainer` | `WithResourcesProvider` |
-| Prompts | `prompts/list`, `prompts/get` | `notifications/prompts/list_changed` | (inline: build your own) | `WithPromptsProvider` |
-| Logging | `logging/setLevel` | `notifications/message` | (implement interface) | `WithLoggingProvider` |
-| Completions | `completion/complete` | — | (implement interface) | `WithCompletionsProvider` |
-| Sampling | `sampling/createMessage` | — | (implement using `mcp/sampling` helpers) | — |
-| Elicitation | `elicitation/create` | — | Use `elicitation.Builder` | — |
-| Roots | `roots/list` | `notifications/roots/list_changed` | (implement interface) | (future) |
+* Pass a container (e.g. `NewToolsContainer`) directly – containers self‑implement the provider.
+* Or pass an `XCapabilityProviderFunc` for per‑session logic.
 
-### Tools via Container
+## Authorization and discovery
+
+When you enable discovery with `WithAuthorizationServerDiscovery(issuer)`, the handler:
+
+- Validates tokens using JWKS from your issuer (via `auth.NewFromDiscovery`).
+- Serves Protected Resource Metadata at `/.well-known/oauth-protected-resource/`.
+- Mirrors Authorization Server Metadata at `/.well-known/oauth-authorization-server`.
+- Responds to unauthorized requests with a standards-compliant `WWW-Authenticate` header that points at the resource metadata.
+
+See the spec documents under `specs/` for details.
+
+## Capability providers (static & dynamic)
+
+Every capability is configured via exactly one option: `WithResourcesCapability`, `WithToolsCapability`, `WithPromptsCapability`, `WithLoggingCapability`, etc. Each option takes a provider – something implementing the corresponding `XCapabilityProvider` interface.
+
+Three ergonomic patterns:
+
+1. Static constant: use the `StaticX` helpers, e.g. `WithProtocolVersion(StaticProtocolVersion("2025-06-18"))` or `WithServerInfo(StaticServerInfo("name", "version", WithServerInfoTitle("Nice Title")))`.
+2. Self-providing container: pass a container directly. `NewToolsContainer(...)` and `NewResourcesContainer(...)` implement both the capability and its provider; just do `WithToolsCapability(tools)`.
+3. Per-session dynamic logic: provide an `XCapabilityProviderFunc` closure. It receives context + session and can return a tailored capability (or `ok=false` to omit it for that session).
+
+Return `(value, ok=true, nil)` to advertise a capability even if its list is empty. Return `ok=false` to *omit* that capability altogether.
+
+ListChanged notifications are emitted when underlying containers signal a change (e.g. `Replace` / `ReplaceResources`). This works uniformly for static containers and dynamic implementations.
+
+## Dynamic capabilities (and static containers)
+
+Prefer dynamic? Provide an `XCapabilityProviderFunc` closure when constructing the server.
+
+---
+
+### Humorous Elicitation Mini-Example
+
+Collect user input mid-tool without designing a new schema manually. Below a tool elicits a favorite snack then responds with two content blocks.
 
 ```go
-tools := mcpservice.NewToolsContainer(
-	mcpservice.NewTool[MyArgs]("do_stuff", func(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[MyArgs]) error {
-		_ = w.AppendText("done")
+tool := mcpservice.NewTool[struct{}]("snack_oracle", func(ctx context.Context, s sessions.Session, w mcpservice.ToolResponseWriter, r *mcpservice.ToolRequest[struct{}]) error {
+	if el, ok := s.GetElicitationCapability(); ok {
+		type Snack struct { Name string `json:"name" jsonschema:"minLength=2,description=Favorite snack"` }
+		var sn Snack
+		dec := elicitation.BindStruct(&sn)
+		action, err := el.Elicit(ctx, "What snack fuels your coding?", dec)
+		if err != nil || action != sessions.ElicitActionAccept { return nil } // minimal handling
+		_ = w.AppendText("Crunching the data...")
+		_ = w.AppendBlocks(mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "Consensus: " + sn.Name + " increases bug-free LOC by 0%. Delicious anyway."})
 		return nil
-	}, mcpservice.WithToolDescription("Does stuff")),
-)
-server := mcpservice.NewServer(mcpservice.WithToolsCapability(tools))
+	}
+	_ = w.AppendText("Client can't elicit. Falling back to generic advice: hydrate.")
+	return nil
+}, mcpservice.WithToolDescription("Politely asks for your favorite snack."))
 ```
 
-### Tools Dynamically (Per Session)
-
-```go
-server := mcpservice.NewServer(
-	mcpservice.WithToolsProvider(func(ctx context.Context, sess sessions.Session) (mcpservice.ToolsCapability, bool, error) {
-		if sess.UserID() == "restricted" { return nil, false, nil }
-		tc := mcpservice.NewToolsContainer(/* build based on session */)
-		return tc, true, nil
-	}),
-)
-```
+Add it next to your other tools in a container; structured schema is auto-reflected.
 
 ---
 
@@ -178,13 +228,17 @@ Use when you need the client (or host application) to produce a model-generated 
 
 ```go
 if samp, ok := sess.GetSamplingCapability(); ok {
-	req := sampling.NewCreateMessage([]mcp.SamplingMessage{
-		{Role: mcp.RoleUser, Content: mcp.ContentBlock{Type: mcp.ContentTypeText, Text: "Summarize current plan"}},
-	}, sampling.WithSystemPrompt("Be concise"), sampling.WithMaxTokens(256))
-	if err := sampling.ValidateCreateMessage(req); err != nil { return err }
-	res, err := samp.CreateMessage(ctx, req)
+	res, err := samp.CreateMessage(
+		ctx,
+		"Be concise",                          // system prompt
+		sampling.UserText("Summarize current plan"), // user message
+		sampling.WithMaxTokens(256),
+	)
 	if err != nil { return err }
-	log.Printf("model=%s reply=%s", res.Model, res.Content.Text)
+	// The returned assistant message is in res.Message
+	if txt, ok := res.Message.Content.(sampling.Text); ok {
+		log.Printf("model=%s reply=%s", res.Model, txt.Text)
+	}
 }
 ```
 
@@ -286,7 +340,7 @@ Long running tool calls can emit `notifications/progress` (server -> client) and
 
 ### Sampling & Elicitation Helpers
 
-Package `mcp/sampling` provides ergonomic helpers for building sampling messages; `elicitation` provides a builder for collecting structured values from the client. They layer cleanly atop the same session and transport plumbing.
+Use `sessions/sampling` for constructing user / assistant / system messages with exactly one content block (e.g. `UserText("hello")`). Invoke `SamplingCapability.CreateMessage` with the system prompt, the current user message, and option helpers (e.g. `sessions.WithMaxTokens`). The `elicitation` package provides a reflective schema-driven workflow for gathering structured user input mid-tool.
 
 ---
 

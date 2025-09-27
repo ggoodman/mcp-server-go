@@ -20,6 +20,14 @@ func NewSlogLevelVarLogging(lv *slog.LevelVar) LoggingCapability {
 
 type slogLevelVarLogging struct{ lv *slog.LevelVar }
 
+// ProvideLogging implements LoggingCapabilityProvider for static slog level var logging.
+func (l *slogLevelVarLogging) ProvideLogging(ctx context.Context, session sessions.Session) (LoggingCapability, bool, error) {
+	if l == nil {
+		return nil, false, nil
+	}
+	return l, true, nil
+}
+
 func (l *slogLevelVarLogging) SetLevel(ctx context.Context, _ sessions.Session, level mcp.LoggingLevel) error {
 	if l == nil || l.lv == nil {
 		return nil
