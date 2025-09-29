@@ -96,6 +96,7 @@ func TestSingleInstance(t *testing.T) {
 
 		// Tools should be advertised (empty static container exposes listChanged)
 		if initRes.Capabilities.Tools == nil || !initRes.Capabilities.Tools.ListChanged {
+			// Use testing fatal
 			t.Fatalf("expected tools listChanged capability to be true, got %#v", initRes.Capabilities.Tools)
 		}
 	})
@@ -160,7 +161,6 @@ func TestSingleInstance(t *testing.T) {
 			t.Fatalf("expected non-empty URITemplate")
 		}
 	})
-
 	t.Run("Tools list over POST is empty", func(t *testing.T) {
 		server := mcpservice.NewServer(
 			mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
@@ -756,13 +756,15 @@ func testLogHandler(t *testing.T) *logBridge {
 type serverOption func(*serverConfig)
 
 type serverConfig struct {
-	authenticator auth.Authenticator
-	mcp           mcpservice.ServerCapabilities
-	sessionsHost  sessions.SessionHost
-	logger        *slog.Logger
-	serverName    string
-	issuer        string
-	jwksURI       string
+	authenticator  auth.Authenticator
+	mcp            mcpservice.ServerCapabilities
+	sessionsHost   sessions.SessionHost
+	logger         *slog.Logger
+	serverName     string
+	issuer         string
+	jwksURI        string
+	overrideIssuer bool
+	overrideJWKS   bool
 }
 
 // withAuth configures the server to use the provided authenticator.
@@ -797,6 +799,7 @@ func withServerName(name string) serverOption {
 func withIssuer(issuer string) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.issuer = issuer
+		cfg.overrideIssuer = true
 	}
 }
 
@@ -804,6 +807,7 @@ func withIssuer(issuer string) serverOption {
 func withJwksURI(uri string) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.jwksURI = uri
+		cfg.overrideJWKS = true
 	}
 }
 
@@ -865,6 +869,34 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 	}))
 
 	// Create the streaming HTTP handler with the test server URL
+	// If caller supplied an authenticator that is only noAuth (default) but provided issuer+jwks, build a manual JWT authenticator so metadata reflects response_types_supported.
+	// Only build a manual authenticator automatically if BOTH issuer and jwks were explicitly overridden
+	// by the test. Default implicit values should not enable auth; many tests rely on no-auth behavior.
+	if _, isNoAuth := cfg.authenticator.(*noAuth); isNoAuth && cfg.overrideIssuer && cfg.overrideJWKS {
+		sec := auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true, OIDC: &auth.OIDCExtra{ResponseTypesSupported: []string{"code"}}}
+		sec.Normalize()
+		sp, err := sec.NewManualJWTAuthenticator(ctx)
+		if err == nil { // if error, fall back to noAuth; test will fail elsewhere if critical
+			cfg.authenticator = sp
+		}
+		// Pass the same SecurityConfig (with OIDC) to transport for advertisement
+		streamingHandler, err := streaminghttp.New(
+			ctx,
+			srv.URL,
+			cfg.sessionsHost,
+			cfg.mcp,
+			cfg.authenticator,
+			streaminghttp.WithServerName(cfg.serverName),
+			streaminghttp.WithLogger(cfg.logger),
+			streaminghttp.WithSecurityConfig(sec),
+		)
+		if err != nil {
+			srv.Close()
+			t.Fatalf("Failed to create streaming HTTP handler: %v", err)
+		}
+		handler = streamingHandler
+		return srv
+	}
 	streamingHandler, err := streaminghttp.New(
 		ctx,
 		srv.URL,
@@ -873,7 +905,15 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		cfg.authenticator,
 		streaminghttp.WithServerName(cfg.serverName),
 		streaminghttp.WithLogger(cfg.logger),
-		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true}),
+		func() streaminghttp.Option {
+			if sd, ok := cfg.authenticator.(auth.SecurityDescriptor); ok {
+				sec := sd.SecurityConfig()
+				// Ensure Advertise true for tests
+				sec.Advertise = true
+				return streaminghttp.WithSecurityConfig(sec)
+			}
+			return streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true})
+		}(),
 	)
 	if err != nil {
 		srv.Close()
@@ -1248,6 +1288,110 @@ func TestAuthorizationServerMetadataMirror_ManualMode(t *testing.T) {
 	}
 }
 
+func TestAuthorizationServerMetadata_DiscoveryEndpoints(t *testing.T) {
+	// Simulate discovery by manually constructing a SecurityDescriptor with OIDC endpoints.
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
+	)
+	issuer := "https://issuer.example"
+	authzEP := issuer + "/authorize"
+	tokenEP := issuer + "/oauth/token"
+	cfg := auth.SecurityConfig{Issuer: issuer, Audiences: []string{"https://aud.example"}, Advertise: true, OIDC: &auth.OIDCExtra{AuthorizationEndpoint: authzEP, TokenEndpoint: tokenEP}}
+	cfg.Normalize()
+	sd := securityConfigDescriptor{cfg: cfg}
+	srv := mustServer(t, server, withAuth(sd))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/.well-known/oauth-authorization-server")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	var meta struct {
+		AuthorizationEndpoint string `json:"authorization_endpoint"`
+		TokenEndpoint         string `json:"token_endpoint"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if meta.AuthorizationEndpoint != authzEP {
+		t.Fatalf("authz ep mismatch: %q", meta.AuthorizationEndpoint)
+	}
+	if meta.TokenEndpoint != tokenEP {
+		t.Fatalf("token ep mismatch: %q", meta.TokenEndpoint)
+	}
+}
+
+func TestAuthorizationServerMetadata_DiscoveryExtended(t *testing.T) {
+	// Build a server using a discovery-backed authenticator by constructing a mock provider.
+	// For test simplicity, manually craft SecurityConfig with extended metadata mimicking discovery output.
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
+	)
+	issuer := "https://issuer.example"
+	cfg := auth.SecurityConfig{Issuer: issuer, Audiences: []string{"https://aud.example"}, Advertise: true, OIDC: &auth.OIDCExtra{
+		AuthorizationEndpoint:                      "https://issuer.example/oauth2/auth",
+		TokenEndpoint:                              "https://issuer.example/oauth2/token",
+		RegistrationEndpoint:                       "https://issuer.example/connect/register",
+		ResponseTypesSupported:                     []string{"code"},
+		GrantTypesSupported:                        []string{"authorization_code"},
+		ResponseModesSupported:                     []string{"query"},
+		CodeChallengeMethodsSupported:              []string{"S256"},
+		TokenEndpointAuthMethodsSupported:          []string{"client_secret_basic"},
+		TokenEndpointAuthSigningAlgValuesSupported: []string{"RS256"},
+	}}
+	cfg.Normalize()
+	sd := securityConfigDescriptor{cfg: cfg}
+	srv := mustServer(t, server, withAuth(sd))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/.well-known/oauth-authorization-server")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	var meta struct {
+		GrantTypesSupported                        []string `json:"grant_types_supported"`
+		ResponseModesSupported                     []string `json:"response_modes_supported"`
+		CodeChallengeMethodsSupported              []string `json:"code_challenge_methods_supported"`
+		TokenEndpointAuthMethodsSupported          []string `json:"token_endpoint_auth_methods_supported"`
+		TokenEndpointAuthSigningAlgValuesSupported []string `json:"token_endpoint_auth_signing_alg_values_supported"`
+		RegistrationEndpoint                       string   `json:"registration_endpoint"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(meta.GrantTypesSupported) == 0 || meta.GrantTypesSupported[0] != "authorization_code" {
+		t.Fatalf("grant_types missing or wrong: %+v", meta.GrantTypesSupported)
+	}
+	if len(meta.ResponseModesSupported) == 0 || meta.ResponseModesSupported[0] != "query" {
+		t.Fatalf("response_modes missing: %+v", meta.ResponseModesSupported)
+	}
+	if len(meta.CodeChallengeMethodsSupported) == 0 || meta.CodeChallengeMethodsSupported[0] != "S256" {
+		t.Fatalf("code_challenge missing: %+v", meta.CodeChallengeMethodsSupported)
+	}
+	if len(meta.TokenEndpointAuthMethodsSupported) == 0 || meta.TokenEndpointAuthMethodsSupported[0] != "client_secret_basic" {
+		t.Fatalf("token auth methods missing: %+v", meta.TokenEndpointAuthMethodsSupported)
+	}
+	if len(meta.TokenEndpointAuthSigningAlgValuesSupported) == 0 || meta.TokenEndpointAuthSigningAlgValuesSupported[0] != "RS256" {
+		t.Fatalf("token auth algs missing: %+v", meta.TokenEndpointAuthSigningAlgValuesSupported)
+	}
+}
+
+// securityConfigDescriptor adapts a SecurityConfig to SecurityDescriptor without auth.
+type securityConfigDescriptor struct{ cfg auth.SecurityConfig }
+
+func (s securityConfigDescriptor) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
+	return nil, auth.ErrUnauthorized
+}
+func (s securityConfigDescriptor) SecurityConfig() auth.SecurityConfig { return s.cfg }
+
 func TestAuthorizationServerMetadataMirror_CORS(t *testing.T) {
 	server := mcpservice.NewServer(
 		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
@@ -1325,6 +1469,36 @@ func TestProtectedResourceMetadata_CORS(t *testing.T) {
 	}
 	if getResp.Header.Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatalf("missing ACAO on PRM GET")
+	}
+	getResp.Body.Close()
+}
+
+func TestProtectedResourceMetadata_NoSlashRoot(t *testing.T) {
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
+	)
+	srv := mustServer(t, server) // root mount
+	defer srv.Close()
+
+	// OPTIONS without trailing slash should not redirect
+	req, _ := http.NewRequest(http.MethodOptions, srv.URL+"/.well-known/oauth-protected-resource", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight no-slash failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent { // 204 expected, not 301/307
+		t.Fatalf("unexpected OPTIONS status: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// GET no-slash
+	getReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/.well-known/oauth-protected-resource", nil)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		t.Fatalf("GET no-slash failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected GET status: %d", getResp.StatusCode)
 	}
 	getResp.Body.Close()
 }

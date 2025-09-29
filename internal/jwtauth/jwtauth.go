@@ -67,8 +67,31 @@ type discoveryAuthenticator struct {
 	issuer  string
 	keyfunc jwt.Keyfunc
 	// expected fields derived from discovery
-	iss string
+	iss                   string
+	authorizationEndpoint string
+	tokenEndpoint         string
+	registrationEndpoint  string
+	responseTypes         []string
+	scopes                []string
+	grantTypes            []string
+	responseModes         []string
+	codeChallengeMethods  []string
+	tokenAuthMethods      []string
+	tokenAuthAlgs         []string
+	serviceDoc            string
+	policyURI             string
+	tosURI                string
 }
+
+// DiscoveryMetadata exposes optional advertisement-only endpoints learned via
+// OIDC discovery. Implementations may return empty strings if not applicable.
+type DiscoveryMetadata interface {
+	AuthorizationEndpoint() string
+	TokenEndpoint() string
+}
+
+func (a *discoveryAuthenticator) AuthorizationEndpoint() string { return a.authorizationEndpoint }
+func (a *discoveryAuthenticator) TokenEndpoint() string         { return a.tokenEndpoint }
 
 // ErrUnauthorized indicates that the access token failed validation (e.g.,
 // signature, issuer, audience, exp/nbf) and the request should be treated as
@@ -95,14 +118,40 @@ func NewFromDiscovery(ctx context.Context, cfg *Config) (*discoveryAuthenticator
 		return nil, fmt.Errorf("oidc discovery failed: %w", err)
 	}
 	var meta struct {
-		Issuer  string `json:"issuer"`
-		JwksURI string `json:"jwks_uri"`
+		Issuer        string   `json:"issuer"`
+		JwksURI       string   `json:"jwks_uri"`
+		Authorization string   `json:"authorization_endpoint"`
+		Token         string   `json:"token_endpoint"`
+		Registration  string   `json:"registration_endpoint"`
+		ResponseTypes []string `json:"response_types_supported"`
+		Scopes        []string `json:"scopes_supported"`
+		GrantTypes    []string `json:"grant_types_supported"`
+		ResponseModes []string `json:"response_modes_supported"`
+		CodeChallenge []string `json:"code_challenge_methods_supported"`
+		TokenAuth     []string `json:"token_endpoint_auth_methods_supported"`
+		TokenAuthAlgs []string `json:"token_endpoint_auth_signing_alg_values_supported"`
+		ServiceDoc    string   `json:"service_documentation"`
+		PolicyURI     string   `json:"op_policy_uri"`
+		TosURI        string   `json:"op_tos_uri"`
 	}
 	if err := provider.Claims(&meta); err != nil {
 		return nil, fmt.Errorf("invalid discovery metadata: %w", err)
 	}
+	missing := []string{}
 	if meta.JwksURI == "" {
-		return nil, errors.New("discovery metadata missing jwks_uri")
+		missing = append(missing, "jwks_uri")
+	}
+	if meta.Authorization == "" {
+		missing = append(missing, "authorization_endpoint")
+	}
+	if meta.Token == "" {
+		missing = append(missing, "token_endpoint")
+	}
+	if len(meta.ResponseTypes) == 0 {
+		missing = append(missing, "response_types_supported")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("discovery incomplete: missing %s", strings.Join(missing, ", "))
 	}
 
 	// Auto-refreshing JWKS
@@ -129,9 +178,45 @@ func NewFromDiscovery(ctx context.Context, cfg *Config) (*discoveryAuthenticator
 			}
 			return kf.Keyfunc(t)
 		},
-		iss: meta.Issuer,
+		iss:                   meta.Issuer,
+		authorizationEndpoint: meta.Authorization,
+		tokenEndpoint:         meta.Token,
+		responseTypes:         append([]string(nil), meta.ResponseTypes...),
+		registrationEndpoint:  meta.Registration,
+		scopes:                append([]string(nil), meta.Scopes...),
+		grantTypes:            append([]string(nil), meta.GrantTypes...),
+		responseModes:         append([]string(nil), meta.ResponseModes...),
+		codeChallengeMethods:  append([]string(nil), meta.CodeChallenge...),
+		tokenAuthMethods:      append([]string(nil), meta.TokenAuth...),
+		tokenAuthAlgs:         append([]string(nil), meta.TokenAuthAlgs...),
+		serviceDoc:            meta.ServiceDoc,
+		policyURI:             meta.PolicyURI,
+		tosURI:                meta.TosURI,
 	}, nil
 }
+
+// Extended discovery accessors used by outer layers to populate advertisement metadata.
+func (a *discoveryAuthenticator) ResponseTypes() []string {
+	return append([]string(nil), a.responseTypes...)
+}
+func (a *discoveryAuthenticator) Scopes() []string     { return append([]string(nil), a.scopes...) }
+func (a *discoveryAuthenticator) GrantTypes() []string { return append([]string(nil), a.grantTypes...) }
+func (a *discoveryAuthenticator) ResponseModes() []string {
+	return append([]string(nil), a.responseModes...)
+}
+func (a *discoveryAuthenticator) CodeChallengeMethods() []string {
+	return append([]string(nil), a.codeChallengeMethods...)
+}
+func (a *discoveryAuthenticator) TokenEndpointAuthMethods() []string {
+	return append([]string(nil), a.tokenAuthMethods...)
+}
+func (a *discoveryAuthenticator) TokenEndpointAuthAlgs() []string {
+	return append([]string(nil), a.tokenAuthAlgs...)
+}
+func (a *discoveryAuthenticator) ServiceDocumentation() string { return a.serviceDoc }
+func (a *discoveryAuthenticator) PolicyURI() string            { return a.policyURI }
+func (a *discoveryAuthenticator) TosURI() string               { return a.tosURI }
+func (a *discoveryAuthenticator) RegistrationEndpoint() string { return a.registrationEndpoint }
 
 func (a *discoveryAuthenticator) CheckAuthentication(ctx context.Context, tok string) (UserInfo, error) {
 	if tok == "" {

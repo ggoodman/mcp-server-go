@@ -74,6 +74,40 @@ func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts 
 		EnforceNbf:  true,
 		Advertise:   true,
 	}
+	// Populate advertisement-only OIDC metadata if discovery yielded endpoints.
+	// Attempt to extract extended discovery metadata via a private interface.
+	type fullDiscovery interface {
+		AuthorizationEndpoint() string
+		TokenEndpoint() string
+		ResponseTypes() []string
+		Scopes() []string
+		GrantTypes() []string
+		ResponseModes() []string
+		CodeChallengeMethods() []string
+		TokenEndpointAuthMethods() []string
+		TokenEndpointAuthAlgs() []string
+		ServiceDocumentation() string
+		PolicyURI() string
+		TosURI() string
+		RegistrationEndpoint() string
+	}
+	if dm, ok := any(internal).(fullDiscovery); ok {
+		sec.OIDC = &OIDCExtra{
+			AuthorizationEndpoint:                      dm.AuthorizationEndpoint(),
+			TokenEndpoint:                              dm.TokenEndpoint(),
+			RegistrationEndpoint:                       dm.RegistrationEndpoint(),
+			ResponseTypesSupported:                     dm.ResponseTypes(),
+			ScopesSupported:                            dm.Scopes(),
+			GrantTypesSupported:                        dm.GrantTypes(),
+			ResponseModesSupported:                     dm.ResponseModes(),
+			CodeChallengeMethodsSupported:              dm.CodeChallengeMethods(),
+			TokenEndpointAuthMethodsSupported:          dm.TokenEndpointAuthMethods(),
+			TokenEndpointAuthSigningAlgValuesSupported: dm.TokenEndpointAuthAlgs(),
+			ServiceDocumentation:                       dm.ServiceDocumentation(),
+			OpPolicyURI:                                dm.PolicyURI(),
+			OpTosURI:                                   dm.TosURI(),
+		}
+	}
 	sec.Normalize()
 	return &adapter{a: internal, sec: sec}, nil
 }
