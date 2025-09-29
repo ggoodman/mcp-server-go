@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/elnormous/contenttype"
 	"github.com/ggoodman/mcp-server-go/auth"
 	"github.com/ggoodman/mcp-server-go/internal/engine"
@@ -66,29 +65,10 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // Option configures the StreamingHTTPHandler.
 type Option func(*newConfig)
 
-// ManualOIDC provides manual OAuth/OIDC details and PRM fields when bypassing
-// OIDC discovery.
-type ManualOIDC struct {
-	// Issuer is the OAuth2 authorization server issuer URL.
-	Issuer string
-	// JwksURI is the URL of the JSON Web Key Set document.
-	JwksURI string
-
-	// Optional fields that would normally be discovered from authorization server metadata
-	ScopesSupported                            []string
-	TokenEndpointAuthMethodsSupported          []string
-	TokenEndpointAuthSigningAlgValuesSupported []string
-	ServiceDocumentation                       string
-	OpPolicyURI                                string
-	OpTosURI                                   string
-}
-
 type newConfig struct {
-	serverName string
-	logger     *slog.Logger
-	// auth mode: exactly one must be set
-	discoveryURL string
-	manualOIDC   *ManualOIDC
+	serverName     string
+	logger         *slog.Logger
+	securityConfig *auth.SecurityConfig
 }
 
 // WithServerName sets a human-readable server name surfaced in PRM.
@@ -101,30 +81,20 @@ func WithLogger(h *slog.Logger) Option {
 	return func(c *newConfig) { c.logger = h }
 }
 
-// WithAuthorizationServerDiscovery enables auto-configuration via OAuth 2.0
-// Authorization Server Metadata (RFC 8414) at the provided issuer URL. OIDC
-// issuers are supported since their discovery document is a superset.
-func WithAuthorizationServerDiscovery(authorizationServerURL string) Option {
-	return func(c *newConfig) { c.discoveryURL = authorizationServerURL }
-}
-
-// WithManualOIDC sets manual OIDC/PRM configuration without discovery.
-func WithManualOIDC(cfg ManualOIDC) Option {
-	return func(c *newConfig) { c.manualOIDC = &cfg }
+// WithSecurityConfig provides a unified security configuration for both
+// advertisement and (if the authenticator supports it) consistency checks.
+func WithSecurityConfig(sc auth.SecurityConfig) Option {
+	return func(c *newConfig) { cfgCopy := sc.Copy(); c.securityConfig = &cfgCopy }
 }
 
 // StreamingHTTPHandler implements the stream HTTP transport protocol of
 // the Model Context Protocol.
 type StreamingHTTPHandler struct {
-	mux            *http.ServeMux
-	oidcProvider   *oidc.Provider
-	log            *slog.Logger
-	prmDocument    wellknown.ProtectedResourceMetadata
-	prmDocumentURL *url.URL
-	serverURL      *url.URL
-	// Mirror of RFC 8414 Authorization Server Metadata for discovery convenience.
-	// In discovery mode this mirrors the real AS document; in manual mode it's
-	// synthesized from ManualOIDC fields.
+	mux                   *http.ServeMux
+	log                   *slog.Logger
+	prmDocument           wellknown.ProtectedResourceMetadata
+	prmDocumentURL        *url.URL
+	serverURL             *url.URL
 	authServerMetadata    wellknown.AuthServerMetadata
 	authServerMetadataURL *url.URL
 
@@ -133,23 +103,12 @@ type StreamingHTTPHandler struct {
 	eng         *engine.Engine
 	sessionHost sessions.SessionHost
 
-	// Per-session subscription bridges for resources/updated notifications.
-	// Map: sessionID -> (uri -> cancel)
 	subMu      sync.Mutex
 	subCancels map[string]map[string]context.CancelFunc
 
-	// Per-session parent contexts for long-lived activities (e.g., resource
-	// subscription forwarders). Each session gets a parent derived from the
-	// request context via context.WithoutCancel to preserve values while
-	// decoupling from request cancellation. The cancel function is invoked
-	// when the session ends or is deemed invalid.
 	sessMu      sync.Mutex
 	sessParents map[string]context.Context
 	sessCancel  map[string]context.CancelFunc
-
-	// Per-session outbound dispatchers and their cancel/unsub handlers for
-	// long-lived subscriptions (e.g., notifications/cancelled).
-
 }
 
 // lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
@@ -192,22 +151,16 @@ func (l *lockedWriteFlusher) Flush() {
 //   - publicEndpoint: externally visible URL of the MCP endpoint (scheme, host, path)
 //   - host: sessions.SessionHost implementation (horizontal-scale ready)
 //   - server: mcpserver.ServerCapabilities implementation
-//   - authenticator: auth.Authenticator implementation
+//   - authenticator: auth.Authenticator implementation (may also implement auth.SecurityDescriptor)
 //
-// Exactly one auth mode option must be provided:
-//   - WithAuthorizationServerDiscovery
-//   - WithManualOIDC
-func New(
-	ctx context.Context,
-	publicEndpoint string,
-	host sessions.SessionHost,
-	server mcpservice.ServerCapabilities,
-	authenticator auth.Authenticator,
-	opts ...Option,
-) (*StreamingHTTPHandler, error) {
-	if authenticator == nil {
-		return nil, fmt.Errorf("authenticator is required")
-	}
+// Authentication configuration resolution order:
+//  1. Explicit WithSecurityConfig option (highest precedence)
+//  2. authenticator implements auth.SecurityDescriptor (inferred)
+//
+// If neither produces a security config but an authenticator is supplied, the
+// handler will operate without advertising well-known security metadata. If
+// no authenticator and no security config are provided New returns an error.
+func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, server mcpservice.ServerCapabilities, authenticator auth.Authenticator, opts ...Option) (*StreamingHTTPHandler, error) {
 	if server == nil {
 		return nil, fmt.Errorf("server is required")
 	}
@@ -223,29 +176,28 @@ func New(
 		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
 	}
 
-	cfg := &newConfig{
-		logger: slog.Default(),
-	}
+	cfg := &newConfig{logger: slog.Default()}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 
-	if (cfg.discoveryURL == "" && cfg.manualOIDC == nil) || (cfg.discoveryURL != "" && cfg.manualOIDC != nil) {
-		return nil, fmt.Errorf("exactly one of WithAuthorizationServerDiscovery or WithManualOIDC must be provided")
+	var resolved *auth.SecurityConfig
+	if cfg.securityConfig != nil {
+		cc := cfg.securityConfig.Copy()
+		resolved = &cc
+	}
+	if resolved == nil && authenticator != nil {
+		if sd, ok := authenticator.(auth.SecurityDescriptor); ok {
+			cc := sd.SecurityConfig().Copy()
+			resolved = &cc
+		}
+	}
+	if resolved == nil && authenticator == nil {
+		return nil, fmt.Errorf("either authenticator or WithSecurityConfig required")
 	}
 
-	h := &StreamingHTTPHandler{
-		log:         cfg.logger,
-		serverURL:   mcpURL,
-		auth:        authenticator,
-		mcp:         server,
-		sessionHost: host,
-		subCancels:  make(map[string]map[string]context.CancelFunc),
-		sessParents: make(map[string]context.Context),
-		sessCancel:  make(map[string]context.CancelFunc),
-	}
+	h := &StreamingHTTPHandler{log: cfg.logger, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, subCancels: make(map[string]map[string]context.CancelFunc), sessParents: make(map[string]context.Context), sessCancel: make(map[string]context.CancelFunc)}
 
-	// Initialize Engine and start its event consumer loop.
 	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
 		if err := h.eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -253,96 +205,28 @@ func New(
 		}
 	}()
 
-	// Build PRM based on auth mode
-	switch {
-	case cfg.manualOIDC != nil:
-		manual := cfg.manualOIDC
-		if manual.Issuer == "" {
-			return nil, fmt.Errorf("issuer is required for manual OIDC")
+	if resolved != nil && resolved.Advertise {
+		issuer := resolved.Issuer
+		jwks := resolved.JWKSURL
+		var scopes []string
+		var svcDoc, pol, tos string
+		if resolved.OIDC != nil {
+			scopes = resolved.OIDC.ScopesSupported
+			svcDoc = resolved.OIDC.ServiceDocumentation
+			pol = resolved.OIDC.OpPolicyURI
+			tos = resolved.OIDC.OpTosURI
 		}
-		if manual.JwksURI == "" {
-			return nil, fmt.Errorf("JwksURI is required for manual OIDC")
-		}
-		h.prmDocument = wellknown.ProtectedResourceMetadata{
-			Resource:             mcpURL.String(),
-			AuthorizationServers: []string{manual.Issuer},
-			JwksURI:              manual.JwksURI,
-			ScopesSupported:      manual.ScopesSupported,
-			// Per RFC 9728, bearer methods describe how the token is sent to the resource.
-			// We support the Authorization header mechanism.
-			BearerMethodsSupported: []string{"authorization_header"},
-			// ResourceSigningAlgValuesSupported applies if the RESOURCE signs challenges; leave empty unless explicitly supported.
-			// ResourceSigningAlgValuesSupported:  manual.ResourceSigningAlgValuesSupported, // not set by default
-			ResourceName:                          cfg.serverName,
-			ResourceDocumentation:                 manual.ServiceDocumentation,
-			ResourcePolicyURI:                     manual.OpPolicyURI,
-			ResourceTosURI:                        manual.OpTosURI,
-			TLSClientCertificateBoundAccessTokens: false,
-			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
-		}
-		// Synthesize a minimal, standards-conformant Authorization Server Metadata doc.
-		h.authServerMetadata = wellknown.AuthServerMetadata{
-			Issuer:                            manual.Issuer,
-			ResponseTypesSupported:            []string{"code"},
-			JwksURI:                           manual.JwksURI,
-			ScopesSupported:                   manual.ScopesSupported,
-			TokenEndpointAuthMethodsSupported: manual.TokenEndpointAuthMethodsSupported,
-			TokenEndpointAuthSigningAlgValuesSupported: manual.TokenEndpointAuthSigningAlgValuesSupported,
-			ServiceDocumentation:                       manual.ServiceDocumentation,
-			OpPolicyURI:                                manual.OpPolicyURI,
-			OpTosURI:                                   manual.OpTosURI,
-		}
-		h.oidcProvider = nil
-
-	case cfg.discoveryURL != "":
-		provider, err := oidc.NewProvider(ctx, cfg.discoveryURL)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create OIDC provider: %w", err)
-		}
-		var asm *wellknown.AuthServerMetadata
-		if err := provider.Claims(&asm); err != nil {
-			return nil, fmt.Errorf("unexpected or invalid authorization server metadata: %w", err)
-		}
-		if asm.JwksURI == "" {
-			return nil, fmt.Errorf("the supplied authorization server does not declare support for a JWKS URI in its metadata")
-		}
-		h.prmDocument = wellknown.ProtectedResourceMetadata{
-			Resource:                              mcpURL.String(),
-			AuthorizationServers:                  []string{asm.Issuer},
-			JwksURI:                               asm.JwksURI,
-			ScopesSupported:                       asm.ScopesSupported,
-			BearerMethodsSupported:                []string{"authorization_header"},
-			ResourceName:                          cfg.serverName,
-			ResourceDocumentation:                 asm.ServiceDocumentation,
-			ResourcePolicyURI:                     asm.OpPolicyURI,
-			ResourceTosURI:                        asm.OpTosURI,
-			TLSClientCertificateBoundAccessTokens: false,
-			AuthorizationDetailsTypesSupported:    []string{"urn:ietf:params:oauth:authorization-details"},
-		}
-		// Mirror the discovered AS metadata directly.
-		h.authServerMetadata = *asm
-		h.oidcProvider = provider
+		h.prmDocument = wellknown.ProtectedResourceMetadata{Resource: mcpURL.String(), AuthorizationServers: []string{issuer}, JwksURI: jwks, ScopesSupported: scopes, BearerMethodsSupported: []string{"authorization_header"}, ResourceName: cfg.serverName, ResourceDocumentation: svcDoc, ResourcePolicyURI: pol, ResourceTosURI: tos, TLSClientCertificateBoundAccessTokens: false, AuthorizationDetailsTypesSupported: []string{"urn:ietf:params:oauth:authorization-details"}}
+		h.authServerMetadata = wellknown.AuthServerMetadata{Issuer: issuer, ResponseTypesSupported: []string{"code"}, JwksURI: jwks, ScopesSupported: scopes, ServiceDocumentation: svcDoc, OpPolicyURI: pol, OpTosURI: tos}
 	}
 
-	// Construct PRM document URL
-	h.prmDocumentURL = &url.URL{
-		Scheme: mcpURL.Scheme,
-		Host:   mcpURL.Host,
-		Path:   fmt.Sprintf("/.well-known/oauth-protected-resource%s", mcpURL.Path),
-	}
-
-	// Construct Authorization Server Metadata mirror URL
-	h.authServerMetadataURL = &url.URL{
-		Scheme: mcpURL.Scheme,
-		Host:   mcpURL.Host,
-		Path:   "/.well-known/oauth-authorization-server",
-	}
+	h.prmDocumentURL = &url.URL{Scheme: mcpURL.Scheme, Host: mcpURL.Host, Path: fmt.Sprintf("/.well-known/oauth-protected-resource%s", mcpURL.Path)}
+	h.authServerMetadataURL = &url.URL{Scheme: mcpURL.Scheme, Host: mcpURL.Host, Path: "/.well-known/oauth-authorization-server"}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(fmt.Sprintf("POST %s", pathOnly(mcpURL)), h.handlePostMCP)
 	mux.HandleFunc(fmt.Sprintf("GET %s", pathOnly(mcpURL)), h.handleGetMCP)
 	mux.HandleFunc(fmt.Sprintf("DELETE %s", pathOnly(mcpURL)), h.handleDeleteMCP)
-
 	prmPath := pathOnly(h.prmDocumentURL)
 	mux.HandleFunc(fmt.Sprintf("GET %s", prmPath), h.handleGetProtectedResourceMetadata)
 	mux.HandleFunc(fmt.Sprintf("OPTIONS %s", prmPath), h.handleOptionsProtectedResourceMetadata)
@@ -350,8 +234,6 @@ func New(
 		mux.HandleFunc(fmt.Sprintf("GET %s/", prmPath), h.handleGetProtectedResourceMetadata)
 		mux.HandleFunc(fmt.Sprintf("OPTIONS %s/", prmPath), h.handleOptionsProtectedResourceMetadata)
 	}
-
-	// Expose a mirror of Authorization Server Metadata for discovery convenience.
 	asPath := pathOnly(h.authServerMetadataURL)
 	mux.HandleFunc(fmt.Sprintf("GET %s", asPath), h.handleGetAuthorizationServerMetadata)
 	mux.HandleFunc(fmt.Sprintf("OPTIONS %s", asPath), h.handleOptionsAuthorizationServerMetadata)
@@ -360,7 +242,6 @@ func New(
 		mux.HandleFunc(fmt.Sprintf("OPTIONS %s/", asPath), h.handleOptionsAuthorizationServerMetadata)
 	}
 	h.mux = mux
-
 	return h, nil
 }
 
@@ -749,8 +630,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	if err := h.eng.StreamSession(ctx, sessionHeader, userInfo.UserID(), lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
 		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
-			logger.ErrorContext(cbCtx, "sse.write.fail", slog.String("err", err.Error()))
-			return fmt.Errorf("failed to write session message to http response: %w", err)
+			return err
 		}
 		logger.InfoContext(cbCtx, "sse.message.deliver")
 		return nil
@@ -766,28 +646,23 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	logger.InfoContext(ctx, "sse.stream.end", slog.Duration("dur", time.Since(start)))
 }
 
-// handleGetProtectedResourceMetadata serves the OAuth2 Protected Resource Metadata
-// document crafted when the StreamingHTTPHandler initialized.
-func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
-	// CORS: allow cross-origin browser fetches of the well-known metadata
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Vary", "Origin")
-	w.Header().Set("Content-Type", "application/json")
-
-	if err := json.NewEncoder(w).Encode(h.prmDocument); err != nil {
-		http.Error(w, fmt.Sprintf("failed to encode protected resource metadata: %v", err), http.StatusInternalServerError)
-		return
-	}
-}
-
-// handleOptionsProtectedResourceMetadata responds to CORS preflight requests
-// for the protected resource metadata endpoint.
 func (h *StreamingHTTPHandler) handleOptionsProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
 	w.Header().Set("Access-Control-Max-Age", "600")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleGetProtectedResourceMetadata serves the OAuth2 Protected Resource Metadata document.
+func (h *StreamingHTTPHandler) handleGetProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Vary", "Origin")
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(h.prmDocument); err != nil {
+		http.Error(w, fmt.Sprintf("failed to encode protected resource metadata: %v", err), http.StatusInternalServerError)
+		return
+	}
 }
 
 // handleGetAuthorizationServerMetadata serves a mirror or synthesized

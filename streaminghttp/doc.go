@@ -18,7 +18,7 @@
 //	    host,                       // sessions.SessionHost implementation
 //	    server,                     // mcpservice.ServerCapabilities
 //	    authenticator,              // auth.Authenticator
-//	    streaminghttp.WithAuthorizationServerDiscovery("https://issuer.example"),
+//	    // Security metadata inferred from authenticator (implements auth.SecurityDescriptor)
 //	)
 //
 // Exactly one auth mode must be supplied: discovery or manual OIDC metadata.

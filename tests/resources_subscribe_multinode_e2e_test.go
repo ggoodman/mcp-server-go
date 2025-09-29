@@ -33,7 +33,7 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	defer cancel()
 
 	// Quick availability check
-	h, err := redishost.New("localhost:6379", redishost.WithKeyPrefix("mcp:mn:test:"))
+	h, err := redishost.New("redis://localhost:6379", redishost.WithKeyPrefix("mcp:mn:test:"))
 	if err != nil {
 		t.Skipf("skipping multi-node test (no redis): %v", err)
 		return
@@ -61,13 +61,13 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handlerB.ServeHTTP(w, r) }))
 	defer srvB.Close()
 
-	ha, err := streaminghttp.New(ctx, srvA.URL, h, srvCapsA, new(noAuthMN), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}))
+	ha, err := streaminghttp.New(ctx, srvA.URL, h, srvCapsA, new(noAuthMN), streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}))
 	if err != nil {
 		t.Fatalf("handler A: %v", err)
 	}
 	handlerA = ha
 
-	hb, err := streaminghttp.New(ctx, srvB.URL, h, srvCapsB, new(noAuthMN), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}))
+	hb, err := streaminghttp.New(ctx, srvB.URL, h, srvCapsB, new(noAuthMN), streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}))
 	if err != nil {
 		t.Fatalf("handler B: %v", err)
 	}

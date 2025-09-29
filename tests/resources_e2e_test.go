@@ -37,10 +37,7 @@ func TestExamples_ResourcesStatic_E2E(t *testing.T) {
 		resources_static.New(),
 		new(noAuthRes),
 		streaminghttp.WithServerName("examples"),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{
-			Issuer:  "http://127.0.0.1:0",
-			JwksURI: "http://127.0.0.1/.well-known/jwks.json",
-		}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/.well-known/jwks.json", Advertise: true}),
 	)
 	if err != nil {
 		t.Fatalf("failed to create handler: %v", err)

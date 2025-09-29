@@ -31,7 +31,7 @@ func main() {
 	authenticator, err := auth.NewFromDiscovery(
 		ctx,
 		issuer,
-		auth.WithExpectedAudience(publicEndpoint), // audience check (use your public MCP endpoint)
+		publicEndpoint, // audience (use your public MCP endpoint URL)
 		auth.WithLeeway(2*time.Minute),
 	)
 	if err != nil {
@@ -44,10 +44,9 @@ func main() {
 		publicEndpoint,
 		host,
 		server,
-		authenticator,
+		authenticator, // security metadata inferred from authenticator's SecurityDescriptor
 		streaminghttp.WithServerName("My MCP Server"),
 		streaminghttp.WithLogger(defaultLogger()),
-		streaminghttp.WithAuthorizationServerDiscovery(issuer),
 	)
 	if err != nil {
 		panic(err)

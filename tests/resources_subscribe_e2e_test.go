@@ -51,10 +51,7 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 		srvCaps,
 		new(noAuthSub),
 		streaminghttp.WithServerName("examples"),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{
-			Issuer:  "http://127.0.0.1:0",
-			JwksURI: "http://127.0.0.1/.well-known/jwks.json",
-		}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/.well-known/jwks.json", Advertise: true}),
 	)
 	if err != nil {
 		t.Fatalf("handler: %v", err)

@@ -558,7 +558,7 @@ func TestResources_ListReadSubscribe(t *testing.T) {
 		[]mcp.Resource{{URI: uri, Name: "A", MimeType: "text/plain"}},
 		nil,
 		map[string][]mcp.ResourceContents{
-			uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v1"}},
+			uri: {{URI: uri, MimeType: "text/plain", Text: "v1"}},
 		},
 	)
 	srv := mcpservice.NewServer(
@@ -623,7 +623,7 @@ func TestResources_ListReadSubscribe(t *testing.T) {
 	}
 
 	// mutate contents -> expect notifications/resources/updated
-	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: []mcp.ResourceContents{{URI: uri, MimeType: "text/plain", Text: "v2"}}})
+	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: {{URI: uri, MimeType: "text/plain", Text: "v2"}}})
 	note, ok := th.drainUntilMethod(string(mcp.ResourcesUpdatedNotificationMethod), 2*time.Second)
 	if !ok {
 		t.Fatalf("expected %s after content change", mcp.ResourcesUpdatedNotificationMethod)

@@ -45,7 +45,7 @@ func TestSessionLifecycle_GetStreamBoundToRequest(t *testing.T) {
 		mh,
 		srvCaps,
 		new(noAuthSL),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}),
 	)
 	if err != nil {
 		t.Fatalf("handler: %v", err)
@@ -143,7 +143,7 @@ func TestSessionLifecycle_PostBoundToRequest_WriteFallback(t *testing.T) {
 		mh,
 		srvCaps,
 		new(noAuthSL),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}),
 	)
 	if err != nil {
 		t.Fatalf("handler: %v", err)

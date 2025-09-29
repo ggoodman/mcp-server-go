@@ -18,8 +18,7 @@
 // Example:
 //
 //	ctx := context.Background()
-//	authn, err := auth.NewFromDiscovery(ctx, "https://issuer.example",
-//	    auth.WithExpectedAudience("https://mcp.example/api"),
+//	authn, err := auth.NewFromDiscovery(ctx, "https://issuer.example", "https://mcp.example/api",
 //	    auth.WithRequiredScopes("mcp:read", "mcp:write"),
 //	)
 //	if err != nil { log.Fatal(err) }

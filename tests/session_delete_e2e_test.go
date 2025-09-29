@@ -41,7 +41,7 @@ func TestDeleteSession_ClosesStreamsAndRevokes(t *testing.T) {
 		mh,
 		srvCaps,
 		new(noAuthDel),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}),
 	)
 	if err != nil {
 		t.Fatalf("handler: %v", err)

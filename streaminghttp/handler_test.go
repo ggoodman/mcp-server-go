@@ -567,7 +567,7 @@ func TestPOST_Request_ServersideTriggersClientCall_StreamedInline(t *testing.T) 
 		mcpservice.WithProtocolVersion(mcpservice.StaticProtocolVersion("2025-06-18")),
 		mcpservice.WithServerInfo(mcpservice.StaticServerInfo("test", "0.0.1")),
 	)
-	h, err := streaminghttp.New(context.Background(), "http://example.com/mcp", host, server, &noAuth{wantToken: "test-token"}, streaminghttp.WithServerName("t"), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "https://issuer", JwksURI: "https://issuer/jwks"}))
+	h, err := streaminghttp.New(context.Background(), "http://example.com/mcp", host, server, &noAuth{wantToken: "test-token"}, streaminghttp.WithServerName("t"), streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "https://issuer", Audiences: []string{"test"}, JWKSURL: "https://issuer/jwks", Advertise: true}))
 	if err != nil {
 		t.Fatalf("new handler: %v", err)
 	}
@@ -873,7 +873,7 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		cfg.authenticator,
 		streaminghttp.WithServerName(cfg.serverName),
 		streaminghttp.WithLogger(cfg.logger),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: cfg.issuer, JwksURI: cfg.jwksURI}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true}),
 	)
 	if err != nil {
 		srv.Close()
@@ -959,7 +959,7 @@ func mustMultiInstanceServer(t *testing.T, handlerCount int, router RouterFunc, 
 			cfg.authenticator,
 			streaminghttp.WithServerName(cfg.serverName),
 			streaminghttp.WithLogger(cfg.logger),
-			streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: cfg.issuer, JwksURI: cfg.jwksURI}),
+			streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true}),
 		)
 		if err != nil {
 			srv.Close()

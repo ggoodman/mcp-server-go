@@ -8,14 +8,10 @@ import (
 	"github.com/ggoodman/mcp-server-go/internal/jwtauth"
 )
 
-// AccessTokenAuthOption configures the RFC 9068 access token authenticator.
+// AccessTokenAuthOption configures optional aspects of the RFC 9068 access
+// token authenticator (scopes, algorithms, leeway, etc.). Audience is now a
+// required formal argument to NewFromDiscovery instead of an option.
 type AccessTokenAuthOption func(*jwtauth.Config)
-
-// WithExpectedAudience configures the audience ("aud") this resource expects.
-// Typically this is your public MCP endpoint URL.
-func WithExpectedAudience(resource string) AccessTokenAuthOption {
-	return func(c *jwtauth.Config) { c.ExpectedAudience = resource }
-}
 
 // WithRequiredScopes requires all of the provided scopes to be present in the
 // space-delimited "scope" claim.
@@ -51,27 +47,42 @@ func WithLeeway(d time.Duration) AccessTokenAuthOption {
 // tokens discovered via OpenID Connect discovery (jwks_uri, issuer, etc.).
 //
 // Required:
-//   - issuer: the authorization server issuer URL.
-//   - WithExpectedAudience must be provided (aud check).
-func NewFromDiscovery(ctx context.Context, issuer string, opts ...AccessTokenAuthOption) (Authenticator, error) {
+//   - issuer:   authorization server issuer URL
+//   - audience: expected audience ("aud") claim – typically your public MCP endpoint URL
+//
+// Remaining validation knobs (scopes, algs, leeway) are configured via functional options.
+func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts ...AccessTokenAuthOption) (SecurityProvider, error) {
 	cfg := jwtauth.DefaultConfig()
 	cfg.Issuer = issuer
+	cfg.ExpectedAudience = audience
 	for _, opt := range opts {
 		opt(cfg)
 	}
-
 	if cfg.ExpectedAudience == "" {
-		return nil, errors.New("WithExpectedAudience is required")
+		return nil, errors.New("audience is required")
 	}
 	internal, err := jwtauth.NewFromDiscovery(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &adapter{a: internal}, nil
+	sec := SecurityConfig{
+		Issuer:      cfg.Issuer,
+		Audiences:   []string{cfg.ExpectedAudience},
+		AllowedAlgs: append([]string(nil), cfg.AllowedAlgs...),
+		Leeway:      cfg.Leeway,
+		EnforceExp:  true,
+		EnforceNbf:  true,
+		Advertise:   true,
+	}
+	sec.Normalize()
+	return &adapter{a: internal, sec: sec}, nil
 }
 
 // adapter wraps the internal authenticator to satisfy the public interface.
-type adapter struct{ a jwtauth.Authenticator }
+type adapter struct {
+	a   jwtauth.Authenticator
+	sec SecurityConfig
+}
 
 func (ad *adapter) CheckAuthentication(ctx context.Context, tok string) (UserInfo, error) {
 	ui, err := ad.a.CheckAuthentication(ctx, tok)
@@ -84,6 +95,8 @@ func (ad *adapter) CheckAuthentication(ctx context.Context, tok string) (UserInf
 	}
 	return userInfoAdapter{ui: ui}, nil
 }
+
+func (ad *adapter) SecurityConfig() SecurityConfig { return ad.sec.Copy() }
 
 type userInfoAdapter struct{ ui jwtauth.UserInfo }
 
