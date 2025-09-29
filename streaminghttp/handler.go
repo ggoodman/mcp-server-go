@@ -223,7 +223,9 @@ func New(
 		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
 	}
 
-	cfg := &newConfig{}
+	cfg := &newConfig{
+		logger: slog.Default(),
+	}
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -232,13 +234,8 @@ func New(
 		return nil, fmt.Errorf("exactly one of WithAuthorizationServerDiscovery or WithManualOIDC must be provided")
 	}
 
-	log := slog.Default()
-	if cfg.logger != nil {
-		log = cfg.logger
-	}
-
 	h := &StreamingHTTPHandler{
-		log:         log,
+		log:         cfg.logger,
 		serverURL:   mcpURL,
 		auth:        authenticator,
 		mcp:         server,
@@ -249,10 +246,10 @@ func New(
 	}
 
 	// Initialize Engine and start its event consumer loop.
-	h.eng = engine.NewEngine(host, server, engine.WithLogger(log))
+	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
 		if err := h.eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error("engine.run.fail", slog.String("err", err.Error()))
+			h.log.Error("engine.run.fail", slog.String("err", err.Error()))
 		}
 	}()
 
@@ -822,6 +819,7 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 	authHeader := r.Header.Get(authorizationHeader)
 
 	if authHeader == "" {
+		h.log.InfoContext(ctx, "auth.check.missing", slog.String("err", "no authorization header"))
 		w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="invalid_token", error_description="no token provided"`, h.serverURL.String()))
 		w.WriteHeader(http.StatusUnauthorized)
 		return nil
@@ -829,6 +827,7 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 
 	tok, ok := strings.CutPrefix(authHeader, "Bearer ")
 	if !ok || tok == "" {
+		h.log.InfoContext(ctx, "auth.check.invalid", slog.String("err", "invalid or absent bearer token"))
 		w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="invalid_request", error_description="invalid or absent authorization header"`, h.serverURL.String()))
 		w.WriteHeader(http.StatusBadRequest)
 		return nil
@@ -837,17 +836,20 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 	userInfo, err := h.auth.CheckAuthentication(ctx, tok)
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthorized) {
+			h.log.InfoContext(ctx, "auth.check.fail", slog.String("err", err.Error()))
 			w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="invalid_token", error_description="%s"`, h.serverURL.String(), err.Error()))
 			w.WriteHeader(http.StatusUnauthorized)
 			return nil
 		}
 
 		if errors.Is(err, auth.ErrInsufficientScope) {
+			h.log.InfoContext(ctx, "auth.check.fail", slog.String("err", err.Error()))
 			w.Header().Add(wwwAuthenticateHeader, fmt.Sprintf(`Bearer realm="%s", error="insufficient_scope", error_description="%s"`, h.serverURL.String(), err.Error()))
 			w.WriteHeader(http.StatusForbidden)
 			return nil
 		}
 
+		h.log.InfoContext(ctx, "auth.check.err", slog.String("err", err.Error()))
 		w.WriteHeader(http.StatusInternalServerError)
 		return nil
 	}

@@ -82,8 +82,13 @@ func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opt
 		wired:              make(map[string]bool),
 		subCancels:         make(map[string]map[string]mcpservice.CancelSubscription),
 	}
-	// Keep linters honest about method usage in builds where certain paths are pruned.
-	_ = e.handshakeTTL
+
+	// Apply options (order matters; later options override earlier ones).
+	for _, opt := range opts {
+		if opt != nil {
+			opt(e)
+		}
+	}
 	return e
 }
 
@@ -301,7 +306,7 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 	case string(mcp.LoggingSetLevelMethod):
 		return e.handleSetLoggingLevel(ctx, sess, req)
 	case string(mcp.ToolsCallMethod):
-		return e.handleToolCall(ctx, sess, req, requestScopedWriter)
+		return e.handleToolCall(ctx, sess, req)
 	}
 
 	return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "not implemented", nil), nil
@@ -496,7 +501,7 @@ func (e *Engine) handleToolsList(ctx context.Context, sess *SessionHandle, req *
 	return jsonrpc.NewResultResponse(req.ID, result)
 }
 
-func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request, writer MessageWriter) (*jsonrpc.Response, error) {
+func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	start := time.Now()
 	log := e.log.With(slog.String("method", req.Method))
 
@@ -840,9 +845,11 @@ func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, 
 			e.log.Error("engine.handle_notification.cancel.decode", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
 			return nil
 		}
-
-		hadCancel := e.cancelInFlightRequest(params.RequestID, params.Reason)
-		e.log.Info("engine.handle_notification.cancel.dispatched", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("request_id", params.RequestID), slog.Bool("had_cancel", hadCancel))
+		if params.RequestID != nil && !params.RequestID.IsNil() {
+			ridStr := params.RequestID.String()
+			hadCancel := e.cancelInFlightRequest(ridStr, params.Reason)
+			e.log.Info("engine.handle_notification.cancel.dispatched", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("request_id", ridStr), slog.Bool("had_cancel", hadCancel))
+		}
 	}
 
 	// We got a notification from a transport. We don't directly handle notifications in the engine. Instead
@@ -1148,11 +1155,14 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 				return nil // ignore malformed messages
 			}
 
-			// Trace cancellation delivery
-			e.log.Info("engine.handle_session_event.cancel", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", params.RequestID), slog.String("reason", params.Reason))
+			if params.RequestID != nil && !params.RequestID.IsNil() {
+				ridStr := params.RequestID.String()
+				// Trace cancellation delivery
+				e.log.Info("engine.handle_session_event.cancel", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", ridStr), slog.String("reason", params.Reason))
 
-			hadCancel := e.cancelInFlightRequest(params.RequestID, params.Reason)
-			e.log.Info("engine.handle_session_event.cancel.dispatched", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", params.RequestID), slog.Bool("had_cancel", hadCancel))
+				hadCancel := e.cancelInFlightRequest(ridStr, params.Reason)
+				e.log.Info("engine.handle_session_event.cancel.dispatched", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", ridStr), slog.Bool("had_cancel", hadCancel))
+			}
 			return nil
 		case string(mcp.ResourcesUnsubscribeMethod):
 			var params mcp.UnsubscribeRequest
@@ -1175,7 +1185,6 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 			return nil
 		default:
 			// Unknown request; ignore.
-			e.log.Info("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("method", req.Method))
 			return nil
 		}
 	}
@@ -1201,7 +1210,6 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 			}
 			return nil
 		} else {
-			e.log.Info("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", reqID))
 			return nil
 		}
 	}

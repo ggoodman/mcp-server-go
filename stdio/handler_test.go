@@ -486,7 +486,7 @@ func TestCancellation_ToolsCall(t *testing.T) {
 
 	// cancel via notification
 	cancelNote := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.CancelledNotificationMethod)}
-	cancelNote.Params = mustJSON(t, mcp.CancelledNotification{RequestID: rid, Reason: "test"})
+	cancelNote.Params = mustJSON(t, mcp.CancelledNotification{RequestID: jsonrpc.NewRequestID(rid), Reason: "test"})
 	if err := th.send(cancelNote); err != nil {
 		t.Fatal(err)
 	}
