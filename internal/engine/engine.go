@@ -82,8 +82,13 @@ func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opt
 		wired:              make(map[string]bool),
 		subCancels:         make(map[string]map[string]mcpservice.CancelSubscription),
 	}
-	// Keep linters honest about method usage in builds where certain paths are pruned.
-	_ = e.handshakeTTL
+
+	// Apply options (order matters; later options override earlier ones).
+	for _, opt := range opts {
+		if opt != nil {
+			opt(e)
+		}
+	}
 	return e
 }
 
@@ -301,7 +306,7 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 	case string(mcp.LoggingSetLevelMethod):
 		return e.handleSetLoggingLevel(ctx, sess, req)
 	case string(mcp.ToolsCallMethod):
-		return e.handleToolCall(ctx, sess, req, requestScopedWriter)
+		return e.handleToolCall(ctx, sess, req)
 	}
 
 	return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "not implemented", nil), nil
@@ -496,7 +501,7 @@ func (e *Engine) handleToolsList(ctx context.Context, sess *SessionHandle, req *
 	return jsonrpc.NewResultResponse(req.ID, result)
 }
 
-func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request, writer MessageWriter) (*jsonrpc.Response, error) {
+func (e *Engine) handleToolCall(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	start := time.Now()
 	log := e.log.With(slog.String("method", req.Method))
 
