@@ -1,9 +1,12 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"time"
+
+	"github.com/ggoodman/mcp-server-go/internal/jwtauth"
 )
 
 // SecurityConfig is the unified, immutable configuration describing how this
@@ -37,6 +40,12 @@ type SecurityConfig struct {
 // surface for client bootstrapping. None of these fields are required for
 // token validation.
 type OIDCExtra struct {
+	// AuthorizationEndpoint and TokenEndpoint are derived from OIDC discovery
+	// (/.well-known/openid-configuration) when using discovery-based
+	// authenticators. They are advertisement-only and never used for access
+	// token validation in this process.
+	AuthorizationEndpoint                      string
+	TokenEndpoint                              string
 	ScopesSupported                            []string
 	TokenEndpointAuthMethodsSupported          []string
 	TokenEndpointAuthSigningAlgValuesSupported []string
@@ -86,12 +95,43 @@ func (c SecurityConfig) Copy() SecurityConfig {
 	dup.AllowedAlgs = append([]string(nil), c.AllowedAlgs...)
 	if c.OIDC != nil {
 		ox := *c.OIDC
+		ox.AuthorizationEndpoint = c.OIDC.AuthorizationEndpoint
+		ox.TokenEndpoint = c.OIDC.TokenEndpoint
 		ox.ScopesSupported = append([]string(nil), ox.ScopesSupported...)
 		ox.TokenEndpointAuthMethodsSupported = append([]string(nil), ox.TokenEndpointAuthMethodsSupported...)
 		ox.TokenEndpointAuthSigningAlgValuesSupported = append([]string(nil), ox.TokenEndpointAuthSigningAlgValuesSupported...)
 		dup.OIDC = &ox
 	}
 	return dup
+}
+
+// NewManualJWTAuthenticator constructs a JWT access token authenticator using
+// this security configuration without performing OIDC discovery. It expects:
+//   - c.Issuer (non-empty)
+//   - at least one audience in c.Audiences
+//   - c.JWKSURL (non-empty)
+//
+// AllowedAlgs and Leeway are honored (defaults applied via Normalize if needed).
+// OIDC advertisement fields (AuthorizationEndpoint, TokenEndpoint, etc.) are
+// not required for validation but may be present for metadata serving.
+func (c SecurityConfig) NewManualJWTAuthenticator(ctx context.Context) (SecurityProvider, error) {
+	cc := c.Copy()
+	cc.Normalize()
+	if err := cc.Validate(); err != nil {
+		return nil, err
+	}
+	if cc.JWKSURL == "" {
+		return nil, errors.New("security: JWKSURL required for manual JWT authenticator")
+	}
+
+	// Build static validator (no discovery) using internal jwtauth.
+	sc := &jwtauth.StaticConfig{Issuer: cc.Issuer, ExpectedAudiences: append([]string(nil), cc.Audiences...), AllowedAlgs: append([]string(nil), cc.AllowedAlgs...), Leeway: cc.Leeway}
+	a, err := jwtauth.NewStatic(ctx, sc, cc.JWKSURL)
+	if err != nil {
+		return nil, err
+	}
+	// Wrap to expose SecurityDescriptor + Authenticator.
+	return &adapter{a: a, sec: cc}, nil
 }
 
 // EqualCore returns true if the core enforcement identity (issuer + audiences) matches.

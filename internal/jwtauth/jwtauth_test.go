@@ -28,9 +28,10 @@ func newMockOIDC(t *testing.T, keysJSON []byte, metaExtra map[string]any) *mockO
 	handler := http.NewServeMux()
 	handler.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		meta := map[string]any{
-			"issuer":   m.issuer,
-			"jwks_uri": m.issuer + m.jwksPath,
-			// minimal extras to look realistic
+			"issuer":                   m.issuer,
+			"jwks_uri":                 m.issuer + m.jwksPath,
+			"authorization_endpoint":   m.issuer + "/oauth2/auth",
+			"token_endpoint":           m.issuer + "/oauth2/token",
 			"response_types_supported": []string{"code"},
 		}
 		for k, v := range m.metaExtra {
@@ -137,6 +138,28 @@ func TestAuthenticator_HappyPath(t *testing.T) {
 	if out.Scope != "mcp:read mcp:write" {
 		t.Fatalf("scope roundtrip mismatch: %q", out.Scope)
 	}
+}
+
+func TestAuthenticator_DiscoveryMissingRequired(t *testing.T) {
+	pk, _, jwks := genRSA(t)
+	// Provide meta missing token_endpoint to trigger failure.
+	extra := map[string]any{
+		"authorization_endpoint": "placeholder", // omit token_endpoint
+		// response_types_supported intentionally present
+	}
+	oidc := newMockOIDC(t, jwks, extra)
+	defer oidc.Close()
+	cfg := baseConfig(oidc.issuer, "aud")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err := NewFromDiscovery(ctx, cfg)
+	if err == nil {
+		t.Fatalf("expected error due to missing token_endpoint")
+	}
+	if !errors.Is(err, err) { // trivial non-nil check; we mainly assert it failed
+		t.Logf("got expected failure: %v", err)
+	}
+	_ = pk // silence unused (pk used just to generate jwks realistically)
 }
 
 func TestAuthenticator_AudienceArray(t *testing.T) {

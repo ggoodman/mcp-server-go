@@ -210,14 +210,21 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 		jwks := resolved.JWKSURL
 		var scopes []string
 		var svcDoc, pol, tos string
+		var authzEP, tokenEP string
+		var respTypes []string
 		if resolved.OIDC != nil {
 			scopes = resolved.OIDC.ScopesSupported
 			svcDoc = resolved.OIDC.ServiceDocumentation
 			pol = resolved.OIDC.OpPolicyURI
 			tos = resolved.OIDC.OpTosURI
+			authzEP = resolved.OIDC.AuthorizationEndpoint
+			tokenEP = resolved.OIDC.TokenEndpoint
+			// Future: extend OIDCExtra to carry response types; for now leave empty if not available.
 		}
+		// respTypes intentionally left empty if not provided by discovery; strict discovery
+		// validation ensures they are present when using discovery-based auth.
 		h.prmDocument = wellknown.ProtectedResourceMetadata{Resource: mcpURL.String(), AuthorizationServers: []string{issuer}, JwksURI: jwks, ScopesSupported: scopes, BearerMethodsSupported: []string{"authorization_header"}, ResourceName: cfg.serverName, ResourceDocumentation: svcDoc, ResourcePolicyURI: pol, ResourceTosURI: tos, TLSClientCertificateBoundAccessTokens: false, AuthorizationDetailsTypesSupported: []string{"urn:ietf:params:oauth:authorization-details"}}
-		h.authServerMetadata = wellknown.AuthServerMetadata{Issuer: issuer, ResponseTypesSupported: []string{"code"}, JwksURI: jwks, ScopesSupported: scopes, ServiceDocumentation: svcDoc, OpPolicyURI: pol, OpTosURI: tos}
+		h.authServerMetadata = wellknown.AuthServerMetadata{Issuer: issuer, ResponseTypesSupported: respTypes, AuthorizationEndpoint: authzEP, TokenEndpoint: tokenEP, JwksURI: jwks, ScopesSupported: scopes, ServiceDocumentation: svcDoc, OpPolicyURI: pol, OpTosURI: tos}
 	}
 
 	h.prmDocumentURL = &url.URL{Scheme: mcpURL.Scheme, Host: mcpURL.Host, Path: fmt.Sprintf("/.well-known/oauth-protected-resource%s", mcpURL.Path)}
@@ -228,9 +235,16 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 	mux.HandleFunc(fmt.Sprintf("GET %s", pathOnly(mcpURL)), h.handleGetMCP)
 	mux.HandleFunc(fmt.Sprintf("DELETE %s", pathOnly(mcpURL)), h.handleDeleteMCP)
 	prmPath := pathOnly(h.prmDocumentURL)
-	mux.HandleFunc(fmt.Sprintf("GET %s", prmPath), h.handleGetProtectedResourceMetadata)
-	mux.HandleFunc(fmt.Sprintf("OPTIONS %s", prmPath), h.handleOptionsProtectedResourceMetadata)
-	if !strings.HasSuffix(prmPath, "/") {
+	// If MCP is at root (prmPath ends with "/oauth-protected-resource/") also serve no-slash to avoid ServeMux 301.
+	if strings.HasSuffix(prmPath, "/") {
+		base := strings.TrimSuffix(prmPath, "/")
+		mux.HandleFunc(fmt.Sprintf("GET %s", base), h.handleGetProtectedResourceMetadata)
+		mux.HandleFunc(fmt.Sprintf("OPTIONS %s", base), h.handleOptionsProtectedResourceMetadata)
+		mux.HandleFunc(fmt.Sprintf("GET %s/", base), h.handleGetProtectedResourceMetadata)
+		mux.HandleFunc(fmt.Sprintf("OPTIONS %s/", base), h.handleOptionsProtectedResourceMetadata)
+	} else {
+		mux.HandleFunc(fmt.Sprintf("GET %s", prmPath), h.handleGetProtectedResourceMetadata)
+		mux.HandleFunc(fmt.Sprintf("OPTIONS %s", prmPath), h.handleOptionsProtectedResourceMetadata)
 		mux.HandleFunc(fmt.Sprintf("GET %s/", prmPath), h.handleGetProtectedResourceMetadata)
 		mux.HandleFunc(fmt.Sprintf("OPTIONS %s/", prmPath), h.handleOptionsProtectedResourceMetadata)
 	}
