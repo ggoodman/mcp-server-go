@@ -105,34 +105,46 @@ func WithRealm(realm string) Option {
 // Realm is omitted if empty. Params map order is stable only for tests if a
 // deterministic container is used; since Go map iteration is randomized, we
 // build a slice in key order we care about explicitly.
-func buildBearerChallenge(realm string, params map[string]string) string {
+func buildBearerChallenge(realm string, resourceMetadata string, params map[string]string) string {
 	pieces := make([]string, 0, 1+len(params))
+	esc := func(v string) string { return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v) }
 	if realm != "" {
-		pieces = append(pieces, fmt.Sprintf(`realm="%s"`, realm))
+		pieces = append(pieces, fmt.Sprintf(`realm="%s"`, esc(realm)))
+	}
+	if resourceMetadata != "" {
+		pieces = append(pieces, fmt.Sprintf(`resource_metadata="%s"`, esc(resourceMetadata)))
 	}
 	// Preserve a logical ordering: error, error_description, scope (if later added), others alphabetical.
 	if params != nil {
 		if v, ok := params["error"]; ok {
-			pieces = append(pieces, fmt.Sprintf(`error="%s"`, v))
+			pieces = append(pieces, fmt.Sprintf(`error="%s"`, esc(v)))
 		}
 		if v, ok := params["error_description"]; ok {
-			pieces = append(pieces, fmt.Sprintf(`error_description="%s"`, v))
+			pieces = append(pieces, fmt.Sprintf(`error_description="%s"`, esc(v)))
 		}
 		if v, ok := params["scope"]; ok {
-			pieces = append(pieces, fmt.Sprintf(`scope="%s"`, v))
+			pieces = append(pieces, fmt.Sprintf(`scope="%s"`, esc(v)))
 		}
 		// Add any remaining keys deterministically (stable order not critical for current use, best-effort alphabetical)
 		for k, v := range params {
 			if k == "error" || k == "error_description" || k == "scope" {
 				continue
 			}
-			pieces = append(pieces, fmt.Sprintf(`%s="%s"`, k, v))
+			pieces = append(pieces, fmt.Sprintf(`%s="%s"`, k, esc(v)))
 		}
 	}
 	if len(pieces) == 0 {
 		return "Bearer"
 	}
 	return "Bearer " + strings.Join(pieces, ", ")
+}
+
+// pathIfSet returns the string form of u if non-nil, else empty.
+func pathIfSet(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return u.String()
 }
 
 // StreamingHTTPHandler implements the stream HTTP transport protocol of
@@ -768,7 +780,7 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 		// resource server SHOULD NOT include an error code. Provide only a bare
 		// Bearer challenge with realm.
 		h.log.InfoContext(ctx, "auth.check.missing", slog.String("err", "no authorization header"))
-		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, nil))
+		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), nil))
 		w.WriteHeader(http.StatusUnauthorized)
 		return nil
 	}
@@ -777,14 +789,14 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 	const bearerPrefix = "Bearer "
 	if !strings.HasPrefix(authHeader, bearerPrefix) || len(authHeader) <= len(bearerPrefix) {
 		h.log.InfoContext(ctx, "auth.check.invalid", slog.String("err", "malformed bearer authorization header"))
-		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, map[string]string{"error": "invalid_request", "error_description": "malformed bearer authorization header"}))
+		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), map[string]string{"error": "invalid_request", "error_description": "malformed bearer authorization header"}))
 		w.WriteHeader(http.StatusBadRequest)
 		return nil
 	}
 	tok := strings.TrimSpace(authHeader[len(bearerPrefix):])
 	if tok == "" {
 		h.log.InfoContext(ctx, "auth.check.invalid", slog.String("err", "empty bearer token"))
-		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, map[string]string{"error": "invalid_request", "error_description": "empty bearer token"}))
+		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), map[string]string{"error": "invalid_request", "error_description": "empty bearer token"}))
 		w.WriteHeader(http.StatusBadRequest)
 		return nil
 	}
@@ -794,7 +806,7 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 		if errors.Is(err, auth.ErrUnauthorized) {
 			// Authentication attempted but token invalid -> 401 invalid_token
 			h.log.InfoContext(ctx, "auth.check.fail", slog.String("err", err.Error()))
-			w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, map[string]string{"error": "invalid_token", "error_description": err.Error()}))
+			w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), map[string]string{"error": "invalid_token", "error_description": err.Error()}))
 			w.WriteHeader(http.StatusUnauthorized)
 			return nil
 		}
@@ -803,7 +815,7 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 			// Auth succeeded but insufficient privileges -> 403 insufficient_scope
 			h.log.InfoContext(ctx, "auth.check.fail", slog.String("err", err.Error()))
 			// Optionally we could append scope="..." when we know required scopes.
-			w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, map[string]string{"error": "insufficient_scope", "error_description": err.Error()}))
+			w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), map[string]string{"error": "insufficient_scope", "error_description": err.Error()}))
 			w.WriteHeader(http.StatusForbidden)
 			return nil
 		}

@@ -313,6 +313,25 @@ func TestSingleInstance(t *testing.T) {
 		}
 	})
 
+	t.Run("Auth header escaping in error_description", func(t *testing.T) {
+		badAuth := &errorMessageAuth{wantToken: "the-token", err: fmt.Errorf("unauthorized: reason=\"bad\\value\"")}
+		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
+		srv := mustServer(t, server, withAuth(badAuth))
+		defer srv.Close()
+		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m5"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
+		resp, _ := doPostMCP(t, srv, "Bearer the-token", "", initReq)
+		if resp.StatusCode != http.StatusUnauthorized {
+			resp.Body.Close()
+			t.Fatalf("expected 401 got %d", resp.StatusCode)
+		}
+		wa := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		// Expect escaped quotes and backslash: reason=\"bad\\value\"
+		if !strings.Contains(wa, `reason=\"bad\\value\"`) {
+			t.Fatalf("expected escaped value in header, got %q", wa)
+		}
+	})
+
 	t.Run("Logging setLevel over POST", func(t *testing.T) {
 		var lv slog.LevelVar
 		lv.Set(slog.LevelInfo)
@@ -1322,6 +1341,19 @@ func (a *scopeFailAuth) CheckAuthentication(ctx context.Context, tok string) (au
 		return nil, auth.ErrUnauthorized
 	}
 	return nil, auth.ErrInsufficientScope
+}
+
+// errorMessageAuth returns a provided error (wrapped as unauthorized) to test header escaping.
+type errorMessageAuth struct {
+	wantToken string
+	err       error
+}
+
+func (a *errorMessageAuth) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
+	if tok != a.wantToken {
+		return nil, auth.ErrUnauthorized
+	}
+	return nil, fmt.Errorf("%s: %w", a.err.Error(), auth.ErrUnauthorized)
 }
 
 // Keep optional serverOption helpers considered used to satisfy linters when not
