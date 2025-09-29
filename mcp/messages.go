@@ -1,6 +1,10 @@
 package mcp
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
+)
 
 // Method is an MCP method identifier used in JSON-RPC messages.
 type Method string
@@ -74,8 +78,10 @@ type ProgressToken any // string | number
 
 // CancelledNotification informs the peer that a request was canceled.
 type CancelledNotification struct {
-	RequestID string `json:"requestId"`
-	Reason    string `json:"reason,omitzero"`
+	// RequestID matches the JSON-RPC request ID of the in-flight request being cancelled.
+	// JSON-RPC permits string or number; we accept both via jsonrpc.RequestID.
+	RequestID *jsonrpc.RequestID `json:"requestId"`
+	Reason    string             `json:"reason,omitzero"`
 }
 
 // ProgressNotificationParams conveys progress of a long-running operation.

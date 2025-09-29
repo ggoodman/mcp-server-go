@@ -223,7 +223,9 @@ func New(
 		return nil, fmt.Errorf("server URL must use HTTP or HTTPS scheme, got %q", mcpURL.Scheme)
 	}
 
-	cfg := &newConfig{}
+	cfg := &newConfig{
+		logger: slog.Default(),
+	}
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -232,13 +234,8 @@ func New(
 		return nil, fmt.Errorf("exactly one of WithAuthorizationServerDiscovery or WithManualOIDC must be provided")
 	}
 
-	log := slog.Default()
-	if cfg.logger != nil {
-		log = cfg.logger
-	}
-
 	h := &StreamingHTTPHandler{
-		log:         log,
+		log:         cfg.logger,
 		serverURL:   mcpURL,
 		auth:        authenticator,
 		mcp:         server,
@@ -249,10 +246,10 @@ func New(
 	}
 
 	// Initialize Engine and start its event consumer loop.
-	h.eng = engine.NewEngine(host, server, engine.WithLogger(log))
+	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
 		if err := h.eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Error("engine.run.fail", slog.String("err", err.Error()))
+			h.log.Error("engine.run.fail", slog.String("err", err.Error()))
 		}
 	}()
 
