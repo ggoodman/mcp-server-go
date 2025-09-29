@@ -865,6 +865,32 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 	}))
 
 	// Create the streaming HTTP handler with the test server URL
+	// If caller supplied an authenticator that is only noAuth (default) but provided issuer+jwks, build a manual JWT authenticator so metadata reflects response_types_supported.
+	if _, isNoAuth := cfg.authenticator.(*noAuth); isNoAuth && cfg.issuer != "" && cfg.jwksURI != "" {
+		sec := auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true, OIDC: &auth.OIDCExtra{ResponseTypesSupported: []string{"code"}}}
+		sec.Normalize()
+		sp, err := sec.NewManualJWTAuthenticator(ctx)
+		if err == nil { // if error, fall back to noAuth; test will fail elsewhere if critical
+			cfg.authenticator = sp
+		}
+		// Pass the same SecurityConfig (with OIDC) to transport for advertisement
+		streamingHandler, err := streaminghttp.New(
+			ctx,
+			srv.URL,
+			cfg.sessionsHost,
+			cfg.mcp,
+			cfg.authenticator,
+			streaminghttp.WithServerName(cfg.serverName),
+			streaminghttp.WithLogger(cfg.logger),
+			streaminghttp.WithSecurityConfig(sec),
+		)
+		if err != nil {
+			srv.Close()
+			t.Fatalf("Failed to create streaming HTTP handler: %v", err)
+		}
+		handler = streamingHandler
+		return srv
+	}
 	streamingHandler, err := streaminghttp.New(
 		ctx,
 		srv.URL,
@@ -873,7 +899,15 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		cfg.authenticator,
 		streaminghttp.WithServerName(cfg.serverName),
 		streaminghttp.WithLogger(cfg.logger),
-		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true}),
+		func() streaminghttp.Option {
+			if sd, ok := cfg.authenticator.(auth.SecurityDescriptor); ok {
+				sec := sd.SecurityConfig()
+				// Ensure Advertise true for tests
+				sec.Advertise = true
+				return streaminghttp.WithSecurityConfig(sec)
+			}
+			return streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true})
+		}(),
 	)
 	if err != nil {
 		srv.Close()

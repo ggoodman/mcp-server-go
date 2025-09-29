@@ -144,8 +144,9 @@ func TestAuthenticator_DiscoveryMissingRequired(t *testing.T) {
 	pk, _, jwks := genRSA(t)
 	// Provide meta missing token_endpoint to trigger failure.
 	extra := map[string]any{
-		"authorization_endpoint": "placeholder", // omit token_endpoint
-		// response_types_supported intentionally present
+		"authorization_endpoint":   "placeholder", // omit token_endpoint
+		"response_types_supported": []string{"code"},
+		"token_endpoint":           "", // override default provided by mock to force missing
 	}
 	oidc := newMockOIDC(t, jwks, extra)
 	defer oidc.Close()
