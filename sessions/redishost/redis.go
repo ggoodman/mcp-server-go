@@ -68,10 +68,11 @@ func WithClaimSettings(minIdle, interval time.Duration) Option {
 // New constructs a Host connecting to the provided Redis address (e.g. "localhost:6379").
 // Options can configure behavior such as key prefix. The connection is verified via PING.
 func New(redisAddr string, opts ...Option) (*Host, error) {
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+	options, err := redis.ParseURL(redisAddr)
+	if err != nil {
+		return nil, fmt.Errorf("redis parse url: %w", err)
 	}
-	cl := redis.NewClient(&redis.Options{Addr: redisAddr})
+	cl := redis.NewClient(options)
 	if err := cl.Ping(context.Background()).Err(); err != nil {
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
