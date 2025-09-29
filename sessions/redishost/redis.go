@@ -295,17 +295,27 @@ func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*ses
 			if err != nil {
 				return err
 			}
-			// pipeline set preserving TTL time remaining
-			p := tx.TxPipeline()
-			// fetch remaining TTL
-			ttl, err := tx.TTL(ctx, key).Result()
-			if err != nil {
-				return err
+			// Determine refreshed sliding TTL. We intentionally RESET the key TTL to m.TTL
+			// (clamped by remaining MaxLifetime) to implement a proper sliding window.
+			// Previous logic preserved the remaining TTL which caused sessions opened
+			// after a short handshake TTL to expire prematurely.
+			remaining := m.TTL
+			if m.MaxLifetime > 0 {
+				// Clamp refreshed TTL so we never extend past absolute max lifetime.
+				elapsed := time.Since(m.CreatedAt)
+				if elapsed >= m.MaxLifetime {
+					// Session exceeded absolute lifetime: treat as not found to upstream.
+					return errors.New("not found")
+				}
+				left := m.MaxLifetime - elapsed
+				if left < remaining {
+					remaining = left
+				}
 			}
-			if ttl <= 0 {
-				ttl = m.TTL
-			} // fallback
-			p.Set(ctx, key, b, ttl)
+			p := tx.TxPipeline()
+			p.Set(ctx, key, b, remaining)
+			// Align stream expiry with refreshed TTL (best-effort)
+			p.Expire(ctx, h.streamKey(m.SessionID), remaining)
 			_, err = p.Exec(ctx)
 			return err
 		}, key)
@@ -319,7 +329,7 @@ func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*ses
 
 func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
 	key := h.metaKey(sessionID)
-	// Extend TTL by fetching existing metadata and re-setting value with new TTL (sliding window)
+	// Refresh sliding TTL to full duration (clamped by MaxLifetime) on activity.
 	return h.client.Watch(ctx, func(tx *redis.Tx) error {
 		val, err := tx.Get(ctx, key).Bytes()
 		if err != nil {
@@ -331,22 +341,25 @@ func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
 		}
 		m.LastAccess = time.Now().UTC()
 		m.UpdatedAt = m.LastAccess
+		// Compute refreshed TTL.
+		newTTL := m.TTL
+		if m.MaxLifetime > 0 {
+			elapsed := time.Since(m.CreatedAt)
+			if elapsed >= m.MaxLifetime {
+				return errors.New("not found")
+			}
+			remain := m.MaxLifetime - elapsed
+			if remain < newTTL {
+				newTTL = remain
+			}
+		}
 		b, err := json.Marshal(&m)
 		if err != nil {
 			return err
 		}
-		// Preserve remaining TTL or use m.TTL if no TTL
-		ttl, err := tx.TTL(ctx, key).Result()
-		if err != nil {
-			return err
-		}
-		if ttl <= 0 {
-			ttl = m.TTL
-		}
 		p := tx.TxPipeline()
-		p.Set(ctx, key, b, ttl)
-		// Best-effort: align stream TTL with metadata TTL
-		p.Expire(ctx, h.streamKey(sessionID), ttl)
+		p.Set(ctx, key, b, newTTL)
+		p.Expire(ctx, h.streamKey(sessionID), newTTL)
 		_, err = p.Exec(ctx)
 		return err
 	}, key)

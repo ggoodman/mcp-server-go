@@ -78,9 +78,9 @@ func (ad *adapter) CheckAuthentication(ctx context.Context, tok string) (UserInf
 	if err != nil {
 		// Map internal sentinel errors to public errors used by the handler.
 		if errors.Is(err, jwtauth.ErrInsufficientScope) {
-			return nil, ErrInsufficientScope
+			return nil, errors.Join(ErrInsufficientScope, err)
 		}
-		return nil, ErrUnauthorized
+		return nil, errors.Join(ErrUnauthorized, err)
 	}
 	return userInfoAdapter{ui: ui}, nil
 }
