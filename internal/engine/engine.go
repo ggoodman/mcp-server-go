@@ -1185,7 +1185,6 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 			return nil
 		default:
 			// Unknown request; ignore.
-			e.log.Info("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("method", req.Method))
 			return nil
 		}
 	}
@@ -1211,7 +1210,6 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 			}
 			return nil
 		} else {
-			e.log.Info("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", reqID))
 			return nil
 		}
 	}
