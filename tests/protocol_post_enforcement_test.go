@@ -29,7 +29,7 @@ func setupTestServer(t *testing.T) (*httptest.Server, http.Handler) {
 	srvCaps := mcpservice.NewServer()
 	var handler http.Handler
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
-	h, err := streaminghttp.New(ctx, srv.URL, mh, srvCaps, new(noAuthProto2), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}))
+	h, err := streaminghttp.New(ctx, srv.URL, mh, srvCaps, new(noAuthProto2), streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}))
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}

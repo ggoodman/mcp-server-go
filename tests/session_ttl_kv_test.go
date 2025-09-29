@@ -32,7 +32,7 @@ func TestSessionTouchDebounce(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
 	defer srv.Close()
 
-	h, err := streaminghttp.New(ctx, srv.URL, mh, srvCaps, new(ttlNoAuth), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}))
+	h, err := streaminghttp.New(ctx, srv.URL, mh, srvCaps, new(ttlNoAuth), streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}))
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestSessionDataSizeLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
 	defer srv.Close()
 
-	h, err := streaminghttp.New(ctx, srv.URL, mh, srvCaps, new(ttlNoAuth), streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/jwks.json"}))
+	h, err := streaminghttp.New(ctx, srv.URL, mh, srvCaps, new(ttlNoAuth), streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/jwks.json", Advertise: true}))
 	if err != nil {
 		t.Fatalf("handler: %v", err)
 	}

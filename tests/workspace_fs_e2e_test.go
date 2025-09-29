@@ -42,10 +42,7 @@ func TestExamples_WorkspaceFS_E2E(t *testing.T) {
 		workspace_fs.New(dir),
 		new(noAuthWS),
 		streaminghttp.WithServerName("examples"),
-		streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{
-			Issuer:  "http://127.0.0.1:0",
-			JwksURI: "http://127.0.0.1/.well-known/jwks.json",
-		}),
+		streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"test"}, JWKSURL: "http://127.0.0.1/.well-known/jwks.json", Advertise: true}),
 	)
 	if err != nil {
 		t.Fatalf("failed to create handler: %v", err)

@@ -124,10 +124,10 @@ Upgrade path: swap the transport + host; your `server` stays the same.
 ```go
 // (Sketch – not a full program)
 host := redishost.New(redisClient) // or your implementation of sessions.SessionHost
-authn, _ := auth.NewFromDiscovery(ctx, issuerURL, auth.WithExpectedAudience(publicURL))
+authn, _ := auth.NewFromDiscovery(ctx, issuerURL, publicURL)
 httpHandler, _ := streaminghttp.New(ctx, publicURL, host, server, authn,
-    streaminghttp.WithAuthorizationServerDiscovery(issuerURL),
-    streaminghttp.WithServerName("reverse-prod"),
+	// Security metadata (issuer, audiences, JWKS) inferred from authenticator.
+	streaminghttp.WithServerName("reverse-prod"),
 )
 http.Handle("/mcp", httpHandler)
 ```
@@ -146,16 +146,30 @@ Each capability is configured by a single `With*Capability` option that accepts 
 * Pass a container (e.g. `NewToolsContainer`) directly – containers self‑implement the provider.
 * Or pass an `XCapabilityProviderFunc` for per‑session logic.
 
-## Authorization and discovery
+## Authorization, validation & advertisement
 
-When you enable discovery with `WithAuthorizationServerDiscovery(issuer)`, the handler:
+The streaming HTTP transport now derives all advertised security metadata from a single `auth.SecurityConfig` exposed by the authenticator (it implements `auth.SecurityDescriptor`) or provided explicitly via `streaminghttp.WithSecurityConfig`.
 
-- Validates tokens using JWKS from your issuer (via `auth.NewFromDiscovery`).
-- Serves Protected Resource Metadata at `/.well-known/oauth-protected-resource/`.
-- Mirrors Authorization Server Metadata at `/.well-known/oauth-authorization-server`.
-- Responds to unauthorized requests with a standards-compliant `WWW-Authenticate` header that points at the resource metadata.
+Typical pattern:
 
-See the spec documents under `specs/` for details.
+```go
+authn, _ := auth.NewFromDiscovery(ctx, issuerURL, publicURL)
+handler, _ := streaminghttp.New(ctx, publicURL, host, server, authn)
+```
+
+If the resolved `SecurityConfig.Advertise` is true, the handler automatically:
+
+* Serves Protected Resource Metadata (`/.well-known/oauth-protected-resource<endpoint-path>`)
+* Mirrors Authorization Server Metadata (`/.well-known/oauth-authorization-server`)
+* Emits `WWW-Authenticate` headers pointing at the resource metadata on auth failures
+
+To override or supply metadata without discovery (e.g. offline environments) pass:
+
+```go
+streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: issuerURL, Audiences: []string{"my-aud"}, JWKSURL: jwksURL, Advertise: true})
+```
+
+No more duplicated issuer/audience across transport options—one source of truth.
 
 ## Capability providers (static & dynamic)
 
@@ -427,7 +441,7 @@ Contributions welcome — see `CONTRIBUTING.md`.
 
 **Q: Do I need Redis to start?**  No — stdio + memory host gets you running instantly.
 
-**Q: How do I add authentication?** Use `auth.NewFromDiscovery` with `WithExpectedAudience(publicURL)` then pass the authenticator to `streaminghttp.New`.
+**Q: How do I add authentication?** Call `auth.NewFromDiscovery(ctx, issuerURL, publicURL)` (issuer + audience are required positional args) then pass the authenticator to `streaminghttp.New`.
 
 **Q: How do I emit progress?** The tool writer returned by `NewTool*` supports `_ = w.Progress(fraction)`. Honor context cancellation to be well-behaved.
 

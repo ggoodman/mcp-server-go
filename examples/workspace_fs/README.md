@@ -36,7 +36,7 @@ Mount it on the streaming HTTP handler (for local development you can use memory
 ```go
 h, _ := streaminghttp.New(ctx, publicURL, memoryhost.New(), srv, noAuth,
     streaminghttp.WithServerName("workspace"),
-    streaminghttp.WithManualOIDC(streaminghttp.ManualOIDC{Issuer: "http://127.0.0.1:0", JwksURI: "http://127.0.0.1/.well-known/jwks.json"}),
+  streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: "http://127.0.0.1:0", Audiences: []string{"example"}, JWKSURL: "http://127.0.0.1/.well-known/jwks.json", Advertise: true}),
 )
 http.Handle("/", h)
 ```
