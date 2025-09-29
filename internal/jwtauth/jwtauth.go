@@ -70,6 +70,16 @@ type discoveryAuthenticator struct {
 	iss                   string
 	authorizationEndpoint string
 	tokenEndpoint         string
+	responseTypes         []string
+	scopes                []string
+	grantTypes            []string
+	responseModes         []string
+	codeChallengeMethods  []string
+	tokenAuthMethods      []string
+	tokenAuthAlgs         []string
+	serviceDoc            string
+	policyURI             string
+	tosURI                string
 }
 
 // DiscoveryMetadata exposes optional advertisement-only endpoints learned via
@@ -169,8 +179,40 @@ func NewFromDiscovery(ctx context.Context, cfg *Config) (*discoveryAuthenticator
 		iss:                   meta.Issuer,
 		authorizationEndpoint: meta.Authorization,
 		tokenEndpoint:         meta.Token,
+		responseTypes:         append([]string(nil), meta.ResponseTypes...),
+		scopes:                append([]string(nil), meta.Scopes...),
+		grantTypes:            append([]string(nil), meta.GrantTypes...),
+		responseModes:         append([]string(nil), meta.ResponseModes...),
+		codeChallengeMethods:  append([]string(nil), meta.CodeChallenge...),
+		tokenAuthMethods:      append([]string(nil), meta.TokenAuth...),
+		tokenAuthAlgs:         append([]string(nil), meta.TokenAuthAlgs...),
+		serviceDoc:            meta.ServiceDoc,
+		policyURI:             meta.PolicyURI,
+		tosURI:                meta.TosURI,
 	}, nil
 }
+
+// Extended discovery accessors used by outer layers to populate advertisement metadata.
+func (a *discoveryAuthenticator) ResponseTypes() []string {
+	return append([]string(nil), a.responseTypes...)
+}
+func (a *discoveryAuthenticator) Scopes() []string     { return append([]string(nil), a.scopes...) }
+func (a *discoveryAuthenticator) GrantTypes() []string { return append([]string(nil), a.grantTypes...) }
+func (a *discoveryAuthenticator) ResponseModes() []string {
+	return append([]string(nil), a.responseModes...)
+}
+func (a *discoveryAuthenticator) CodeChallengeMethods() []string {
+	return append([]string(nil), a.codeChallengeMethods...)
+}
+func (a *discoveryAuthenticator) TokenEndpointAuthMethods() []string {
+	return append([]string(nil), a.tokenAuthMethods...)
+}
+func (a *discoveryAuthenticator) TokenEndpointAuthAlgs() []string {
+	return append([]string(nil), a.tokenAuthAlgs...)
+}
+func (a *discoveryAuthenticator) ServiceDocumentation() string { return a.serviceDoc }
+func (a *discoveryAuthenticator) PolicyURI() string            { return a.policyURI }
+func (a *discoveryAuthenticator) TosURI() string               { return a.tosURI }
 
 func (a *discoveryAuthenticator) CheckAuthentication(ctx context.Context, tok string) (UserInfo, error) {
 	if tok == "" {

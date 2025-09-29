@@ -1285,6 +1285,63 @@ func TestAuthorizationServerMetadata_DiscoveryEndpoints(t *testing.T) {
 	}
 }
 
+func TestAuthorizationServerMetadata_DiscoveryExtended(t *testing.T) {
+	// Build a server using a discovery-backed authenticator by constructing a mock provider.
+	// For test simplicity, manually craft SecurityConfig with extended metadata mimicking discovery output.
+	server := mcpservice.NewServer(
+		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
+	)
+	issuer := "https://issuer.example"
+	cfg := auth.SecurityConfig{Issuer: issuer, Audiences: []string{"https://aud.example"}, Advertise: true, OIDC: &auth.OIDCExtra{
+		AuthorizationEndpoint:                      "https://issuer.example/oauth2/auth",
+		TokenEndpoint:                              "https://issuer.example/oauth2/token",
+		ResponseTypesSupported:                     []string{"code"},
+		GrantTypesSupported:                        []string{"authorization_code"},
+		ResponseModesSupported:                     []string{"query"},
+		CodeChallengeMethodsSupported:              []string{"S256"},
+		TokenEndpointAuthMethodsSupported:          []string{"client_secret_basic"},
+		TokenEndpointAuthSigningAlgValuesSupported: []string{"RS256"},
+	}}
+	cfg.Normalize()
+	sd := securityConfigDescriptor{cfg: cfg}
+	srv := mustServer(t, server, withAuth(sd))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/.well-known/oauth-authorization-server")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	var meta struct {
+		GrantTypesSupported                        []string `json:"grant_types_supported"`
+		ResponseModesSupported                     []string `json:"response_modes_supported"`
+		CodeChallengeMethodsSupported              []string `json:"code_challenge_methods_supported"`
+		TokenEndpointAuthMethodsSupported          []string `json:"token_endpoint_auth_methods_supported"`
+		TokenEndpointAuthSigningAlgValuesSupported []string `json:"token_endpoint_auth_signing_alg_values_supported"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(meta.GrantTypesSupported) == 0 || meta.GrantTypesSupported[0] != "authorization_code" {
+		t.Fatalf("grant_types missing or wrong: %+v", meta.GrantTypesSupported)
+	}
+	if len(meta.ResponseModesSupported) == 0 || meta.ResponseModesSupported[0] != "query" {
+		t.Fatalf("response_modes missing: %+v", meta.ResponseModesSupported)
+	}
+	if len(meta.CodeChallengeMethodsSupported) == 0 || meta.CodeChallengeMethodsSupported[0] != "S256" {
+		t.Fatalf("code_challenge missing: %+v", meta.CodeChallengeMethodsSupported)
+	}
+	if len(meta.TokenEndpointAuthMethodsSupported) == 0 || meta.TokenEndpointAuthMethodsSupported[0] != "client_secret_basic" {
+		t.Fatalf("token auth methods missing: %+v", meta.TokenEndpointAuthMethodsSupported)
+	}
+	if len(meta.TokenEndpointAuthSigningAlgValuesSupported) == 0 || meta.TokenEndpointAuthSigningAlgValuesSupported[0] != "RS256" {
+		t.Fatalf("token auth algs missing: %+v", meta.TokenEndpointAuthSigningAlgValuesSupported)
+	}
+}
+
 // securityConfigDescriptor adapts a SecurityConfig to SecurityDescriptor without auth.
 type securityConfigDescriptor struct{ cfg auth.SecurityConfig }
 

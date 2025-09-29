@@ -465,4 +465,3 @@ func mapSchemaTypeToProtocol(vType string, k reflect.Kind) (string, bool) {
 	}
 	return "", false
 }
-

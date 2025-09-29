@@ -79,11 +79,31 @@ func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts 
 	type fullDiscovery interface {
 		AuthorizationEndpoint() string
 		TokenEndpoint() string
+		ResponseTypes() []string
+		Scopes() []string
+		GrantTypes() []string
+		ResponseModes() []string
+		CodeChallengeMethods() []string
+		TokenEndpointAuthMethods() []string
+		TokenEndpointAuthAlgs() []string
+		ServiceDocumentation() string
+		PolicyURI() string
+		TosURI() string
 	}
 	if dm, ok := any(internal).(fullDiscovery); ok {
-		if dm.AuthorizationEndpoint() != "" || dm.TokenEndpoint() != "" {
-			// Initialize OIDCExtra if needed; we only currently expose endpoints here.
-			sec.OIDC = &OIDCExtra{AuthorizationEndpoint: dm.AuthorizationEndpoint(), TokenEndpoint: dm.TokenEndpoint()}
+		sec.OIDC = &OIDCExtra{
+			AuthorizationEndpoint:                      dm.AuthorizationEndpoint(),
+			TokenEndpoint:                              dm.TokenEndpoint(),
+			ResponseTypesSupported:                     dm.ResponseTypes(),
+			ScopesSupported:                            dm.Scopes(),
+			GrantTypesSupported:                        dm.GrantTypes(),
+			ResponseModesSupported:                     dm.ResponseModes(),
+			CodeChallengeMethodsSupported:              dm.CodeChallengeMethods(),
+			TokenEndpointAuthMethodsSupported:          dm.TokenEndpointAuthMethods(),
+			TokenEndpointAuthSigningAlgValuesSupported: dm.TokenEndpointAuthAlgs(),
+			ServiceDocumentation:                       dm.ServiceDocumentation(),
+			OpPolicyURI:                                dm.PolicyURI(),
+			OpTosURI:                                   dm.TosURI(),
 		}
 	}
 	sec.Normalize()
