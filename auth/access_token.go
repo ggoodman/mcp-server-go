@@ -89,11 +89,13 @@ func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts 
 		ServiceDocumentation() string
 		PolicyURI() string
 		TosURI() string
+		RegistrationEndpoint() string
 	}
 	if dm, ok := any(internal).(fullDiscovery); ok {
 		sec.OIDC = &OIDCExtra{
 			AuthorizationEndpoint:                      dm.AuthorizationEndpoint(),
 			TokenEndpoint:                              dm.TokenEndpoint(),
+			RegistrationEndpoint:                       dm.RegistrationEndpoint(),
 			ResponseTypesSupported:                     dm.ResponseTypes(),
 			ScopesSupported:                            dm.Scopes(),
 			GrantTypesSupported:                        dm.GrantTypes(),

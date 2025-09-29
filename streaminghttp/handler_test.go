@@ -96,6 +96,7 @@ func TestSingleInstance(t *testing.T) {
 
 		// Tools should be advertised (empty static container exposes listChanged)
 		if initRes.Capabilities.Tools == nil || !initRes.Capabilities.Tools.ListChanged {
+			// Use testing fatal
 			t.Fatalf("expected tools listChanged capability to be true, got %#v", initRes.Capabilities.Tools)
 		}
 	})
@@ -160,7 +161,6 @@ func TestSingleInstance(t *testing.T) {
 			t.Fatalf("expected non-empty URITemplate")
 		}
 	})
-
 	t.Run("Tools list over POST is empty", func(t *testing.T) {
 		server := mcpservice.NewServer(
 			mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
@@ -1295,6 +1295,7 @@ func TestAuthorizationServerMetadata_DiscoveryExtended(t *testing.T) {
 	cfg := auth.SecurityConfig{Issuer: issuer, Audiences: []string{"https://aud.example"}, Advertise: true, OIDC: &auth.OIDCExtra{
 		AuthorizationEndpoint:                      "https://issuer.example/oauth2/auth",
 		TokenEndpoint:                              "https://issuer.example/oauth2/token",
+		RegistrationEndpoint:                       "https://issuer.example/connect/register",
 		ResponseTypesSupported:                     []string{"code"},
 		GrantTypesSupported:                        []string{"authorization_code"},
 		ResponseModesSupported:                     []string{"query"},
@@ -1321,6 +1322,7 @@ func TestAuthorizationServerMetadata_DiscoveryExtended(t *testing.T) {
 		CodeChallengeMethodsSupported              []string `json:"code_challenge_methods_supported"`
 		TokenEndpointAuthMethodsSupported          []string `json:"token_endpoint_auth_methods_supported"`
 		TokenEndpointAuthSigningAlgValuesSupported []string `json:"token_endpoint_auth_signing_alg_values_supported"`
+		RegistrationEndpoint                       string   `json:"registration_endpoint"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
 		t.Fatalf("decode: %v", err)

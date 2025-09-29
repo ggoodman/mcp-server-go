@@ -210,7 +210,7 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 		jwks := resolved.JWKSURL
 		var scopes []string
 		var svcDoc, pol, tos string
-		var authzEP, tokenEP string
+		var authzEP, tokenEP, regEP string
 		var respTypes []string
 		var grantTypes, responseModes, codeChal, tokenAuthMethods, tokenAuthAlgs []string
 		if resolved.OIDC != nil {
@@ -220,6 +220,7 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 			tos = resolved.OIDC.OpTosURI
 			authzEP = resolved.OIDC.AuthorizationEndpoint
 			tokenEP = resolved.OIDC.TokenEndpoint
+			regEP = resolved.OIDC.RegistrationEndpoint
 			respTypes = resolved.OIDC.ResponseTypesSupported
 			grantTypes = resolved.OIDC.GrantTypesSupported
 			responseModes = resolved.OIDC.ResponseModesSupported
@@ -230,7 +231,7 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 		// respTypes intentionally left empty if not provided by discovery; strict discovery
 		// validation ensures they are present when using discovery-based auth.
 		h.prmDocument = wellknown.ProtectedResourceMetadata{Resource: mcpURL.String(), AuthorizationServers: []string{issuer}, JwksURI: jwks, ScopesSupported: scopes, BearerMethodsSupported: []string{"authorization_header"}, ResourceName: cfg.serverName, ResourceDocumentation: svcDoc, ResourcePolicyURI: pol, ResourceTosURI: tos, TLSClientCertificateBoundAccessTokens: false, AuthorizationDetailsTypesSupported: []string{"urn:ietf:params:oauth:authorization-details"}}
-		h.authServerMetadata = wellknown.AuthServerMetadata{Issuer: issuer, ResponseTypesSupported: respTypes, AuthorizationEndpoint: authzEP, TokenEndpoint: tokenEP, JwksURI: jwks, ScopesSupported: scopes, ServiceDocumentation: svcDoc, OpPolicyURI: pol, OpTosURI: tos, GrantTypesSupported: grantTypes, ResponseModesSupported: responseModes, CodeChallengeMethodsSupported: codeChal, TokenEndpointAuthMethodsSupported: tokenAuthMethods, TokenEndpointAuthSigningAlgValuesSupported: tokenAuthAlgs}
+		h.authServerMetadata = wellknown.AuthServerMetadata{Issuer: issuer, ResponseTypesSupported: respTypes, AuthorizationEndpoint: authzEP, TokenEndpoint: tokenEP, RegistrationEndpoint: regEP, JwksURI: jwks, ScopesSupported: scopes, ServiceDocumentation: svcDoc, OpPolicyURI: pol, OpTosURI: tos, GrantTypesSupported: grantTypes, ResponseModesSupported: responseModes, CodeChallengeMethodsSupported: codeChal, TokenEndpointAuthMethodsSupported: tokenAuthMethods, TokenEndpointAuthSigningAlgValuesSupported: tokenAuthAlgs}
 	}
 
 	h.prmDocumentURL = &url.URL{Scheme: mcpURL.Scheme, Host: mcpURL.Host, Path: fmt.Sprintf("/.well-known/oauth-protected-resource%s", mcpURL.Path)}

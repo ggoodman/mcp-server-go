@@ -47,6 +47,7 @@ type OIDCExtra struct {
 	AuthorizationEndpoint                      string
 	TokenEndpoint                              string
 	ScopesSupported                            []string
+	RegistrationEndpoint                       string
 	ResponseTypesSupported                     []string
 	GrantTypesSupported                        []string
 	ResponseModesSupported                     []string
@@ -102,6 +103,7 @@ func (c SecurityConfig) Copy() SecurityConfig {
 		ox.AuthorizationEndpoint = c.OIDC.AuthorizationEndpoint
 		ox.TokenEndpoint = c.OIDC.TokenEndpoint
 		ox.ScopesSupported = append([]string(nil), ox.ScopesSupported...)
+		ox.RegistrationEndpoint = c.OIDC.RegistrationEndpoint
 		ox.ResponseTypesSupported = append([]string(nil), c.OIDC.ResponseTypesSupported...)
 		ox.GrantTypesSupported = append([]string(nil), c.OIDC.GrantTypesSupported...)
 		ox.ResponseModesSupported = append([]string(nil), c.OIDC.ResponseModesSupported...)

@@ -70,6 +70,7 @@ type discoveryAuthenticator struct {
 	iss                   string
 	authorizationEndpoint string
 	tokenEndpoint         string
+	registrationEndpoint  string
 	responseTypes         []string
 	scopes                []string
 	grantTypes            []string
@@ -121,6 +122,7 @@ func NewFromDiscovery(ctx context.Context, cfg *Config) (*discoveryAuthenticator
 		JwksURI       string   `json:"jwks_uri"`
 		Authorization string   `json:"authorization_endpoint"`
 		Token         string   `json:"token_endpoint"`
+		Registration  string   `json:"registration_endpoint"`
 		ResponseTypes []string `json:"response_types_supported"`
 		Scopes        []string `json:"scopes_supported"`
 		GrantTypes    []string `json:"grant_types_supported"`
@@ -180,6 +182,7 @@ func NewFromDiscovery(ctx context.Context, cfg *Config) (*discoveryAuthenticator
 		authorizationEndpoint: meta.Authorization,
 		tokenEndpoint:         meta.Token,
 		responseTypes:         append([]string(nil), meta.ResponseTypes...),
+		registrationEndpoint:  meta.Registration,
 		scopes:                append([]string(nil), meta.Scopes...),
 		grantTypes:            append([]string(nil), meta.GrantTypes...),
 		responseModes:         append([]string(nil), meta.ResponseModes...),
@@ -213,6 +216,7 @@ func (a *discoveryAuthenticator) TokenEndpointAuthAlgs() []string {
 func (a *discoveryAuthenticator) ServiceDocumentation() string { return a.serviceDoc }
 func (a *discoveryAuthenticator) PolicyURI() string            { return a.policyURI }
 func (a *discoveryAuthenticator) TosURI() string               { return a.tosURI }
+func (a *discoveryAuthenticator) RegistrationEndpoint() string { return a.registrationEndpoint }
 
 func (a *discoveryAuthenticator) CheckAuthentication(ctx context.Context, tok string) (UserInfo, error) {
 	if tok == "" {
