@@ -756,13 +756,15 @@ func testLogHandler(t *testing.T) *logBridge {
 type serverOption func(*serverConfig)
 
 type serverConfig struct {
-	authenticator auth.Authenticator
-	mcp           mcpservice.ServerCapabilities
-	sessionsHost  sessions.SessionHost
-	logger        *slog.Logger
-	serverName    string
-	issuer        string
-	jwksURI       string
+	authenticator  auth.Authenticator
+	mcp            mcpservice.ServerCapabilities
+	sessionsHost   sessions.SessionHost
+	logger         *slog.Logger
+	serverName     string
+	issuer         string
+	jwksURI        string
+	overrideIssuer bool
+	overrideJWKS   bool
 }
 
 // withAuth configures the server to use the provided authenticator.
@@ -797,6 +799,7 @@ func withServerName(name string) serverOption {
 func withIssuer(issuer string) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.issuer = issuer
+		cfg.overrideIssuer = true
 	}
 }
 
@@ -804,6 +807,7 @@ func withIssuer(issuer string) serverOption {
 func withJwksURI(uri string) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.jwksURI = uri
+		cfg.overrideJWKS = true
 	}
 }
 
@@ -866,7 +870,9 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 
 	// Create the streaming HTTP handler with the test server URL
 	// If caller supplied an authenticator that is only noAuth (default) but provided issuer+jwks, build a manual JWT authenticator so metadata reflects response_types_supported.
-	if _, isNoAuth := cfg.authenticator.(*noAuth); isNoAuth && cfg.issuer != "" && cfg.jwksURI != "" {
+	// Only build a manual authenticator automatically if BOTH issuer and jwks were explicitly overridden
+	// by the test. Default implicit values should not enable auth; many tests rely on no-auth behavior.
+	if _, isNoAuth := cfg.authenticator.(*noAuth); isNoAuth && cfg.overrideIssuer && cfg.overrideJWKS {
 		sec := auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true, OIDC: &auth.OIDCExtra{ResponseTypesSupported: []string{"code"}}}
 		sec.Normalize()
 		sp, err := sec.NewManualJWTAuthenticator(ctx)

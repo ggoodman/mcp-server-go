@@ -119,18 +119,66 @@ func main() {
 
 ```
 
-Upgrade path: swap the transport + host; your `server` stays the same.
+Upgrade path: swap the transport + host; your `server` value is unchanged and you layer in authorization.
+
+### From stdio prototype → horizontally scaled streaming HTTP (with auth)
+
+Below is an end‑to‑end sketch showing how you take the earlier stdio server and run it behind the streaming HTTP transport with:
+
+1. A distributed session host (Redis) for fan‑out + durability.
+2. OIDC discovery (single line) OR a manual static JWT config (offline / air‑gapped environments).
+3. Automatic well‑known metadata advertisement (protected resource + authorization server mirrors) sourced solely from one `auth.SecurityConfig`.
 
 ```go
 // (Sketch – not a full program)
-host := redishost.New(redisClient) // or your implementation of sessions.SessionHost
-authn, _ := auth.NewFromDiscovery(ctx, issuerURL, publicURL)
-httpHandler, _ := streaminghttp.New(ctx, publicURL, host, server, authn,
-	// Security metadata (issuer, audiences, JWKS) inferred from authenticator.
+ctx := context.Background()
+
+// 1. Construct (or reuse) your MCP server capabilities (same as stdio)
+server := buildServer() // from earlier snippet
+
+// 2. Pick a SessionHost implementation (memory for single node; redis for scale)
+host, _ := redishost.New(os.Getenv("REDIS_ADDR"))
+
+publicEndpoint := "https://mcp.example.com/mcp" // the full public URL path clients will call
+issuer := "https://issuer.example"              // your OIDC issuer
+
+// 3a. Discovery-based auth (recommended when you control / trust the AS metadata)
+authn, _ := auth.NewFromDiscovery(ctx, issuer, publicEndpoint)
+
+// 3b. OR manual static JWT validation (no discovery). You MUST supply advertisement fields explicitly.
+// jwksURL := "https://issuer.example/jwks.json"
+// sec := auth.SecurityConfig{
+//   Issuer:    issuer,
+//   Audiences: []string{publicEndpoint},
+//   JWKSURL:   jwksURL,
+//   Advertise: true, // serve well-known endpoints
+//   OIDC: &auth.OIDCExtra{ // ONLY fields you populate here will be advertised.
+//     ResponseTypesSupported: []string{"code"}, // required by our strict policy (discovery would have enforced)
+//   },
+// }
+// sec.Normalize()
+// authn, _ := sec.NewManualJWTAuthenticator(ctx)
+
+// 4. Create transport. If an authenticator implements auth.SecurityDescriptor the handler
+//    derives the SecurityConfig from it; you can also pass a SecurityConfig explicitly via option.
+httpHandler, _ := streaminghttp.New(
+	ctx,
+	publicEndpoint,
+	host,
+	server,
+	authn,
 	streaminghttp.WithServerName("reverse-prod"),
 )
+
 http.Handle("/mcp", httpHandler)
 ```
+
+Key points:
+
+* One source of truth: `auth.SecurityConfig` (exposed by the authenticator or provided directly) feeds all advertisement (no duplicated issuer/audience/JWKS in transport options).
+* Discovery path: strict validation — fails fast if required metadata (`jwks_uri`, `authorization_endpoint`, `token_endpoint`, `response_types_supported`) is missing so clients get a complete picture.
+* Manual path: you control exactly what is advertised; nothing is synthesized. If you want clients to know supported response or grant types you must set the corresponding slices in `OIDCExtra`.
+* Horizontal scale requires only swapping the session host; capability logic is untouched.
 
 ---
 
