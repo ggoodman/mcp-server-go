@@ -98,17 +98,6 @@ func (ad *adapter) CheckAuthentication(ctx context.Context, tok string) (UserInf
 
 func (ad *adapter) SecurityConfig() SecurityConfig { return ad.sec.Copy() }
 
-// NewValidator creates a SecurityProvider from a pre-populated SecurityConfig
-// without performing OIDC discovery. This is a placeholder until a manual
-// JWKS-based validator is implemented. For now it returns an error.
-func NewValidator(cfg SecurityConfig) (SecurityProvider, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	// TODO: implement static JWKS or local key set validation path.
-	return nil, errors.New("static validator not yet implemented")
-}
-
 type userInfoAdapter struct{ ui jwtauth.UserInfo }
 
 func (u userInfoAdapter) UserID() string       { return u.ui.UserID() }
