@@ -232,9 +232,103 @@ func TestSingleInstance(t *testing.T) {
 		if want, got := http.StatusUnauthorized, resp.StatusCode; want != got {
 			t.Fatalf("unexpected status: want %d got %d", want, got)
 		}
-		// Should include a WWW-Authenticate header per spec
-		if h := resp.Header.Get("www-authenticate"); !strings.HasPrefix(strings.ToLower(h), "bearer ") {
-			t.Fatalf("expected WWW-Authenticate header, got %q", h)
+		// Should include a WWW-Authenticate header per spec (Bearer challenge)
+		if h := resp.Header.Get("www-authenticate"); !strings.HasPrefix(strings.ToLower(h), "bearer") { // realm optional now
+			t.Fatalf("expected WWW-Authenticate bearer header, got %q", h)
+		}
+	})
+
+	// New tests for WWW-Authenticate header semantics (RFC 6750 compliance)
+	t.Run("Auth missing header -> bare challenge no error", func(t *testing.T) {
+		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
+		srv := mustServer(t, server, withAuth(&noAuth{wantToken: "required"}))
+		defer srv.Close()
+
+		// Initialize request without Authorization header
+		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m1"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
+		resp, _ := doPostMCP(t, srv, "", "", initReq)
+		if resp.StatusCode != http.StatusUnauthorized {
+			resp.Body.Close()
+			t.Fatalf("expected 401 got %d", resp.StatusCode)
+		}
+		wa := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		if wa == "" || !strings.HasPrefix(strings.ToLower(wa), "bearer") || strings.Contains(wa, "error=") {
+			t.Fatalf("expected bare Bearer challenge without error, got %q", wa)
+		}
+	})
+
+	t.Run("Auth malformed header -> invalid_request", func(t *testing.T) {
+		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
+		srv := mustServer(t, server, withAuth(&noAuth{wantToken: "required"}))
+		defer srv.Close()
+		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m2"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
+		// Use wrong scheme
+		resp, _ := doPostMCP(t, srv, "Basic abc", "", initReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			resp.Body.Close()
+			t.Fatalf("expected 400 got %d", resp.StatusCode)
+		}
+		wa := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		if !strings.Contains(strings.ToLower(wa), "error=\"invalid_request\"") {
+			t.Fatalf("expected invalid_request error, got %q", wa)
+		}
+	})
+
+	t.Run("Auth invalid token -> invalid_token", func(t *testing.T) {
+		auth := &noAuth{wantToken: "secret"}
+		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
+		srv := mustServer(t, server, withAuth(auth))
+		defer srv.Close()
+		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m3"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
+		resp, _ := doPostMCP(t, srv, "Bearer wrong", "", initReq)
+		if resp.StatusCode != http.StatusUnauthorized {
+			resp.Body.Close()
+			t.Fatalf("expected 401 got %d", resp.StatusCode)
+		}
+		wa := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		if !strings.Contains(strings.ToLower(wa), "error=\"invalid_token\"") {
+			t.Fatalf("expected invalid_token error, got %q", wa)
+		}
+	})
+
+	t.Run("Auth insufficient scope -> insufficient_scope", func(t *testing.T) {
+		// Custom authenticator that returns ErrInsufficientScope when token matches but lacks scope
+		inscopeAuth := &scopeFailAuth{token: "scoped"}
+		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
+		srv := mustServer(t, server, withAuth(inscopeAuth))
+		defer srv.Close()
+		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m4"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
+		resp, _ := doPostMCP(t, srv, "Bearer scoped", "", initReq)
+		if resp.StatusCode != http.StatusForbidden {
+			resp.Body.Close()
+			t.Fatalf("expected 403 got %d", resp.StatusCode)
+		}
+		wa := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		if !strings.Contains(strings.ToLower(wa), "error=\"insufficient_scope\"") {
+			t.Fatalf("expected insufficient_scope error, got %q", wa)
+		}
+	})
+
+	t.Run("Auth header escaping in error_description", func(t *testing.T) {
+		badAuth := &errorMessageAuth{wantToken: "the-token", err: fmt.Errorf("unauthorized: reason=\"bad\\value\"")}
+		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
+		srv := mustServer(t, server, withAuth(badAuth))
+		defer srv.Close()
+		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m5"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
+		resp, _ := doPostMCP(t, srv, "Bearer the-token", "", initReq)
+		if resp.StatusCode != http.StatusUnauthorized {
+			resp.Body.Close()
+			t.Fatalf("expected 401 got %d", resp.StatusCode)
+		}
+		wa := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+		// Expect escaped quotes and backslash: reason=\"bad\\value\"
+		if !strings.Contains(wa, `reason=\"bad\\value\"`) {
+			t.Fatalf("expected escaped value in header, got %q", wa)
 		}
 	})
 
@@ -1234,6 +1328,33 @@ type fakeUserInfo struct{}
 
 func (u *fakeUserInfo) UserID() string       { return "fake-user" }
 func (u *fakeUserInfo) Claims(ref any) error { return nil }
+
+// scopeFailAuth returns ErrInsufficientScope when the provided token matches the
+// configured token. If the token does not match, it returns ErrUnauthorized.
+// This allows us to exercise the insufficient_scope branch in the handler.
+type scopeFailAuth struct {
+	token string
+}
+
+func (a *scopeFailAuth) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
+	if tok != a.token {
+		return nil, auth.ErrUnauthorized
+	}
+	return nil, auth.ErrInsufficientScope
+}
+
+// errorMessageAuth returns a provided error (wrapped as unauthorized) to test header escaping.
+type errorMessageAuth struct {
+	wantToken string
+	err       error
+}
+
+func (a *errorMessageAuth) CheckAuthentication(ctx context.Context, tok string) (auth.UserInfo, error) {
+	if tok != a.wantToken {
+		return nil, auth.ErrUnauthorized
+	}
+	return nil, fmt.Errorf("%s: %w", a.err.Error(), auth.ErrUnauthorized)
+}
 
 // Keep optional serverOption helpers considered used to satisfy linters when not
 // consumed by specific tests. These are part of the test harness API surface.
