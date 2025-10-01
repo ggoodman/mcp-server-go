@@ -31,6 +31,14 @@ func RunSessionHostTests(t *testing.T, factory HostFactory) {
 	t.Run("Events_LateSubscriberOnlySeesLaterEvents", func(t *testing.T) { testEventsLateSubscriber(t, factory) })
 	t.Run("Events_HandlerErrorTerminatesOnlyThatSubscriber", func(t *testing.T) { testEventsHandlerError(t, factory) })
 	t.Run("Events_CancellationStopsSubscription", func(t *testing.T) { testEventsCancellation(t, factory) })
+
+	// KV storage semantics
+	t.Run("Data_PutGetRoundTrip", func(t *testing.T) { testDataPutGetRoundTrip(t, factory) })
+	t.Run("Data_GetAbsentReturnsFoundFalse", func(t *testing.T) { testDataGetAbsent(t, factory) })
+	t.Run("Data_DeleteMakesKeyAbsent", func(t *testing.T) { testDataDelete(t, factory) })
+	t.Run("Data_OverwriteReplacesValue", func(t *testing.T) { testDataOverwrite(t, factory) })
+	t.Run("Data_IsolationBetweenSessions", func(t *testing.T) { testDataIsolation(t, factory) })
+	t.Run("Data_EmptyValuePersistsDistinctFromAbsent", func(t *testing.T) { testDataEmptyValue(t, factory) })
 }
 
 // --- Messaging tests ---
@@ -675,4 +683,147 @@ func testEventsCancellation(t *testing.T, factory HostFactory) {
 	}
 	// Just wait for context deadline
 	<-ctx.Done()
+}
+
+// --- Data tests ---
+
+func testDataPutGetRoundTrip(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sid := "data-sess-1"
+	key := "k1"
+	val := []byte("value")
+	if err := h.PutSessionData(ctx, sid, key, val); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, found, err := h.GetSessionData(ctx, sid, key)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !found {
+		t.Fatalf("expected found=true")
+	}
+	if string(got) != string(val) {
+		t.Fatalf("expected %q got %q", val, got)
+	}
+	// Ensure returned slice is a copy (mutate got, re-read)
+	got[0] = 'X'
+	reread, found, err := h.GetSessionData(ctx, sid, key)
+	if err != nil || !found {
+		t.Fatalf("reread missing: err=%v found=%v", err, found)
+	}
+	if string(reread) != string(val) {
+		t.Fatalf("mutation leaked; expected %q got %q", val, reread)
+	}
+}
+
+func testDataGetAbsent(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, found, err := h.GetSessionData(ctx, "data-sess-abs", "nope")
+	if err != nil {
+		t.Fatalf("get absent err: %v", err)
+	}
+	if found {
+		t.Fatalf("expected found=false for absent key")
+	}
+}
+
+func testDataDelete(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sid := "data-sess-del"
+	if err := h.PutSessionData(ctx, sid, "k", []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := h.DeleteSessionData(ctx, sid, "k"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	_, found, err := h.GetSessionData(ctx, sid, "k")
+	if err != nil {
+		t.Fatalf("get after delete: %v", err)
+	}
+	if found {
+		t.Fatalf("expected found=false after delete")
+	}
+	// idempotent delete
+	if err := h.DeleteSessionData(ctx, sid, "k"); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+}
+
+func testDataOverwrite(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sid := "data-sess-ow"
+	key := "k"
+	if err := h.PutSessionData(ctx, sid, key, []byte("v1")); err != nil {
+		t.Fatalf("put1: %v", err)
+	}
+	if err := h.PutSessionData(ctx, sid, key, []byte("v2")); err != nil {
+		t.Fatalf("put2: %v", err)
+	}
+	got, found, err := h.GetSessionData(ctx, sid, key)
+	if err != nil || !found {
+		t.Fatalf("get overwrite: err=%v found=%v", err, found)
+	}
+	if string(got) != "v2" {
+		t.Fatalf("expected v2 got %s", got)
+	}
+}
+
+func testDataIsolation(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.PutSessionData(ctx, "data-sess-a", "k", []byte("va")); err != nil {
+		t.Fatalf("put a: %v", err)
+	}
+	if err := h.PutSessionData(ctx, "data-sess-b", "k", []byte("vb")); err != nil {
+		t.Fatalf("put b: %v", err)
+	}
+	ga, fa, ea := h.GetSessionData(ctx, "data-sess-a", "k")
+	if ea != nil || !fa || string(ga) != "va" {
+		t.Fatalf("sess a mismatch ea=%v fa=%v ga=%s", ea, fa, ga)
+	}
+	gb, fb, eb := h.GetSessionData(ctx, "data-sess-b", "k")
+	if eb != nil || !fb || string(gb) != "vb" {
+		t.Fatalf("sess b mismatch eb=%v fb=%v gb=%s", eb, fb, gb)
+	}
+}
+
+func testDataEmptyValue(t *testing.T, factory HostFactory) {
+	h := factory(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sid := "data-sess-empty"
+	key := "k"
+	if err := h.PutSessionData(ctx, sid, key, []byte{}); err != nil {
+		t.Fatalf("put empty: %v", err)
+	}
+	got, found, err := h.GetSessionData(ctx, sid, key)
+	if err != nil {
+		t.Fatalf("get empty: %v", err)
+	}
+	if !found {
+		t.Fatalf("expected found for empty value")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected zero-length slice, got %d", len(got))
+	}
+	// Distinguish from absent
+	if err := h.DeleteSessionData(ctx, sid, key); err != nil {
+		t.Fatalf("delete empty: %v", err)
+	}
+	_, found2, err := h.GetSessionData(ctx, sid, key)
+	if err != nil {
+		t.Fatalf("get after delete empty: %v", err)
+	}
+	if found2 {
+		t.Fatalf("expected not found after delete of empty value")
+	}
 }

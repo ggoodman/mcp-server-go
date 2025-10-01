@@ -372,21 +372,21 @@ func (h *Host) PutSessionData(ctx context.Context, sessionID, key string, value 
 	return nil
 }
 
-func (h *Host) GetSessionData(ctx context.Context, sessionID, key string) ([]byte, error) {
+func (h *Host) GetSessionData(ctx context.Context, sessionID, key string) ([]byte, bool, error) {
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	m, ok := h.kv[sessionID]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, false, nil
 	}
 	v, ok := m[key]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, false, nil
 	}
-	return append([]byte(nil), v...), nil
+	return append([]byte(nil), v...), true, nil
 }
 
 func (h *Host) DeleteSessionData(ctx context.Context, sessionID, key string) error {

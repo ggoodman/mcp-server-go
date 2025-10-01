@@ -22,6 +22,11 @@ func (s fakeSession) GetRootsCapability() (cap sessions.RootsCapability, ok bool
 func (s fakeSession) GetElicitationCapability() (cap sessions.ElicitationCapability, ok bool) {
 	return nil, false
 }
+func (s fakeSession) PutData(ctx context.Context, key string, value []byte) error { return nil }
+func (s fakeSession) GetData(ctx context.Context, key string) ([]byte, bool, error) {
+	return nil, false, nil
+}
+func (s fakeSession) DeleteData(ctx context.Context, key string) error { return nil }
 
 func writeFile(t *testing.T, dir, rel, content string) string {
 	t.Helper()

@@ -60,7 +60,9 @@ type SessionHost interface {
 
 	// --- Per-session bounded KV storage ---
 	PutSessionData(ctx context.Context, sessionID, key string, value []byte) error
-	GetSessionData(ctx context.Context, sessionID, key string) ([]byte, error)
+	// GetSessionData returns (nil,false,nil) if the key does not exist, (v,true,nil)
+	// on success, and (nil,false,err) on backend / context error.
+	GetSessionData(ctx context.Context, sessionID, key string) (value []byte, found bool, err error)
 	DeleteSessionData(ctx context.Context, sessionID, key string) error
 }
 
