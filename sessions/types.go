@@ -19,6 +19,20 @@ type Session interface {
 	GetSamplingCapability() (cap SamplingCapability, ok bool)
 	GetRootsCapability() (cap RootsCapability, ok bool)
 	GetElicitationCapability() (cap ElicitationCapability, ok bool)
+
+	// PutData stores raw bytes value under key scoped to this session. The
+	// storage is best-effort bounded by host TTL / size constraints. Callers
+	// SHOULD keep values small (host-specific limits may apply). Context governs
+	// cancellation. Returns a backend error on failure.
+	PutData(ctx context.Context, key string, value []byte) error
+	// GetData retrieves raw bytes previously stored with PutData. It returns
+	// (nil, false, nil) ONLY when the key does not exist. It MUST NOT collapse
+	// backend/storage errors into (ok=false). Any transport, context cancellation
+	// or backend failure MUST surface via a non-nil err (caller should ignore ok
+	// when err != nil). An empty stored value returns ([]byte{}, true, nil).
+	GetData(ctx context.Context, key string) (value []byte, ok bool, err error)
+	// DeleteData removes the key if present. Missing keys are not an error.
+	DeleteData(ctx context.Context, key string) error
 }
 
 // MessageHandlerFunction handles ordered messages for a session stream.

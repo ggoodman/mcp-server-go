@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"context"
+
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
@@ -8,6 +10,7 @@ import (
 var _ sessions.Session = (*SessionHandle)(nil)
 
 type SessionHandle struct {
+	host            sessions.SessionHost
 	sessionID       string
 	userID          string
 	protocolVersion string
@@ -23,6 +26,7 @@ type SessionHandle struct {
 
 func NewSessionHandle(host sessions.SessionHost, meta *sessions.SessionMetadata, opts ...SessionHandleOption) *SessionHandle {
 	s := &SessionHandle{
+		host:            host,
 		sessionID:       meta.SessionID,
 		userID:          meta.UserID,
 		protocolVersion: meta.ProtocolVersion,
@@ -92,3 +96,29 @@ func (s *SessionHandle) GetElicitationCapability() (cap sessions.ElicitationCapa
 	}
 	return s.elicitationCap, true
 }
+
+// PutData stores raw bytes for this session key via the SessionHost.
+func (s *SessionHandle) PutData(ctx context.Context, key string, value []byte) error {
+	return s.host.PutSessionData(ctx, s.sessionID, key, value)
+}
+
+// GetData retrieves raw bytes for this session key. Returns ok=false if absent.
+func (s *SessionHandle) GetData(ctx context.Context, key string) ([]byte, bool, error) {
+	b, ok, err := s.host.GetSessionData(ctx, s.sessionID, key)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	return b, true, nil
+}
+
+// DeleteData removes the key (idempotent).
+func (s *SessionHandle) DeleteData(ctx context.Context, key string) error {
+	return s.host.DeleteSessionData(ctx, s.sessionID, key)
+}
+
+// isNotFoundErr attempts to classify a storage-layer not-found error. We keep
+// it conservative; if unsure, treat as real error so callers can act.
+// (not-found classification helper removed; SessionHost now returns explicit found bool)

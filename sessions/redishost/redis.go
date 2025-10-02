@@ -375,15 +375,15 @@ func (h *Host) PutSessionData(ctx context.Context, sessionID, key string, value 
 	} // fallback default
 	return h.client.Set(ctx, rkey, value, ttl).Err()
 }
-func (h *Host) GetSessionData(ctx context.Context, sessionID, key string) ([]byte, error) {
+func (h *Host) GetSessionData(ctx context.Context, sessionID, key string) ([]byte, bool, error) {
 	v, err := h.client.Get(ctx, h.dataKey(sessionID, key)).Bytes()
 	if err != nil {
 		if err == redis.Nil {
-			return nil, errors.New("not found")
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return v, nil
+	return v, true, nil
 }
 func (h *Host) DeleteSessionData(ctx context.Context, sessionID, key string) error {
 	_, err := h.client.Del(ctx, h.dataKey(sessionID, key)).Result()
