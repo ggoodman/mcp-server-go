@@ -43,6 +43,25 @@ func WithLeeway(d time.Duration) AccessTokenAuthOption {
 	return func(c *jwtauth.Config) { c.Leeway = d }
 }
 
+// WithExtraAudience accepts a single additional audience (invokable multiple
+// times) beyond the primary audience passed to NewFromDiscovery. This is
+// mainly for local/testing scenarios where the served MCP endpoint URL (and
+// thus audience) differs from the production-configured audience at the auth
+// server. Use sparingly in production environments.
+func WithExtraAudience(aud string) AccessTokenAuthOption {
+	return func(c *jwtauth.Config) {
+		if aud == "" {
+			return
+		}
+		for _, existing := range c.ExpectedAudiences {
+			if existing == aud {
+				return
+			}
+		}
+		c.ExpectedAudiences = append(c.ExpectedAudiences, aud)
+	}
+}
+
 // NewFromDiscovery returns an Authenticator that verifies RFC 9068 JWT access
 // tokens discovered via OpenID Connect discovery (jwks_uri, issuer, etc.).
 //
@@ -51,23 +70,34 @@ func WithLeeway(d time.Duration) AccessTokenAuthOption {
 //   - audience: expected audience ("aud") claim – typically your public MCP endpoint URL
 //
 // Remaining validation knobs (scopes, algs, leeway) are configured via functional options.
+//
+// For local development where the Authorization Server is configured with a
+// production audience but the locally running MCP server has a different base
+// URL (and thus audience), you can use WithExtraAudience (multiple times if
+// needed) to accept additional audience values beyond the primary. Avoid
+// broadening accepted audiences in production unless intentionally operating
+// in a multi-audience model.
 func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts ...AccessTokenAuthOption) (SecurityProvider, error) {
 	cfg := jwtauth.DefaultConfig()
 	cfg.Issuer = issuer
-	cfg.ExpectedAudience = audience
+	cfg.ExpectedAudiences = []string{audience}
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	if cfg.ExpectedAudience == "" {
+	if len(cfg.ExpectedAudiences) == 0 || cfg.ExpectedAudiences[0] == "" {
 		return nil, errors.New("audience is required")
 	}
 	internal, err := jwtauth.NewFromDiscovery(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	// Assemble full audience list: primary expected audience followed by
+	// any explicitly configured extras (deduplicated later by Normalize/usage
+	// layers if needed).
+	audiences := append([]string(nil), cfg.ExpectedAudiences...)
 	sec := SecurityConfig{
 		Issuer:      cfg.Issuer,
-		Audiences:   []string{cfg.ExpectedAudience},
+		Audiences:   audiences,
 		AllowedAlgs: append([]string(nil), cfg.AllowedAlgs...),
 		Leeway:      cfg.Leeway,
 		EnforceExp:  true,

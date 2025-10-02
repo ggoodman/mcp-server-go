@@ -17,12 +17,18 @@ import (
 // It is used by discovery-based authenticators to enforce issuer, audience,
 // scope, algorithm, and clock-skew policies.
 type Config struct {
-	Issuer           string
-	ExpectedAudience string
-	RequiredScopes   []string
-	ScopeModeAny     bool // if true, any of RequiredScopes is sufficient; else all are required
-	AllowedAlgs      []string
-	Leeway           time.Duration
+	Issuer string
+	// ExpectedAudiences contains the primary audience (index 0) followed by any
+	// additional accepted audiences. The first entry SHOULD be the production
+	// audience registered with the authorization server; subsequent entries are
+	// primarily intended for local / testing scenarios where the served MCP
+	// endpoint base URL differs from the production one. Avoid growing this set
+	// in production unless deliberately operating a multi-audience design.
+	ExpectedAudiences []string
+	RequiredScopes    []string
+	ScopeModeAny      bool // if true, any of RequiredScopes is sufficient; else all are required
+	AllowedAlgs       []string
+	Leeway            time.Duration
 }
 
 // DefaultConfig returns a Config with safe defaults for algorithm and leeway.
@@ -223,13 +229,19 @@ func (a *discoveryAuthenticator) CheckAuthentication(ctx context.Context, tok st
 		return nil, errors.New("empty token")
 	}
 
-	parser := jwt.NewParser(
+	// Build parser options. If exactly one expected audience is configured we
+	// can leverage the parser's built-in audience enforcement. If multiple are
+	// present we perform intersection logic after parsing.
+	opts := []jwt.ParserOption{
 		jwt.WithValidMethods(a.cfg.AllowedAlgs),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuer(a.iss),
-		jwt.WithAudience(a.cfg.ExpectedAudience),
 		jwt.WithLeeway(a.cfg.Leeway),
-	)
+	}
+	if len(a.cfg.ExpectedAudiences) == 1 {
+		opts = append(opts, jwt.WithAudience(a.cfg.ExpectedAudiences[0]))
+	}
+	parser := jwt.NewParser(opts...)
 
 	parsed, err := parser.Parse(tok, a.keyfunc)
 	if err != nil {
@@ -252,7 +264,11 @@ func (a *discoveryAuthenticator) CheckAuthentication(ctx context.Context, tok st
 	if iss, _ := claims["iss"].(string); iss == "" || iss != a.iss {
 		return nil, fmt.Errorf("%w: issuer mismatch", ErrUnauthorized)
 	}
-	if !audContains(claims["aud"], a.cfg.ExpectedAudience) {
+	if len(a.cfg.ExpectedAudiences) == 1 {
+		if !audContains(claims["aud"], a.cfg.ExpectedAudiences[0]) {
+			return nil, fmt.Errorf("%w: audience mismatch", ErrUnauthorized)
+		}
+	} else if !audIntersects(claims["aud"], a.cfg.ExpectedAudiences) {
 		return nil, fmt.Errorf("%w: audience mismatch", ErrUnauthorized)
 	}
 	// Optional: iat presence sanity check if present

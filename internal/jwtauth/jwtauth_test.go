@@ -91,7 +91,7 @@ func signToken(t *testing.T, pk *rsa.PrivateKey, kid string, headerTyp string, c
 func baseConfig(issuer, aud string) *Config {
 	cfg := DefaultConfig()
 	cfg.Issuer = issuer
-	cfg.ExpectedAudience = aud
+	cfg.ExpectedAudiences = []string{aud}
 	cfg.Leeway = 0
 	return cfg
 }
@@ -189,6 +189,44 @@ func TestAuthenticator_AudienceArray(t *testing.T) {
 
 	if _, err := a.CheckAuthentication(ctx, tok); err != nil {
 		t.Fatalf("check: %v", err)
+	}
+}
+
+func TestAuthenticator_AdditionalAudiences(t *testing.T) {
+	pk, kid, jwks := genRSA(t)
+	oidc := newMockOIDC(t, jwks, nil)
+	defer oidc.Close()
+
+	primary := "https://api.example.com/mcp"
+	extra := "http://localhost:8080/mcp"
+	cfg := baseConfig(oidc.issuer, primary)
+	cfg.ExpectedAudiences = []string{primary, extra}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a, err := NewFromDiscovery(ctx, cfg)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss": oidc.issuer,
+		"sub": "user-123",
+		"aud": extra, // only extra audience present
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+	}
+	tok := signToken(t, pk, kid, "at+jwt", claims)
+
+	if _, err := a.CheckAuthentication(ctx, tok); err != nil {
+		t.Fatalf("check (extra audience) failed: %v", err)
+	}
+
+	// Negative: unknown audience
+	claims["aud"] = "https://unknown" // replace
+	tok2 := signToken(t, pk, kid, "at+jwt", claims)
+	if _, err := a.CheckAuthentication(ctx, tok2); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected unauthorized for unknown audience, got %v", err)
 	}
 }
 
