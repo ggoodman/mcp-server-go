@@ -345,14 +345,13 @@ func pathOnly(u *url.URL) string {
 }
 
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	r = r.WithContext(logctx.WithRequestData(r.Context(), &logctx.RequestData{
+	h.mux.ServeHTTP(w, r.WithContext(logctx.WithRequestData(r.Context(), &logctx.RequestData{
 		RequestID:  uuid.NewString(),
 		Method:     r.Method,
 		UserAgent:  r.UserAgent(),
 		RemoteAddr: r.RemoteAddr,
 		Path:       r.URL.Path,
-	}))
-	h.mux.ServeHTTP(w, r)
+	})))
 }
 
 // handleDeleteMCP handles the DELETE /mcp endpoint, which terminates an existing

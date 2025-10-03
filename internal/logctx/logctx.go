@@ -11,11 +11,13 @@ type Handler struct {
 
 func (h Handler) Handle(ctx context.Context, r slog.Record) error {
 	if rd, ok := ctx.Value(requestDataKey{}).(RequestData); ok {
-		r.Add(slog.String("request_id", rd.RequestID))
-		r.Add(slog.String("method", rd.Method))
-		r.Add(slog.String("user_agent", rd.UserAgent))
-		r.Add(slog.String("remote_addr", rd.RemoteAddr))
-		r.Add(slog.String("path", rd.Path))
+		r.AddAttrs(slog.Group("req",
+			slog.String("request_id", rd.RequestID),
+			slog.String("method", rd.Method),
+			slog.String("user_agent", rd.UserAgent),
+			slog.String("remote_addr", rd.RemoteAddr),
+			slog.String("path", rd.Path),
+		))
 	}
 
 	return h.Handler.Handle(ctx, r)
