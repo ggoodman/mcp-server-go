@@ -22,6 +22,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 var (
@@ -257,7 +258,9 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 		return nil, fmt.Errorf("either authenticator or WithSecurityConfig required")
 	}
 
-	h := &StreamingHTTPHandler{log: cfg.logger, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm, subCancels: make(map[string]map[string]context.CancelFunc), sessParents: make(map[string]context.Context), sessCancel: make(map[string]context.CancelFunc)}
+	loggerWithContextHandler := slog.New(logctx.Handler{Handler: cfg.logger.Handler()})
+
+	h := &StreamingHTTPHandler{log: loggerWithContextHandler, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm, subCancels: make(map[string]map[string]context.CancelFunc), sessParents: make(map[string]context.Context), sessCancel: make(map[string]context.CancelFunc)}
 
 	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
@@ -342,6 +345,13 @@ func pathOnly(u *url.URL) string {
 }
 
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(logctx.WithRequestData(r.Context(), &logctx.RequestData{
+		RequestID:  uuid.NewString(),
+		Method:     r.Method,
+		UserAgent:  r.UserAgent(),
+		RemoteAddr: r.RemoteAddr,
+		Path:       r.URL.Path,
+	}))
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -351,60 +361,47 @@ func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // session are cleaned up.
 func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	baseCtx := r.Context()
-	reqID := logctx.NewRequestID()
-	ctx := logctx.WithRequestID(baseCtx, reqID)
-	r = r.WithContext(ctx)
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "delete_session"),
-		slog.String("http_method", r.Method),
-		slog.String("path", r.URL.Path),
-	)
-	logger.InfoContext(ctx, "http.delete.start")
+	ctx := r.Context()
+	h.log.InfoContext(ctx, "http.delete.start")
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		logger.InfoContext(ctx, "auth.fail")
+		h.log.InfoContext(ctx, "auth.fail")
 		return
 	}
-	ctx = logctx.WithUserID(ctx, userInfo.UserID())
-	logger = logctx.Enrich(ctx, logger)
-	logger.InfoContext(ctx, "auth.ok")
+	h.log.InfoContext(ctx, "auth.ok")
 
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
-		logger.WarnContext(ctx, "delete.missing_session_id")
+		h.log.WarnContext(ctx, "delete.missing_session_id")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	ctx = logctx.WithSessionID(ctx, sessID)
-	logger = logctx.Enrich(ctx, logger)
 
 	pvHeader := r.Header.Get(mcpProtocolVersionHeader)
 	respProtoVersion, err := h.eng.GetSessionProtocolVersion(ctx, sessID, userInfo.UserID())
 	if err != nil {
-		logger.InfoContext(ctx, "session.load.miss")
+		h.log.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessID)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	logger.InfoContext(ctx, "session.load.ok")
+	h.log.InfoContext(ctx, "session.load.ok")
 
 	if pvHeader != "" && respProtoVersion != "" && pvHeader != respProtoVersion {
-		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", respProtoVersion), slog.String("client_version", pvHeader))
+		h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", respProtoVersion), slog.String("client_version", pvHeader))
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
 
 	if _, err := h.eng.DeleteSession(ctx, sessID, userInfo.UserID()); err != nil {
 		if errors.Is(err, engine.ErrSessionNotFound) {
-			logger.InfoContext(ctx, "session.delete.miss")
+			h.log.InfoContext(ctx, "session.delete.miss")
 			h.teardownSession(sessID)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		logger.ErrorContext(ctx, "session.delete.fail", slog.String("err", err.Error()))
+		h.log.ErrorContext(ctx, "session.delete.fail", slog.String("err", err.Error()))
 		h.teardownSession(sessID)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -420,36 +417,27 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 
 	// Success: no content.
 	w.WriteHeader(http.StatusNoContent)
-	logger.InfoContext(ctx, "http.delete.ok", slog.Duration("dur", time.Since(start)))
+	h.log.InfoContext(ctx, "http.delete.ok", slog.Duration("dur", time.Since(start)))
 }
 
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	baseCtx := r.Context()
-	reqID := logctx.NewRequestID()
-	ctx := logctx.WithRequestID(baseCtx, reqID)
-	r = r.WithContext(ctx)
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "post_mcp"),
-		slog.String("http_method", r.Method),
-		slog.String("path", r.URL.Path),
-	)
-	logger.InfoContext(ctx, "http.post.start")
+	ctx := logctx.WithRequestData(r.Context(), &logctx.RequestData{})
+	h.log.InfoContext(ctx, "http.post.start")
 
 	ctype, err := contenttype.GetMediaType(r)
 	if err != nil || !ctype.Matches(jsonMediaType) {
 		writeJSONError(w, http.StatusUnsupportedMediaType, "content-type must be application/json")
-		logger.WarnContext(ctx, "content_type.unsupported")
+		h.log.WarnContext(ctx, "content_type.unsupported")
 		return
 	}
 
 	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "flusher.missing")
+		h.log.ErrorContext(ctx, "flusher.missing")
 		return
 	}
 
@@ -458,29 +446,26 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		logger.InfoContext(ctx, "auth.fail")
+		h.log.InfoContext(ctx, "auth.fail")
 		return
 	}
-	ctx = logctx.WithUserID(ctx, userInfo.UserID())
-	logger = logctx.Enrich(ctx, logger)
-	logger.InfoContext(ctx, "auth.ok")
 
 	var raw json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
-		logger.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
+		h.log.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
 		return
 	}
 	if len(raw) > 0 && raw[0] == '[' {
 		writeJSONError(w, http.StatusBadRequest, "JSON-RPC batch arrays are forbidden on streaming HTTP transport")
-		logger.WarnContext(ctx, "jsonrpc.batch.forbidden")
+		h.log.WarnContext(ctx, "jsonrpc.batch.forbidden")
 		return
 	}
 
 	var msg jsonrpc.AnyMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON-RPC message: "+err.Error())
-		logger.WarnContext(ctx, "jsonrpc.message.invalid", slog.String("err", err.Error()))
+		h.log.WarnContext(ctx, "jsonrpc.message.invalid", slog.String("err", err.Error()))
 		return
 	}
 
@@ -490,25 +475,25 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		req := msg.AsRequest()
 		if req == nil || req.Method != string(mcp.InitializeMethod) {
 			writeJSONError(w, http.StatusNotFound, "expected initialize request")
-			logger.WarnContext(ctx, "session.initialize.invalid")
+			h.log.InfoContext(ctx, "session.initialize.invalid")
 			return
 		}
 		var initReq mcp.InitializeRequest
 		if err := json.Unmarshal(req.Params, &initReq); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid initialize params")
-			logger.WarnContext(ctx, "session.initialize.params.fail", slog.String("err", err.Error()))
+			h.log.InfoContext(ctx, "session.initialize.params.fail", slog.String("err", err.Error()))
 			return
 		}
 		sess, initRes, err := h.eng.InitializeSession(ctx, userInfo.UserID(), &initReq)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to initialize session")
-			logger.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
 			return
 		}
 		resp, err := jsonrpc.NewResultResponse(req.ID, initRes)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to encode initialize response")
-			logger.ErrorContext(ctx, "session.initialize.encode.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.initialize.encode.fail", slog.String("err", err.Error()))
 			return
 		}
 		w.Header().Set(mcpSessionIDHeader, sess.SessionID())
@@ -518,33 +503,31 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		w.Header().Set("Content-Type", jsonMediaType.String())
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			logger.ErrorContext(ctx, "session.initialize.write.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.initialize.write.fail", slog.String("err", err.Error()))
 		}
-		logger.InfoContext(ctx, "session.initialize.ok", slog.Duration("dur", time.Since(start)))
+		h.log.InfoContext(ctx, "session.initialize.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
-	ctx = logctx.WithSessionID(ctx, sessID)
-	logger = logctx.Enrich(ctx, logger)
 
 	// Validate and fetch protocol version via engine
 	sessionPV, err := h.eng.GetSessionProtocolVersion(ctx, sessID, userInfo.UserID())
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
-		logger.InfoContext(ctx, "session.load.miss")
+		h.log.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessID)
 		return
 	}
-	logger.InfoContext(ctx, "session.load.ok")
+	h.log.InfoContext(ctx, "session.load.ok")
 
 	if req := msg.AsRequest(); req != nil && req.Method == "initialize" {
 		writeJSONError(w, http.StatusConflict, "session already initialized")
-		logger.WarnContext(ctx, "session.initialize.redundant")
+		h.log.WarnContext(ctx, "session.initialize.redundant")
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
 	if clientPV != "" && sessionPV != "" && clientPV != sessionPV {
 		writeJSONError(w, http.StatusBadRequest, "protocol version mismatch")
-		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
+		h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
 		return
 	}
 
@@ -552,14 +535,14 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		if req.ID.IsNil() {
 			if err := h.eng.HandleNotification(ctx, sessID, userInfo.UserID(), req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				logger.ErrorContext(ctx, "notification.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
+				h.log.ErrorContext(ctx, "notification.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
 				return
 			}
 			if spv := sessionPV; spv != "" {
 				w.Header().Set(mcpProtocolVersionHeader, spv)
 			}
 			w.WriteHeader(http.StatusAccepted)
-			logger.InfoContext(ctx, "notification.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
+			h.log.InfoContext(ctx, "notification.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
 			return
 		}
 
@@ -567,7 +550,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		if acc != "" {
 			if _, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes); err != nil {
 				w.WriteHeader(http.StatusUnsupportedMediaType)
-				logger.WarnContext(ctx, "accept.unsupported", slog.String("accept", acc))
+				h.log.WarnContext(ctx, "accept.unsupported", slog.String("accept", acc))
 				return
 			}
 		}
@@ -575,6 +558,9 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		wf.Flush()
 
@@ -595,19 +581,19 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 		res, err := h.eng.HandleRequest(ctx, sessID, userInfo.UserID(), req, writer)
 		if err != nil {
-			logger.ErrorContext(ctx, "rpc.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "rpc.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
 			res = &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, Error: &jsonrpc.Error{Code: jsonrpc.ErrorCodeInternalError, Message: "internal server error"}, ID: req.ID}
 		}
 		b, mErr := json.Marshal(res)
 		if mErr != nil {
-			logger.ErrorContext(ctx, "rpc.response.marshal.fail", slog.String("err", mErr.Error()))
+			h.log.ErrorContext(ctx, "rpc.response.marshal.fail", slog.String("err", mErr.Error()))
 			return
 		}
 		if err := writeSSEEvent(wf, "", b); err != nil {
-			logger.ErrorContext(ctx, "sse.write.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "sse.write.fail", slog.String("err", err.Error()))
 			return
 		}
-		logger.InfoContext(ctx, "rpc.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
+		h.log.InfoContext(ctx, "rpc.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
 		return
 	}
 
@@ -618,45 +604,36 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			} else {
 				w.WriteHeader(http.StatusInternalServerError)
 			}
-			logger.ErrorContext(ctx, "response.forward.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "response.forward.fail", slog.String("err", err.Error()))
 			return
 		}
 		if spv := sessionPV; spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.WriteHeader(http.StatusAccepted)
-		logger.InfoContext(ctx, "response.inbound.ok", slog.Duration("dur", time.Since(start)))
+		h.log.InfoContext(ctx, "response.inbound.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
-	logger.WarnContext(ctx, "jsonrpc.message.unrecognized", slog.Duration("dur", time.Since(start)))
+	h.log.WarnContext(ctx, "jsonrpc.message.unrecognized", slog.Duration("dur", time.Since(start)))
 }
 
 // handleGetMCP handles the GET /mcp endpoint, which is used to consume messages
 // from an established session.
 func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	baseCtx := r.Context()
-	reqID := logctx.NewRequestID()
-	ctx := logctx.WithRequestID(baseCtx, reqID)
-	r = r.WithContext(ctx)
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "get_stream"),
-		slog.String("http_method", r.Method),
-		slog.String("path", r.URL.Path),
-	)
+	ctx := r.Context()
 
 	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
 	if err != nil {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
-		logger.WarnContext(ctx, "http.get.unsupported_media_type")
+		h.log.WarnContext(ctx, "http.get.unsupported_media_type")
 		return
 	}
 
 	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "sse.flusher.missing")
+		h.log.ErrorContext(ctx, "sse.flusher.missing")
 		return
 	}
 
@@ -665,36 +642,32 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		logger.InfoContext(ctx, "auth.fail")
+		h.log.InfoContext(ctx, "auth.fail")
 		return
 	}
-	ctx = logctx.WithUserID(ctx, userInfo.UserID())
-	logger = logctx.Enrich(ctx, logger)
-	logger.InfoContext(ctx, "auth.ok")
+	h.log.InfoContext(ctx, "auth.ok")
 
 	sessionHeader := r.Header.Get(mcpSessionIDHeader)
 	if sessionHeader == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		logger.WarnContext(ctx, "session.id.missing")
+		h.log.WarnContext(ctx, "session.id.missing")
 		return
 	}
-	ctx = logctx.WithSessionID(ctx, sessionHeader)
-	logger = logctx.Enrich(ctx, logger)
 
 	// Validate via engine and retrieve protocol version
 	sessionPV, err := h.eng.GetSessionProtocolVersion(ctx, sessionHeader, userInfo.UserID())
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
-		logger.InfoContext(ctx, "session.load.miss")
+		h.log.InfoContext(ctx, "session.load.miss")
 		h.teardownSession(sessionHeader)
 		return
 	}
-	logger.InfoContext(ctx, "session.load.ok")
+	h.log.InfoContext(ctx, "session.load.ok")
 
 	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
 		if spv := sessionPV; spv != "" && pv != spv {
 			w.WriteHeader(http.StatusPreconditionFailed)
-			logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", spv), slog.String("client_version", pv))
+			h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", spv), slog.String("client_version", pv))
 			return
 		}
 	}
@@ -706,26 +679,29 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	wf.Flush()
-	logger.InfoContext(ctx, "sse.stream.start")
+
+	h.log.InfoContext(ctx, "sse.stream.start")
 
 	if err := h.eng.StreamSession(ctx, sessionHeader, userInfo.UserID(), lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
 		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
 			return err
 		}
-		logger.InfoContext(cbCtx, "sse.message.deliver")
+		h.log.InfoContext(cbCtx, "sse.message.deliver")
 		return nil
 	}); err != nil {
 		if errors.Is(err, context.Canceled) {
-			logger.InfoContext(ctx, "subscribe.session.done")
+			h.log.InfoContext(ctx, "subscribe.session.done")
 		} else {
-			logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
 		}
 		return
 	}
 
-	logger.InfoContext(ctx, "sse.stream.end", slog.Duration("dur", time.Since(start)))
+	h.log.InfoContext(ctx, "sse.stream.end", slog.Duration("dur", time.Since(start)))
 }
 
 func (h *StreamingHTTPHandler) handleOptionsProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {

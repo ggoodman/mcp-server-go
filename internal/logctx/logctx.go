@@ -2,75 +2,35 @@ package logctx
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
 )
 
-// context key type
-type ctxKey int
-
-const (
-	requestIDKey ctxKey = iota
-	sessionIDKey
-	userIDKey
-)
-
-func WithRequestID(ctx context.Context, rid string) context.Context {
-	if rid == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, requestIDKey, rid)
-}
-func WithSessionID(ctx context.Context, sid string) context.Context {
-	if sid == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, sessionIDKey, sid)
-}
-func WithUserID(ctx context.Context, uid string) context.Context {
-	if uid == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, userIDKey, uid)
-}
-func RequestID(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(requestIDKey).(string)
-	return v, ok && v != ""
-}
-func SessionID(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(sessionIDKey).(string)
-	return v, ok && v != ""
-}
-func UserID(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(userIDKey).(string)
-	return v, ok && v != ""
+type Handler struct {
+	slog.Handler
 }
 
-func Enrich(ctx context.Context, l *slog.Logger) *slog.Logger {
-	if l == nil {
-		l = slog.Default()
+func (h Handler) Handle(ctx context.Context, r slog.Record) error {
+	if rd, ok := ctx.Value(requestDataKey{}).(RequestData); ok {
+		r.Add(slog.String("request_id", rd.RequestID))
+		r.Add(slog.String("method", rd.Method))
+		r.Add(slog.String("user_agent", rd.UserAgent))
+		r.Add(slog.String("remote_addr", rd.RemoteAddr))
+		r.Add(slog.String("path", rd.Path))
 	}
-	args := []any{}
-	if rid, ok := RequestID(ctx); ok {
-		args = append(args, slog.String("request_id", rid))
-	}
-	if sid, ok := SessionID(ctx); ok {
-		args = append(args, slog.String("session_id", sid))
-	}
-	if uid, ok := UserID(ctx); ok {
-		args = append(args, slog.String("user_id", uid))
-	}
-	if len(args) == 0 {
-		return l
-	}
-	return l.With(args...)
+
+	return h.Handler.Handle(ctx, r)
 }
 
-func NewRequestID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(b[:])
+type requestDataKey struct{}
+
+type RequestData struct {
+	RequestID  string
+	Method     string
+	UserAgent  string
+	RemoteAddr string
+	Path       string
+}
+
+func WithRequestData(ctx context.Context, data *RequestData) context.Context {
+	return context.WithValue(ctx, requestDataKey{}, data)
 }

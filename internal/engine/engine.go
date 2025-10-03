@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/internal/jsonrpc"
-	"github.com/ggoodman/mcp-server-go/internal/logctx"
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -280,9 +279,6 @@ func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *
 	if st := sess.State(); st != "" && st != sessions.SessionStateOpen {
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidRequest, "session not initialized", nil), nil
 	}
-
-	ctx = logctx.WithSessionID(ctx, sess.SessionID())
-	ctx = logctx.WithUserID(ctx, sess.userID)
 
 	switch req.Method {
 	case string(mcp.ToolsListMethod):
