@@ -10,7 +10,7 @@ type Handler struct {
 }
 
 func (h Handler) Handle(ctx context.Context, r slog.Record) error {
-	if rd, ok := ctx.Value(requestDataKey{}).(RequestData); ok {
+	if rd, ok := ctx.Value(requestDataKey{}).(*RequestData); ok {
 		r.AddAttrs(slog.Group("req",
 			slog.String("request_id", rd.RequestID),
 			slog.String("method", rd.Method),
