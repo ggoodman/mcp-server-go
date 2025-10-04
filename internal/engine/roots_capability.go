@@ -20,7 +20,6 @@ type rootsCapability struct {
 	sessID              string
 	userID              string
 	requestScopedWriter MessageWriter
-	sessionScopedWriter MessageWriter
 }
 
 func (r *rootsCapability) ListRoots(ctx context.Context) (*mcp.ListRootsResult, error) {

@@ -3,6 +3,8 @@ package logctx
 import (
 	"context"
 	"log/slog"
+
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 type Handler struct {
@@ -12,7 +14,7 @@ type Handler struct {
 func (h Handler) Handle(ctx context.Context, r slog.Record) error {
 	if rd, ok := ctx.Value(requestDataKey{}).(*RequestData); ok {
 		r.AddAttrs(slog.Group("req",
-			slog.String("request_id", rd.RequestID),
+			slog.String("id", rd.RequestID),
 			slog.String("method", rd.Method),
 			slog.String("user_agent", rd.UserAgent),
 			slog.String("remote_addr", rd.RemoteAddr),
@@ -20,7 +22,28 @@ func (h Handler) Handle(ctx context.Context, r slog.Record) error {
 		))
 	}
 
+	if sd, ok := ctx.Value(sessionDataKey{}).(*SessionData); ok {
+		r.AddAttrs(slog.Group("sess",
+			slog.String("id", sd.SessionID),
+			slog.String("user_id", sd.UserID),
+			slog.String("protocol_version", sd.ProtocolVersion),
+			slog.String("state", string(sd.State)),
+		))
+	}
+
 	return h.Handler.Handle(ctx, r)
+}
+
+type rpcMsg struct{}
+
+type RPCMessage struct {
+	Method string
+	ID     string
+	Type   string
+}
+
+func WithRPCMessage(ctx context.Context, msg *RPCMessage) context.Context {
+	return context.WithValue(ctx, rpcMsg{}, msg)
 }
 
 type requestDataKey struct{}
@@ -35,4 +58,17 @@ type RequestData struct {
 
 func WithRequestData(ctx context.Context, data *RequestData) context.Context {
 	return context.WithValue(ctx, requestDataKey{}, data)
+}
+
+type sessionDataKey struct{}
+
+type SessionData struct {
+	SessionID       string
+	UserID          string
+	ProtocolVersion string
+	State           sessions.SessionState
+}
+
+func WithSessionData(ctx context.Context, data *SessionData) context.Context {
+	return context.WithValue(ctx, sessionDataKey{}, data)
 }

@@ -260,7 +260,7 @@ func (h *Host) GetSession(ctx context.Context, sessionID string) (*sessions.Sess
 	val, err := h.client.Get(ctx, h.metaKey(sessionID)).Bytes()
 	if err != nil {
 		if err == redis.Nil {
-			return nil, errors.New("not found")
+			return nil, sessions.ErrSessionNotFound
 		}
 		return nil, err
 	}
@@ -279,7 +279,7 @@ func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*ses
 			val, err := tx.Get(ctx, key).Bytes()
 			if err != nil {
 				if err == redis.Nil {
-					return errors.New("not found")
+					return sessions.ErrSessionNotFound
 				}
 				return err
 			}
@@ -305,7 +305,7 @@ func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*ses
 				elapsed := time.Since(m.CreatedAt)
 				if elapsed >= m.MaxLifetime {
 					// Session exceeded absolute lifetime: treat as not found to upstream.
-					return errors.New("not found")
+					return sessions.ErrSessionNotFound
 				}
 				left := m.MaxLifetime - elapsed
 				if left < remaining {
@@ -346,7 +346,7 @@ func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
 		if m.MaxLifetime > 0 {
 			elapsed := time.Since(m.CreatedAt)
 			if elapsed >= m.MaxLifetime {
-				return errors.New("not found")
+				return sessions.ErrSessionNotFound
 			}
 			remain := m.MaxLifetime - elapsed
 			if remain < newTTL {

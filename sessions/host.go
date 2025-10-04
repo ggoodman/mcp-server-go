@@ -2,7 +2,16 @@ package sessions
 
 import (
 	"context"
+	"errors"
 )
+
+var (
+	ErrSessionNotFound = errors.New("session not found")
+)
+
+// MessageHandlerFunction handles ordered messages for a session stream.
+// If the handler returns an error, the subscription will terminate with that error.
+type MessageHandlerFunction func(ctx context.Context, msgID string, msg []byte) error
 
 // SessionHost defines the unified storage + messaging contract for sessions.
 // Implementations MUST be safe for concurrent use and suitable for horizontal

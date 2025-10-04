@@ -22,6 +22,9 @@ func NewRequestID(value interface{}) *RequestID {
 
 // String returns the string representation of the ID
 func (id *RequestID) String() string {
+	if id == nil {
+		return ""
+	}
 	if id.value == nil {
 		return ""
 	}
