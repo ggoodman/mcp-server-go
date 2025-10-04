@@ -33,7 +33,7 @@ func (r *rootsCapability) ListRoots(ctx context.Context) (*mcp.ListRootsResult, 
 	}
 	bytes, err := json.Marshal(clientReq)
 	if err != nil {
-		r.log.Error("roots.list.marshal.fail", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", err.Error()))
+		r.log.ErrorContext(ctx, "roots.list.marshal.fail", slog.String("err", err.Error()))
 		return nil, ErrInternal
 	}
 
@@ -41,33 +41,33 @@ func (r *rootsCapability) ListRoots(ctx context.Context) (*mcp.ListRootsResult, 
 	defer close()
 
 	if err := r.requestScopedWriter.WriteMessage(ctx, bytes); err != nil {
-		r.log.Error("roots.list.write.fail", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", err.Error()))
+		r.log.ErrorContext(ctx, "roots.list.write.fail", slog.String("err", err.Error()))
 		return nil, ErrInternal
 	}
 
 	select {
 	case msg, ok := <-rdvCh:
 		if !ok {
-			r.log.Error("roots.list.err", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", "rendez-vous closed"))
+			r.log.ErrorContext(ctx, "roots.list.err", slog.String("err", "rendez-vous closed"))
 			return nil, ErrCancelled
 		}
 		var resp jsonrpc.Response
 		if err := json.Unmarshal(msg, &resp); err != nil {
-			r.log.Error("roots.list.unmarshal.fail", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", err.Error()))
+			r.log.ErrorContext(ctx, "roots.list.unmarshal.fail", slog.String("err", err.Error()))
 			return nil, ErrInternal
 		}
 		if resp.Error != nil {
-			r.log.Error("roots.list.error", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message))
+			r.log.ErrorContext(ctx, "roots.list.error", slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message))
 			return nil, ErrInternal
 		}
 		var res mcp.ListRootsResult
 		if err := json.Unmarshal(resp.Result, &res); err != nil {
-			r.log.Error("roots.list.result.unmarshal.fail", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", err.Error()))
+			r.log.ErrorContext(ctx, "roots.list.result.unmarshal.fail", slog.String("err", err.Error()))
 			return nil, ErrInternal
 		}
 		return &res, nil
 	case <-ctx.Done():
-		r.log.Error("roots.list.err", slog.String("session_id", r.sessID), slog.String("user_id", r.userID), slog.String("err", "context done before response"))
+		r.log.ErrorContext(ctx, "roots.list.err", slog.String("err", "context done before response"))
 		return nil, ctx.Err()
 	}
 }

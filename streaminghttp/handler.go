@@ -264,7 +264,7 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
 		if err := h.eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			h.log.Error("engine.run.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "engine.run.fail", slog.String("err", err.Error()))
 		}
 	}()
 
