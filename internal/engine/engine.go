@@ -30,10 +30,9 @@ const (
 const internalSessionDeletedMethod = "internal/session/deleted"
 
 var (
-	ErrCancelled       = errors.New("operation cancelled")
-	ErrSessionNotFound = errors.New("session not found")
-	ErrInvalidUserID   = errors.New("invalid user id")
-	ErrInternal        = errors.New("internal error")
+	ErrCancelled     = errors.New("operation cancelled")
+	ErrInvalidUserID = errors.New("invalid user id")
+	ErrInternal      = errors.New("internal error")
 )
 
 // Engine is the core of an MCP server, coordinating sessions, message routing,
@@ -264,25 +263,12 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 	return sess, initRes, nil
 }
 
-func (e *Engine) HandleRequest(ctx context.Context, sessID, userID string, req *jsonrpc.Request, requestScopedWriter MessageWriter) (*jsonrpc.Response, error) {
-	sess, err := e.loadSession(ctx, sessID, userID, requestScopedWriter, NewMessageWriterFunc(
-		func(ctx context.Context, msg jsonrpc.Message) error {
-			_, err := e.host.PublishSession(ctx, sessID, msg)
-			return err
-		},
-	))
-	if err != nil {
-		return nil, err
-	}
-
+func (e *Engine) HandleRequest(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	// Require session to be open before serving requests (except initialize, which
 	// doesn't reach here).
 	if st := sess.State(); st != "" && st != sessions.SessionStateOpen {
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidRequest, "session not initialized", nil), nil
 	}
-
-	ctx = logctx.WithSessionID(ctx, sess.SessionID())
-	ctx = logctx.WithUserID(ctx, sess.userID)
 
 	switch req.Method {
 	case string(mcp.ToolsListMethod):
@@ -803,18 +789,14 @@ func (e *Engine) handleResourcesRead(ctx context.Context, sess *SessionHandle, r
 // It verifies the session and republishes the notification to all instances without
 // actually handling the notification itself. The actual handling is done in the consumer loop
 // for these messages.
-func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, note *jsonrpc.Request) error {
-	_, err := e.loadSession(ctx, sessID, userID, nil, nil)
-	if err != nil {
-		return err
-	}
+func (e *Engine) HandleNotification(ctx context.Context, sess *SessionHandle, note *jsonrpc.Request) error {
 
-	// If the client signals initialized, open the session immediately on this
-	// instance to avoid local races, then fan out for other instances.
 	if note.Method == string(mcp.InitializedNotificationMethod) {
+		// If the client signals initialized, open the session immediately on this
+		// instance to avoid local races, then fan out for other instances.
 		now := time.Now().UTC()
-		if err := e.host.MutateSession(ctx, sessID, func(m *sessions.SessionMetadata) error {
-			if m == nil || m.Revoked || m.UserID != userID {
+		if err := e.host.MutateSession(ctx, sess.SessionID(), func(m *sessions.SessionMetadata) error {
+			if m == nil || m.Revoked || m.UserID != sess.UserID() {
 				return nil
 			}
 			// Idempotent: if already open, nothing to do.
@@ -831,52 +813,40 @@ func (e *Engine) HandleNotification(ctx context.Context, sessID, userID string, 
 			m.LastAccess = now
 			return nil
 		}); err != nil {
-			e.log.Error("engine.handle_notification.open.fail", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
-			// Continue to publish fanout even if local mutation failed.
-		} else {
-			// Best-effort eager wiring; safe to call multiple times.
-			_ = e.eagerWireSession(ctx, sessID, userID)
+			e.log.Error("engine.handle_notification.open.fail", slog.String("err", err.Error()))
 		}
+
+		// Note: No need to dispatch this to peers; the mutation of the session state will
+		// be observed by peers when they next load the session.
+		return nil
 	}
 
-	if note.Method == string(mcp.CancelledNotificationMethod) {
-		var params mcp.CancelledNotification
-		if err := json.Unmarshal(note.Params, &params); err != nil {
-			e.log.Error("engine.handle_notification.cancel.decode", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
-			return nil
-		}
-		if params.RequestID != nil && !params.RequestID.IsNil() {
-			ridStr := params.RequestID.String()
-			hadCancel := e.cancelInFlightRequest(ridStr, params.Reason)
-			e.log.Info("engine.handle_notification.cancel.dispatched", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("request_id", ridStr), slog.Bool("had_cancel", hadCancel))
-		}
-	}
-
-	// We got a notification from a transport. We don't directly handle notifications in the engine. Instead
-	// we dispatch it across the session host so that all instances can see it. The actual handling of
-	// notifications is done in the consumer loop for these messages.
+	// We got a notification from a client. We publish this to all peer instances on the session
+	// fanout topic. Each instance will then handle the notification in its consumer loop if
+	// it is relevant to that instance.
 	noteBytes, err := json.Marshal(note)
 	if err != nil {
-		e.log.Error("engine.handle_notification.err", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
-		return err
+		e.log.Error("engine.handle_notification.err", slog.String("err", err.Error()))
+		return fmt.Errorf("failed to marshal notification: %w", err)
 	}
 	msg, err := json.Marshal(fanoutMessage{
-		SessionID: sessID,
-		UserID:    userID,
+		SessionID: sess.SessionID(),
+		UserID:    sess.UserID(),
 		Msg:       noteBytes,
 	})
 	if err != nil {
-		e.log.Error("engine.handle_notification.err", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
-		return err
+		e.log.Error("engine.handle_notification.err", slog.String("err", err.Error()))
+		return fmt.Errorf("failed to marshal fanout message: %w", err)
 	}
 
 	if err := e.host.PublishEvent(ctx, sessionFanoutTopic, msg); err != nil {
-		e.log.Error("failed to publish notification", "error", err)
+		e.log.Error("engine.publish_event.err", slog.String("err", err.Error()))
+
 		return fmt.Errorf("failed to publish notification: %w", err)
 	}
 
 	// Trace successful dispatch
-	e.log.Info("engine.handle_notification.dispatch", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("method", note.Method))
+	e.log.Info("engine.handle_notification.ok")
 
 	return nil
 }
@@ -925,40 +895,30 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 
 // eagerWireSession ensures the session has session-scoped writers wired so that
 // background capabilities can emit immediately after open.
-func (e *Engine) eagerWireSession(ctx context.Context, sessID, userID string) error {
-	// We only need a session-scoped writer that delivers to the per-session
-	// client-facing stream; requestScopedWriter can be nil here.
-	sess, err := e.loadSession(ctx, sessID, userID, nil, NewMessageWriterFunc(
-		func(ctx context.Context, msg jsonrpc.Message) error {
-			_, err := e.host.PublishSession(ctx, sessID, msg)
-			return err
-		},
-	))
-	if err != nil {
-		return err
-	}
+// It is idempotent per session.
+func (e *Engine) eagerWireSession(ctx context.Context, sess *SessionHandle) {
 	// Mark wiring intent (ensures wireMu is used at least for state guarding)
 	e.wireMu.Lock()
-	already := e.wired[sessID]
+	already := e.wired[sess.sessionID]
 	e.wireMu.Unlock()
+
 	if already {
-		return nil
+		return
 	}
-	return e.registerListChangedEmitters(ctx, sess)
+
+	e.registerListChangedEmitters(ctx, sess)
 }
 
 // registerListChangedEmitters wires capability change listeners to emit JSON-RPC
 // notifications on the per-session client stream. It is idempotent per session.
-//
-//lint:ignore U1000 used via eagerWireSession
-func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionHandle) error {
+func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionHandle) {
 	sid := sess.SessionID()
 	uid := sess.UserID()
 
 	e.wireMu.Lock()
 	if e.wired[sid] {
 		e.wireMu.Unlock()
-		return nil
+		return
 	}
 	e.wired[sid] = true
 	e.wireMu.Unlock()
@@ -983,7 +943,6 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 	if resCap, ok, err := e.srv.GetResourcesCapability(bg, sess); err == nil && ok && resCap != nil {
 		if lc, hasLC, lErr := resCap.GetListChangedCapability(bg, sess); lErr == nil && hasLC && lc != nil {
 			_, _ = lc.Register(bg, sess, func(cbCtx context.Context, s sessions.Session, uri string) {
-				_ = uri // we emit generic listChanged per spec
 				publishNote(mcp.ResourcesListChangedNotificationMethod)
 			})
 		}
@@ -1006,16 +965,14 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 			})
 		}
 	}
-
-	return nil
 }
 
-// loadSession retrieves and validates session metadata, returning a handle.
+// LoadSession retrieves and validates session metadata, returning a handle.
 // It verifies the session belongs to the specified user and is not revoked.
 // It also performs a best-effort TTL touch. If a writers are provided, it sets
 // up capabilities according to the session's negotiated capabilities and
 // leverages the relevant writers for outbound messages.
-func (e *Engine) loadSession(ctx context.Context, sessID, userID string, requestScopedWriter MessageWriter, sessionScopedWriter MessageWriter) (*SessionHandle, error) {
+func (e *Engine) LoadSession(ctx context.Context, sessID, userID string, requestScopedWriter MessageWriter) (*SessionHandle, error) {
 	start := time.Now()
 	metaRec, err := e.host.GetSession(ctx, sessID)
 	if err != nil {
@@ -1024,7 +981,7 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 	}
 	if metaRec.Revoked || metaRec.UserID == "" || metaRec.UserID != userID {
 		e.log.InfoContext(ctx, "engine.load_session.denied", slog.String("session_id", sessID), slog.String("user_id", userID))
-		return nil, ErrSessionNotFound
+		return nil, sessions.ErrSessionNotFound
 	}
 	// Best-effort sliding TTL touch.
 	_ = e.host.TouchSession(ctx, sessID)
@@ -1033,7 +990,7 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 
 	opts := []SessionHandleOption{}
 
-	if requestScopedWriter != nil && sessionScopedWriter != nil {
+	if requestScopedWriter != nil {
 		if metaRec.Capabilities.Sampling {
 			opts = append(opts, WithSamplingCapability(&samplingCapabilty{
 				eng:                 e,
@@ -1041,7 +998,6 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,
-				sessionScopedWriter: sessionScopedWriter,
 			}))
 		}
 		if metaRec.Capabilities.Roots {
@@ -1051,7 +1007,6 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,
-				sessionScopedWriter: sessionScopedWriter,
 			}))
 		}
 		if metaRec.Capabilities.Elicitation {
@@ -1061,12 +1016,15 @@ func (e *Engine) loadSession(ctx context.Context, sessID, userID string, request
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,
-				sessionScopedWriter: sessionScopedWriter,
 			}))
 		}
 	}
 
-	return NewSessionHandle(e.host, metaRec, opts...), nil
+	sess := NewSessionHandle(e.host, metaRec, opts...)
+
+	e.eagerWireSession(ctx, sess)
+
+	return sess, nil
 }
 
 func (e *Engine) cancelInFlightRequest(reqID string, reason string) bool {
@@ -1102,48 +1060,46 @@ func (e *Engine) cancelInFlightRequest(reqID string, reason string) bool {
 func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 	var fanout fanoutMessage
 	if err := json.Unmarshal(msg, &fanout); err != nil {
-		e.log.Error("engine.handle_session_event.err", slog.String("err", err.Error()))
+		e.log.ErrorContext(ctx, "engine.handle_session_event.err", slog.String("err", err.Error()))
 		return nil // ignore malformed messages
 	}
 
-	// Trace event receipt
-	e.log.Info("engine.handle_session_event.recv", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID))
+	sess, err := e.LoadSession(ctx, fanout.SessionID, fanout.UserID, nil)
+	if err != nil {
+		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+			SessionID: fanout.SessionID,
+			UserID:    fanout.UserID,
+		})
+
+		// Session not found or invalid; nothing to do.
+		e.log.InfoContext(ctx, "engine.handle_session_event.load_err", slog.String("err", err.Error()))
+		return nil
+	}
+
+	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+		SessionID:       sess.SessionID(),
+		UserID:          sess.UserID(),
+		ProtocolVersion: sess.ProtocolVersion(),
+		State:           sess.State(),
+	})
 
 	var jsonMsg jsonrpc.AnyMessage
 	if err := json.Unmarshal(fanout.Msg, &jsonMsg); err != nil {
-		e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+		e.log.ErrorContext(ctx, "engine.handle_session_event.unmarshal_err", slog.String("err", err.Error()))
 		return nil // ignore malformed messages
 	}
+
+	ctx = logctx.WithRPCMessage(ctx, &logctx.RPCMessage{
+		Method: jsonMsg.Method,
+		ID:     jsonMsg.ID.String(),
+		Type:   jsonMsg.Type(),
+	})
+
+	e.log.InfoContext(ctx, "engine.handle_session_event.recv")
 
 	req := jsonMsg.AsRequest()
 	if req != nil {
 		switch req.Method {
-		case string(mcp.InitializedNotificationMethod):
-			now := time.Now().UTC()
-			// Flip session to open (idempotent) for cross-instance coordination.
-			if err := e.host.MutateSession(ctx, fanout.SessionID, func(m *sessions.SessionMetadata) error {
-				if m == nil || m.Revoked || m.UserID != fanout.UserID {
-					return nil
-				}
-				if m.State == sessions.SessionStateOpen {
-					return nil
-				}
-				m.State = sessions.SessionStateOpen
-				if m.OpenedAt.IsZero() {
-					m.OpenedAt = now
-				}
-				m.TTL = e.sessionTTL
-				m.UpdatedAt = now
-				m.LastAccess = now
-				return nil
-			}); err != nil {
-				e.log.Error("engine.handle_session_event.open.fail", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
-				return nil
-			}
-			// Eager-wire emitters after open.
-			_ = e.eagerWireSession(ctx, fanout.SessionID, fanout.UserID)
-			e.log.Info("engine.handle_session_event.open", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID))
-			return nil
 		case internalSessionDeletedMethod:
 			// Teardown any local per-session subscriptions.
 			e.cancelAllSubscriptionsForSession(fanout.SessionID)
@@ -1151,23 +1107,23 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 		case string(mcp.CancelledNotificationMethod):
 			var params mcp.CancelledNotification
 			if err := json.Unmarshal(req.Params, &params); err != nil {
-				e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+				e.log.Error("engine.handle_session_event.err", slog.String("err", err.Error()))
 				return nil // ignore malformed messages
 			}
 
 			if params.RequestID != nil && !params.RequestID.IsNil() {
 				ridStr := params.RequestID.String()
 				// Trace cancellation delivery
-				e.log.Info("engine.handle_session_event.cancel", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", ridStr), slog.String("reason", params.Reason))
+				e.log.Info("engine.handle_session_event.cancel", slog.String("request_id", ridStr), slog.String("reason", params.Reason))
 
 				hadCancel := e.cancelInFlightRequest(ridStr, params.Reason)
-				e.log.Info("engine.handle_session_event.cancel.dispatched", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("request_id", ridStr), slog.Bool("had_cancel", hadCancel))
+				e.log.Info("engine.handle_session_event.cancel.dispatched", slog.String("request_id", ridStr), slog.Bool("had_cancel", hadCancel))
 			}
 			return nil
 		case string(mcp.ResourcesUnsubscribeMethod):
 			var params mcp.UnsubscribeRequest
 			if err := json.Unmarshal(req.Params, &params); err != nil {
-				e.log.Error("engine.handle_session_event.err", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", err.Error()))
+				e.log.Error("engine.handle_session_event.err", slog.String("err", err.Error()))
 				return nil
 			}
 			// Best-effort local cancel triggered by fanout message.
@@ -1194,7 +1150,7 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 		// Responses will typically satisfy a rendez-vous channel.
 		reqID := res.ID.String()
 		if reqID == "" {
-			e.log.Error("engine.handle_session_event.invalid", slog.String("session_id", fanout.SessionID), slog.String("user_id", fanout.UserID), slog.String("err", "empty request ID"))
+			e.log.Error("engine.handle_session_event.invalid", slog.String("err", "empty request ID"))
 			return nil // ignore malformed messages
 		}
 
@@ -1209,10 +1165,12 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 				// receiver not ready; drop as per at-least-once semantics
 			}
 			return nil
-		} else {
-			return nil
 		}
+
+		return nil
 	}
+
+	// Unknown message type; ignore.
 
 	return nil
 }
@@ -1253,38 +1211,24 @@ func (e *Engine) createRendezVous(reqID string) (<-chan []byte, func()) {
 // StreamSession validates the session ownership and subscribes the caller to the
 // per-session client-facing stream starting after lastEventID. It is a thin
 // wrapper over the host that centralizes auth/ownership checks in the Engine.
-func (e *Engine) StreamSession(ctx context.Context, sessID, userID, lastEventID string, handler sessions.MessageHandlerFunction) error {
-	meta, err := e.host.GetSession(ctx, sessID)
-	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
-		return ErrSessionNotFound
-	}
-	// Best-effort TTL touch; ignore error
-	_ = e.host.TouchSession(ctx, sessID)
-	// Best-effort eager wiring so background emitters (e.g., listChanged) can fire
-	// as soon as a stream consumer attaches, even if notifications/initialized
-	// has not yet been sent by the client.
-	_ = e.eagerWireSession(ctx, sessID, userID)
-	return e.host.SubscribeSession(ctx, sessID, lastEventID, handler)
+func (e *Engine) StreamSession(ctx context.Context, sess *SessionHandle, lastEventID string, handler sessions.MessageHandlerFunction) error {
+	return e.host.SubscribeSession(ctx, sess.SessionID(), lastEventID, handler)
 }
 
 // HandleClientResponse validates the session ownership and forwards a client
 // JSON-RPC response into the Engine rendezvous via the inter-instance fanout.
 // This allows any node to satisfy the waiting request, regardless of where the
 // response was received.
-func (e *Engine) HandleClientResponse(ctx context.Context, sessID, userID string, res *jsonrpc.Response) error {
+func (e *Engine) HandleClientResponse(ctx context.Context, sess *SessionHandle, res *jsonrpc.Response) error {
 	if res == nil || res.ID == nil || res.ID.IsNil() {
 		return fmt.Errorf("invalid response: missing id")
-	}
-	meta, err := e.host.GetSession(ctx, sessID)
-	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
-		return ErrSessionNotFound
 	}
 
 	payload, err := json.Marshal(res)
 	if err != nil {
 		return fmt.Errorf("marshal response: %w", err)
 	}
-	env, err := json.Marshal(fanoutMessage{SessionID: sessID, UserID: userID, Msg: payload})
+	env, err := json.Marshal(fanoutMessage{SessionID: sess.SessionID(), UserID: sess.UserID(), Msg: payload})
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
 	}
@@ -1294,44 +1238,35 @@ func (e *Engine) HandleClientResponse(ctx context.Context, sessID, userID string
 	return nil
 }
 
-// GetSessionProtocolVersion validates ownership and returns the negotiated
-// protocol version for the session. Returns ErrSessionNotFound if not owned or
-// missing.
-func (e *Engine) GetSessionProtocolVersion(ctx context.Context, sessID, userID string) (string, error) {
-	meta, err := e.host.GetSession(ctx, sessID)
-	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
-		return "", ErrSessionNotFound
-	}
-	// Best-effort TTL touch
-	_ = e.host.TouchSession(ctx, sessID)
-	return meta.ProtocolVersion, nil
-}
-
 // DeleteSession validates ownership, returns the session protocol version for
 // convenience, and deletes the session from the host. Idempotent at the host
 // layer; returns ErrSessionNotFound if not owned or already gone.
-func (e *Engine) DeleteSession(ctx context.Context, sessID, userID string) (string, error) {
-	meta, err := e.host.GetSession(ctx, sessID)
-	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
-		return "", ErrSessionNotFound
-	}
-	pv := meta.ProtocolVersion
+func (e *Engine) DeleteSession(ctx context.Context, sess *SessionHandle) error {
 	// Best-effort: cancel any local subscriptions for this session prior to deletion.
-	e.cancelAllSubscriptionsForSession(sessID)
+	e.cancelAllSubscriptionsForSession(sess.SessionID())
 
 	// Broadcast a fanout event so other instances can cancel their local subscriptions.
 	// This uses an internal method name understood only by the engine fanout handler.
 	note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: internalSessionDeletedMethod}
 	bytes, _ := json.Marshal(note)
-	outer := fanoutMessage{SessionID: sessID, UserID: userID, Msg: bytes}
-	if payload, err := json.Marshal(outer); err == nil {
-		_ = e.host.PublishEvent(context.WithoutCancel(ctx), sessionFanoutTopic, payload)
+	outer := fanoutMessage{SessionID: sess.SessionID(), UserID: sess.UserID(), Msg: bytes}
+	payload, err := json.Marshal(outer)
+	if err != nil {
+		e.log.Error("engine.delete_session.marshal.err", slog.String("err", err.Error()))
+		return fmt.Errorf("error preparing fanout: %w", err)
 	}
 
-	if err := e.host.DeleteSession(ctx, sessID); err != nil {
-		return "", fmt.Errorf("delete session: %w", err)
+	if err := e.host.PublishEvent(context.WithoutCancel(ctx), sessionFanoutTopic, payload); err != nil {
+		e.log.Error("engine.delete_session.fanout.err", slog.String("err", err.Error()))
+		return fmt.Errorf("error publishing fanout: %w", err)
 	}
-	return pv, nil
+
+	if err := e.host.DeleteSession(ctx, sess.SessionID()); err != nil {
+		e.log.Error("engine.delete_session.err", slog.String("err", err.Error()))
+		return fmt.Errorf("error deleting session: %w", err)
+	}
+
+	return nil
 }
 
 // PublishToSession validates ownership and appends a JSON-RPC message to the
@@ -1339,7 +1274,7 @@ func (e *Engine) DeleteSession(ctx context.Context, sessID, userID string) (stri
 func (e *Engine) PublishToSession(ctx context.Context, sessID, userID string, msg jsonrpc.Message) (string, error) {
 	meta, err := e.host.GetSession(ctx, sessID)
 	if err != nil || meta == nil || meta.Revoked || meta.UserID != userID {
-		return "", ErrSessionNotFound
+		return "", sessions.ErrSessionNotFound
 	}
 	// Accept either already-encoded []byte or a struct implementing Message
 	var bytes []byte

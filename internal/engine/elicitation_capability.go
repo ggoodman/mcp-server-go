@@ -22,7 +22,6 @@ type elicitationCapability struct {
 	sessID              string
 	userID              string
 	requestScopedWriter MessageWriter
-	sessionScopedWriter MessageWriter
 }
 
 // Elicit implements sessions.ElicitationCapability.

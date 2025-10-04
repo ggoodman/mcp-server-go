@@ -2,75 +2,81 @@ package logctx
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
+
+	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
-// context key type
-type ctxKey int
-
-const (
-	requestIDKey ctxKey = iota
-	sessionIDKey
-	userIDKey
-)
-
-func WithRequestID(ctx context.Context, rid string) context.Context {
-	if rid == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, requestIDKey, rid)
-}
-func WithSessionID(ctx context.Context, sid string) context.Context {
-	if sid == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, sessionIDKey, sid)
-}
-func WithUserID(ctx context.Context, uid string) context.Context {
-	if uid == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, userIDKey, uid)
-}
-func RequestID(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(requestIDKey).(string)
-	return v, ok && v != ""
-}
-func SessionID(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(sessionIDKey).(string)
-	return v, ok && v != ""
-}
-func UserID(ctx context.Context) (string, bool) {
-	v, ok := ctx.Value(userIDKey).(string)
-	return v, ok && v != ""
+type Handler struct {
+	slog.Handler
 }
 
-func Enrich(ctx context.Context, l *slog.Logger) *slog.Logger {
-	if l == nil {
-		l = slog.Default()
+func (h Handler) Handle(ctx context.Context, r slog.Record) error {
+	if rd, ok := ctx.Value(requestDataKey{}).(*RequestData); ok {
+		r.AddAttrs(slog.Group("req",
+			slog.String("id", rd.RequestID),
+			slog.String("method", rd.Method),
+			slog.String("user_agent", rd.UserAgent),
+			slog.String("remote_addr", rd.RemoteAddr),
+			slog.String("path", rd.Path),
+		))
 	}
-	args := []any{}
-	if rid, ok := RequestID(ctx); ok {
-		args = append(args, slog.String("request_id", rid))
+
+	if sd, ok := ctx.Value(sessionDataKey{}).(*SessionData); ok {
+		r.AddAttrs(slog.Group("sess",
+			slog.String("id", sd.SessionID),
+			slog.String("user_id", sd.UserID),
+			slog.String("protocol_version", sd.ProtocolVersion),
+			slog.String("state", string(sd.State)),
+		))
 	}
-	if sid, ok := SessionID(ctx); ok {
-		args = append(args, slog.String("session_id", sid))
+
+	if msg, ok := ctx.Value(rpcMsg{}).(*RPCMessage); ok {
+		r.AddAttrs(slog.Group("rpc",
+			slog.String("method", msg.Method),
+			slog.String("id", msg.ID),
+			slog.String("type", msg.Type),
+		))
 	}
-	if uid, ok := UserID(ctx); ok {
-		args = append(args, slog.String("user_id", uid))
-	}
-	if len(args) == 0 {
-		return l
-	}
-	return l.With(args...)
+
+	return h.Handler.Handle(ctx, r)
 }
 
-func NewRequestID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(b[:])
+type rpcMsg struct{}
+
+type RPCMessage struct {
+	Method string
+	ID     string
+	Type   string
+}
+
+func WithRPCMessage(ctx context.Context, msg *RPCMessage) context.Context {
+	return context.WithValue(ctx, rpcMsg{}, msg)
+}
+
+type requestDataKey struct{}
+
+type RequestData struct {
+	RequestID  string
+	Method     string
+	UserAgent  string
+	RemoteAddr string
+	Path       string
+}
+
+func WithRequestData(ctx context.Context, data *RequestData) context.Context {
+	return context.WithValue(ctx, requestDataKey{}, data)
+}
+
+type sessionDataKey struct{}
+
+type SessionData struct {
+	SessionID       string
+	UserID          string
+	ProtocolVersion string
+	State           sessions.SessionState
+}
+
+func WithSessionData(ctx context.Context, data *SessionData) context.Context {
+	return context.WithValue(ctx, sessionDataKey{}, data)
 }

@@ -35,10 +35,6 @@ type Session interface {
 	DeleteData(ctx context.Context, key string) error
 }
 
-// MessageHandlerFunction handles ordered messages for a session stream.
-// If the handler returns an error, the subscription will terminate with that error.
-type MessageHandlerFunction func(ctx context.Context, msgID string, msg []byte) error
-
 // ClientInfo identifies the client connecting to the server.
 type ClientInfo struct {
 	Name    string

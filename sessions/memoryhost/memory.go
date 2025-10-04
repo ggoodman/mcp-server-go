@@ -3,6 +3,8 @@ package memoryhost
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -264,13 +266,18 @@ func (h *Host) CreateSession(ctx context.Context, meta *sessions.SessionMetadata
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+
+	sessID := fmt.Sprintf("pid-%d", os.Getpid())
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if _, exists := h.metas[meta.SessionID]; exists {
+	if _, exists := h.metas[sessID]; exists {
 		return errors.New("session exists")
 	}
+
+	meta.SessionID = sessID
 	cp := *meta
-	h.metas[meta.SessionID] = &cp
+	h.metas[sessID] = &cp
 	return nil
 }
 
@@ -282,7 +289,7 @@ func (h *Host) GetSession(ctx context.Context, sessionID string) (*sessions.Sess
 	defer h.mu.RUnlock()
 	m, ok := h.metas[sessionID]
 	if !ok {
-		return nil, errors.New("not found")
+		return nil, sessions.ErrSessionNotFound
 	}
 	cp := *m
 	return &cp, nil
@@ -296,7 +303,7 @@ func (h *Host) MutateSession(ctx context.Context, sessionID string, fn func(*ses
 	defer h.mu.Unlock()
 	m, ok := h.metas[sessionID]
 	if !ok {
-		return errors.New("not found")
+		return sessions.ErrSessionNotFound
 	}
 	if err := fn(m); err != nil {
 		return err
@@ -313,7 +320,7 @@ func (h *Host) TouchSession(ctx context.Context, sessionID string) error {
 	defer h.mu.Unlock()
 	m, ok := h.metas[sessionID]
 	if !ok {
-		return errors.New("not found")
+		return sessions.ErrSessionNotFound
 	}
 	now := time.Now().UTC()
 	m.LastAccess = now

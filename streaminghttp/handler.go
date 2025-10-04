@@ -22,6 +22,7 @@ import (
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/mcpservice"
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 var (
@@ -163,13 +164,6 @@ type StreamingHTTPHandler struct {
 	eng         *engine.Engine
 	sessionHost sessions.SessionHost
 	realm       string
-
-	subMu      sync.Mutex
-	subCancels map[string]map[string]context.CancelFunc
-
-	sessMu      sync.Mutex
-	sessParents map[string]context.Context
-	sessCancel  map[string]context.CancelFunc
 }
 
 // lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
@@ -257,7 +251,9 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 		return nil, fmt.Errorf("either authenticator or WithSecurityConfig required")
 	}
 
-	h := &StreamingHTTPHandler{log: cfg.logger, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm, subCancels: make(map[string]map[string]context.CancelFunc), sessParents: make(map[string]context.Context), sessCancel: make(map[string]context.CancelFunc)}
+	loggerWithContextHandler := slog.New(logctx.Handler{Handler: cfg.logger.Handler()})
+
+	h := &StreamingHTTPHandler{log: loggerWithContextHandler, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm}
 
 	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
@@ -342,7 +338,13 @@ func pathOnly(u *url.URL) string {
 }
 
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
+	h.mux.ServeHTTP(w, r.WithContext(logctx.WithRequestData(r.Context(), &logctx.RequestData{
+		RequestID:  uuid.NewString(),
+		Method:     r.Method,
+		UserAgent:  r.UserAgent(),
+		RemoteAddr: r.RemoteAddr,
+		Path:       r.URL.Path,
+	})))
 }
 
 // handleDeleteMCP handles the DELETE /mcp endpoint, which terminates an existing
@@ -351,105 +353,94 @@ func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // session are cleaned up.
 func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	baseCtx := r.Context()
-	reqID := logctx.NewRequestID()
-	ctx := logctx.WithRequestID(baseCtx, reqID)
-	r = r.WithContext(ctx)
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "delete_session"),
-		slog.String("http_method", r.Method),
-		slog.String("path", r.URL.Path),
-	)
-	logger.InfoContext(ctx, "http.delete.start")
+	ctx := r.Context()
+	h.log.InfoContext(ctx, "http.delete.start")
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		logger.InfoContext(ctx, "auth.fail")
+		h.log.InfoContext(ctx, "auth.fail")
 		return
 	}
-	ctx = logctx.WithUserID(ctx, userInfo.UserID())
-	logger = logctx.Enrich(ctx, logger)
-	logger.InfoContext(ctx, "auth.ok")
+	h.log.InfoContext(ctx, "auth.ok")
 
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
-		logger.WarnContext(ctx, "delete.missing_session_id")
+		h.log.WarnContext(ctx, "delete.missing_session_id")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	ctx = logctx.WithSessionID(ctx, sessID)
-	logger = logctx.Enrich(ctx, logger)
 
-	pvHeader := r.Header.Get(mcpProtocolVersionHeader)
-	respProtoVersion, err := h.eng.GetSessionProtocolVersion(ctx, sessID, userInfo.UserID())
+	sess, err := h.eng.LoadSession(ctx, sessID, userInfo.UserID(), nil)
 	if err != nil {
-		logger.InfoContext(ctx, "session.load.miss")
-		h.teardownSession(sessID)
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	logger.InfoContext(ctx, "session.load.ok")
-
-	if pvHeader != "" && respProtoVersion != "" && pvHeader != respProtoVersion {
-		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", respProtoVersion), slog.String("client_version", pvHeader))
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return
-	}
-
-	if _, err := h.eng.DeleteSession(ctx, sessID, userInfo.UserID()); err != nil {
-		if errors.Is(err, engine.ErrSessionNotFound) {
-			logger.InfoContext(ctx, "session.delete.miss")
-			h.teardownSession(sessID)
+		if errors.Is(err, sessions.ErrSessionNotFound) {
+			h.log.InfoContext(ctx, "session.delete.miss")
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		logger.ErrorContext(ctx, "session.delete.fail", slog.String("err", err.Error()))
-		h.teardownSession(sessID)
+
+		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+			SessionID: sessID,
+			UserID:    userInfo.UserID(),
+		})
+
+		h.log.ErrorContext(ctx, "session.load.fail", slog.String("err", err.Error()))
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	// Also tear down any local per-session forwarders/parents.
-	h.teardownSession(sessID)
+	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+		SessionID:       sess.SessionID(),
+		UserID:          userInfo.UserID(),
+		ProtocolVersion: sess.ProtocolVersion(),
+		State:           sess.State(),
+	})
+
+	pvHeader := r.Header.Get(mcpProtocolVersionHeader)
+
+	if pvHeader != "" && sess.ProtocolVersion() != "" && pvHeader != sess.ProtocolVersion() {
+		h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("client_version", pvHeader))
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+
+	if err := h.eng.DeleteSession(ctx, sess); err != nil {
+		if errors.Is(err, sessions.ErrSessionNotFound) {
+			h.log.InfoContext(ctx, "session.delete.miss")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		h.log.ErrorContext(ctx, "session.delete.fail", slog.String("err", err.Error()))
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	// If we captured a protocol version, advertise it
-	if respProtoVersion != "" {
-		w.Header().Set(mcpProtocolVersionHeader, respProtoVersion)
+	if sess.ProtocolVersion() != "" {
+		w.Header().Set(mcpProtocolVersionHeader, sess.ProtocolVersion())
 	}
 
 	// Success: no content.
 	w.WriteHeader(http.StatusNoContent)
-	logger.InfoContext(ctx, "http.delete.ok", slog.Duration("dur", time.Since(start)))
+	h.log.InfoContext(ctx, "http.delete.ok", slog.Duration("dur", time.Since(start)))
 }
 
 // handlePostMCP handles the POST /mcp endpoint, which is used by the client to send
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	baseCtx := r.Context()
-	reqID := logctx.NewRequestID()
-	ctx := logctx.WithRequestID(baseCtx, reqID)
-	r = r.WithContext(ctx)
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "post_mcp"),
-		slog.String("http_method", r.Method),
-		slog.String("path", r.URL.Path),
-	)
-	logger.InfoContext(ctx, "http.post.start")
+	ctx := r.Context()
 
 	ctype, err := contenttype.GetMediaType(r)
 	if err != nil || !ctype.Matches(jsonMediaType) {
 		writeJSONError(w, http.StatusUnsupportedMediaType, "content-type must be application/json")
-		logger.WarnContext(ctx, "content_type.unsupported")
+		h.log.WarnContext(ctx, "content_type.unsupported")
 		return
 	}
 
 	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "flusher.missing")
+		h.log.ErrorContext(ctx, "flusher.missing")
 		return
 	}
 
@@ -458,31 +449,34 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		logger.InfoContext(ctx, "auth.fail")
+		h.log.InfoContext(ctx, "auth.fail")
 		return
 	}
-	ctx = logctx.WithUserID(ctx, userInfo.UserID())
-	logger = logctx.Enrich(ctx, logger)
-	logger.InfoContext(ctx, "auth.ok")
 
 	var raw json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
-		logger.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
+		h.log.WarnContext(ctx, "json.decode.fail", slog.String("err", err.Error()))
 		return
 	}
 	if len(raw) > 0 && raw[0] == '[' {
 		writeJSONError(w, http.StatusBadRequest, "JSON-RPC batch arrays are forbidden on streaming HTTP transport")
-		logger.WarnContext(ctx, "jsonrpc.batch.forbidden")
+		h.log.WarnContext(ctx, "jsonrpc.batch.forbidden")
 		return
 	}
 
 	var msg jsonrpc.AnyMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON-RPC message: "+err.Error())
-		logger.WarnContext(ctx, "jsonrpc.message.invalid", slog.String("err", err.Error()))
+		h.log.WarnContext(ctx, "jsonrpc.message.invalid", slog.String("err", err.Error()))
 		return
 	}
+
+	ctx = logctx.WithRPCMessage(ctx, &logctx.RPCMessage{
+		Method: msg.Method,
+		ID:     msg.ID.String(),
+		Type:   msg.Type(),
+	})
 
 	sessID := r.Header.Get(mcpSessionIDHeader)
 	if sessID == "" {
@@ -490,25 +484,33 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		req := msg.AsRequest()
 		if req == nil || req.Method != string(mcp.InitializeMethod) {
 			writeJSONError(w, http.StatusNotFound, "expected initialize request")
-			logger.WarnContext(ctx, "session.initialize.invalid")
+			h.log.InfoContext(ctx, "session.initialize.invalid")
 			return
 		}
 		var initReq mcp.InitializeRequest
 		if err := json.Unmarshal(req.Params, &initReq); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid initialize params")
-			logger.WarnContext(ctx, "session.initialize.params.fail", slog.String("err", err.Error()))
+			h.log.InfoContext(ctx, "session.initialize.params.fail", slog.String("err", err.Error()))
 			return
 		}
 		sess, initRes, err := h.eng.InitializeSession(ctx, userInfo.UserID(), &initReq)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to initialize session")
-			logger.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
 			return
 		}
+
+		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+			SessionID:       sess.SessionID(),
+			UserID:          userInfo.UserID(),
+			ProtocolVersion: sess.ProtocolVersion(),
+			State:           sess.State(),
+		})
+
 		resp, err := jsonrpc.NewResultResponse(req.ID, initRes)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to encode initialize response")
-			logger.ErrorContext(ctx, "session.initialize.encode.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.initialize.encode.fail", slog.String("err", err.Error()))
 			return
 		}
 		w.Header().Set(mcpSessionIDHeader, sess.SessionID())
@@ -518,48 +520,72 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		w.Header().Set("Content-Type", jsonMediaType.String())
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			logger.ErrorContext(ctx, "session.initialize.write.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.initialize.write.fail", slog.String("err", err.Error()))
 		}
-		logger.InfoContext(ctx, "session.initialize.ok", slog.Duration("dur", time.Since(start)))
+		h.log.InfoContext(ctx, "session.initialize.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
-	ctx = logctx.WithSessionID(ctx, sessID)
-	logger = logctx.Enrich(ctx, logger)
 
-	// Validate and fetch protocol version via engine
-	sessionPV, err := h.eng.GetSessionProtocolVersion(ctx, sessID, userInfo.UserID())
+	writer := engine.NewMessageWriterFunc(func(dwCtx context.Context, msg jsonrpc.Message) error {
+		// We intentionally use an empty message ID here because we're not sending it through the session's
+		// message queue. As a result, if the message is lost after flushing it to the OS but before the
+		// client actually processes it, the message is permanently lost.
+		//
+		// This is a trade-off we make to support some unfortunate wording in the MCP spec (2.1, bullet 6):
+		// https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#sending-messages-to-the-server
+		if err := writeSSEEvent(wf, "", msg); err != nil {
+			if _, pubErr := h.eng.PublishToSession(dwCtx, sessID, userInfo.UserID(), msg); pubErr != nil {
+				return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
+			}
+		}
+		return nil
+	})
+
+	sess, err := h.eng.LoadSession(ctx, sessID, userInfo.UserID(), writer)
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		logger.InfoContext(ctx, "session.load.miss")
-		h.teardownSession(sessID)
+		if errors.Is(err, sessions.ErrSessionNotFound) {
+			writeJSONError(w, http.StatusNotFound, "session not found")
+			h.log.InfoContext(ctx, "session.load.miss")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to load session")
+		h.log.ErrorContext(ctx, "session.load.fail", slog.String("err", err.Error()))
 		return
 	}
-	logger.InfoContext(ctx, "session.load.ok")
+
+	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+		SessionID:       sess.SessionID(),
+		UserID:          sess.UserID(),
+		ProtocolVersion: sess.ProtocolVersion(),
+		State:           sess.State(),
+	})
+
+	h.log.InfoContext(ctx, "session.load.ok")
 
 	if req := msg.AsRequest(); req != nil && req.Method == "initialize" {
 		writeJSONError(w, http.StatusConflict, "session already initialized")
-		logger.WarnContext(ctx, "session.initialize.redundant")
+		h.log.WarnContext(ctx, "session.initialize.redundant")
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
-	if clientPV != "" && sessionPV != "" && clientPV != sessionPV {
+	if clientPV != "" && sess.ProtocolVersion() != "" && clientPV != sess.ProtocolVersion() {
 		writeJSONError(w, http.StatusBadRequest, "protocol version mismatch")
-		logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", sessionPV), slog.String("client_version", clientPV))
+		h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("client_version", clientPV))
 		return
 	}
 
 	if req := msg.AsRequest(); req != nil {
 		if req.ID.IsNil() {
-			if err := h.eng.HandleNotification(ctx, sessID, userInfo.UserID(), req); err != nil {
+			if err := h.eng.HandleNotification(ctx, sess, req); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				logger.ErrorContext(ctx, "notification.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
+				h.log.ErrorContext(ctx, "notification.inbound.fail", slog.String("err", err.Error()))
 				return
 			}
-			if spv := sessionPV; spv != "" {
+			if spv := sess.ProtocolVersion(); spv != "" {
 				w.Header().Set(mcpProtocolVersionHeader, spv)
 			}
 			w.WriteHeader(http.StatusAccepted)
-			logger.InfoContext(ctx, "notification.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
+			h.log.InfoContext(ctx, "notification.inbound.ok", slog.Duration("dur", time.Since(start)))
 			return
 		}
 
@@ -567,14 +593,17 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		if acc != "" {
 			if _, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes); err != nil {
 				w.WriteHeader(http.StatusUnsupportedMediaType)
-				logger.WarnContext(ctx, "accept.unsupported", slog.String("accept", acc))
+				h.log.WarnContext(ctx, "accept.unsupported", slog.String("accept", acc))
 				return
 			}
 		}
-		if spv := sessionPV; spv != "" {
+		if spv := sess.ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		wf.Flush()
 
@@ -584,79 +613,63 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		rid := req.ID.String()
 		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: wf, requestID: rid})
 
-		writer := engine.NewMessageWriterFunc(func(dwCtx context.Context, msg jsonrpc.Message) error {
-			if err := writeSSEEvent(wf, "", msg); err != nil {
-				if _, pubErr := h.eng.PublishToSession(dwCtx, sessID, userInfo.UserID(), msg); pubErr != nil {
-					return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
-				}
-			}
-			return nil
-		})
-
-		res, err := h.eng.HandleRequest(ctx, sessID, userInfo.UserID(), req, writer)
+		res, err := h.eng.HandleRequest(ctx, sess, req)
 		if err != nil {
-			logger.ErrorContext(ctx, "rpc.inbound.fail", slog.String("method", req.Method), slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "rpc.inbound.fail", slog.String("err", err.Error()))
 			res = &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, Error: &jsonrpc.Error{Code: jsonrpc.ErrorCodeInternalError, Message: "internal server error"}, ID: req.ID}
 		}
+
 		b, mErr := json.Marshal(res)
 		if mErr != nil {
-			logger.ErrorContext(ctx, "rpc.response.marshal.fail", slog.String("err", mErr.Error()))
+			h.log.ErrorContext(ctx, "rpc.response.marshal.fail", slog.String("err", mErr.Error()))
 			return
 		}
-		if err := writeSSEEvent(wf, "", b); err != nil {
-			logger.ErrorContext(ctx, "sse.write.fail", slog.String("err", err.Error()))
+		if err := writer.WriteMessage(ctx, b); err != nil {
+			h.log.ErrorContext(ctx, "sse.write.fail", slog.String("err", err.Error()))
 			return
 		}
-		logger.InfoContext(ctx, "rpc.inbound.ok", slog.String("method", req.Method), slog.Duration("dur", time.Since(start)))
+		h.log.InfoContext(ctx, "rpc.inbound.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
 
 	if res := msg.AsResponse(); res != nil {
-		if err := h.eng.HandleClientResponse(ctx, sessID, userInfo.UserID(), res); err != nil {
-			if errors.Is(err, engine.ErrSessionNotFound) {
+		if err := h.eng.HandleClientResponse(ctx, sess, res); err != nil {
+			if errors.Is(err, sessions.ErrSessionNotFound) {
 				w.WriteHeader(http.StatusNotFound)
 			} else {
 				w.WriteHeader(http.StatusInternalServerError)
 			}
-			logger.ErrorContext(ctx, "response.forward.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "response.forward.fail", slog.String("err", err.Error()))
 			return
 		}
-		if spv := sessionPV; spv != "" {
+		if spv := sess.ProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.WriteHeader(http.StatusAccepted)
-		logger.InfoContext(ctx, "response.inbound.ok", slog.Duration("dur", time.Since(start)))
+		h.log.InfoContext(ctx, "response.inbound.ok", slog.Duration("dur", time.Since(start)))
 		return
 	}
-	logger.WarnContext(ctx, "jsonrpc.message.unrecognized", slog.Duration("dur", time.Since(start)))
+
+	h.log.WarnContext(ctx, "jsonrpc.message.unrecognized", slog.Duration("dur", time.Since(start)))
 }
 
 // handleGetMCP handles the GET /mcp endpoint, which is used to consume messages
 // from an established session.
 func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	baseCtx := r.Context()
-	reqID := logctx.NewRequestID()
-	ctx := logctx.WithRequestID(baseCtx, reqID)
-	r = r.WithContext(ctx)
-	logger := logctx.Enrich(ctx, h.log).With(
-		slog.String("transport", "streaminghttp"),
-		slog.String("op", "get_stream"),
-		slog.String("http_method", r.Method),
-		slog.String("path", r.URL.Path),
-	)
+	ctx := r.Context()
 
 	_, _, err := contenttype.GetAcceptableMediaType(r, eventStreamMediaTypes)
 	if err != nil {
 		w.WriteHeader(http.StatusUnsupportedMediaType)
-		logger.WarnContext(ctx, "http.get.unsupported_media_type")
+		h.log.WarnContext(ctx, "http.get.unsupported_media_type")
 		return
 	}
 
 	f, ok := w.(http.Flusher)
 	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.ErrorContext(ctx, "sse.flusher.missing")
+		h.log.ErrorContext(ctx, "sse.flusher.missing")
 		return
 	}
 
@@ -665,67 +678,72 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
-		logger.InfoContext(ctx, "auth.fail")
+		h.log.InfoContext(ctx, "auth.fail")
 		return
 	}
-	ctx = logctx.WithUserID(ctx, userInfo.UserID())
-	logger = logctx.Enrich(ctx, logger)
-	logger.InfoContext(ctx, "auth.ok")
+	h.log.InfoContext(ctx, "auth.ok")
 
 	sessionHeader := r.Header.Get(mcpSessionIDHeader)
 	if sessionHeader == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		logger.WarnContext(ctx, "session.id.missing")
+		h.log.WarnContext(ctx, "session.id.missing")
 		return
 	}
-	ctx = logctx.WithSessionID(ctx, sessionHeader)
-	logger = logctx.Enrich(ctx, logger)
 
-	// Validate via engine and retrieve protocol version
-	sessionPV, err := h.eng.GetSessionProtocolVersion(ctx, sessionHeader, userInfo.UserID())
+	sess, err := h.eng.LoadSession(ctx, sessionHeader, userInfo.UserID(), nil)
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		logger.InfoContext(ctx, "session.load.miss")
-		h.teardownSession(sessionHeader)
+		if errors.Is(err, sessions.ErrSessionNotFound) {
+			w.WriteHeader(http.StatusNotFound)
+			h.log.InfoContext(ctx, "session.load.miss")
+			return
+		}
+
+		ctx := logctx.WithSessionData(ctx, &logctx.SessionData{SessionID: sessionHeader, UserID: userInfo.UserID()})
+
+		w.WriteHeader(http.StatusInternalServerError)
+		h.log.ErrorContext(ctx, "session.load.fail", slog.String("err", err.Error()))
 		return
 	}
-	logger.InfoContext(ctx, "session.load.ok")
 
 	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
-		if spv := sessionPV; spv != "" && pv != spv {
+		if spv := sess.ProtocolVersion(); spv != "" && pv != spv {
 			w.WriteHeader(http.StatusPreconditionFailed)
-			logger.WarnContext(ctx, "protocol.version.mismatch", slog.String("session_version", spv), slog.String("client_version", pv))
+			h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("client_version", pv))
 			return
 		}
 	}
 
 	lastEventID := r.Header.Get(lastEventIDHeader)
 
-	if spv := sessionPV; spv != "" {
+	if spv := sess.ProtocolVersion(); spv != "" {
 		w.Header().Set(mcpProtocolVersionHeader, spv)
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	wf.Flush()
-	logger.InfoContext(ctx, "sse.stream.start")
 
-	if err := h.eng.StreamSession(ctx, sessionHeader, userInfo.UserID(), lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
+	h.log.InfoContext(ctx, "sse.stream.start")
+
+	if err := h.eng.StreamSession(ctx, sess, lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
 		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
+			h.log.ErrorContext(cbCtx, "sse.write.fail", slog.String("err", err.Error()))
 			return err
 		}
-		logger.InfoContext(cbCtx, "sse.message.deliver")
+		h.log.InfoContext(cbCtx, "sse.message.deliver")
 		return nil
 	}); err != nil {
 		if errors.Is(err, context.Canceled) {
-			logger.InfoContext(ctx, "subscribe.session.done")
+			h.log.InfoContext(ctx, "subscribe.session.done")
 		} else {
-			logger.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "subscribe.session.fail", slog.String("err", err.Error()))
 		}
 		return
 	}
 
-	logger.InfoContext(ctx, "sse.stream.end", slog.Duration("dur", time.Since(start)))
+	h.log.InfoContext(ctx, "sse.stream.end", slog.Duration("dur", time.Since(start)))
 }
 
 func (h *StreamingHTTPHandler) handleOptionsProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
@@ -848,40 +866,6 @@ func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
 	}
 	wf.Flush()
 	return nil
-}
-
-// Direct writer integration handled via SessionHandle.SetDirectWriter.
-
-// teardownSession cancels the per-session parent context (if any) and cancels
-// all per-URI forwarders. It also removes bookkeeping entries. This does not
-// delete the session from the host; it only tears down local resources.
-func (h *StreamingHTTPHandler) teardownSession(sessionID string) {
-	// Cancel per-session parent first to cascade cancellation to children.
-	h.sessMu.Lock()
-	if h.sessCancel != nil {
-		if cancel, ok := h.sessCancel[sessionID]; ok && cancel != nil {
-			cancel()
-			delete(h.sessCancel, sessionID)
-		}
-	}
-	if h.sessParents != nil {
-		delete(h.sessParents, sessionID)
-	}
-	h.sessMu.Unlock()
-
-	// Also cancel any lingering per-URI forwarders and clear their entries.
-	h.subMu.Lock()
-	if m, ok := h.subCancels[sessionID]; ok {
-		for _, c := range m {
-			if c != nil {
-				c()
-			}
-		}
-		delete(h.subCancels, sessionID)
-	}
-	h.subMu.Unlock()
-
-	// (outbound dispatcher removal: no-op)
 }
 
 // streamingProgressReporter emits notifications/progress for a given request over the session stream.

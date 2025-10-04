@@ -23,7 +23,6 @@ type samplingCapabilty struct {
 	sessID              string
 	userID              string
 	requestScopedWriter MessageWriter
-	sessionScopedWriter MessageWriter
 }
 
 // CreateMessage implements sessions.SamplingCapability.
