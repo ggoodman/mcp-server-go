@@ -428,8 +428,7 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 // MCP messages to the server and to establish a session.
 func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ctx := logctx.WithRequestData(r.Context(), &logctx.RequestData{})
-	h.log.InfoContext(ctx, "http.post.start")
+	ctx := r.Context()
 
 	ctype, err := contenttype.GetMediaType(r)
 	if err != nil || !ctype.Matches(jsonMediaType) {
@@ -501,7 +500,12 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
-		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{SessionID: sess.SessionID(), UserID: userInfo.UserID()})
+		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+			SessionID:       sess.SessionID(),
+			UserID:          userInfo.UserID(),
+			ProtocolVersion: sess.ProtocolVersion(),
+			State:           sess.State(),
+		})
 
 		resp, err := jsonrpc.NewResultResponse(req.ID, initRes)
 		if err != nil {

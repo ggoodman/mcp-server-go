@@ -943,7 +943,6 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 	if resCap, ok, err := e.srv.GetResourcesCapability(bg, sess); err == nil && ok && resCap != nil {
 		if lc, hasLC, lErr := resCap.GetListChangedCapability(bg, sess); lErr == nil && hasLC && lc != nil {
 			_, _ = lc.Register(bg, sess, func(cbCtx context.Context, s sessions.Session, uri string) {
-				_ = uri // we emit generic listChanged per spec
 				publishNote(mcp.ResourcesListChangedNotificationMethod)
 			})
 		}

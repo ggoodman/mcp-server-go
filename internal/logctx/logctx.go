@@ -31,6 +31,14 @@ func (h Handler) Handle(ctx context.Context, r slog.Record) error {
 		))
 	}
 
+	if msg, ok := ctx.Value(rpcMsg{}).(*RPCMessage); ok {
+		r.AddAttrs(slog.Group("rpc",
+			slog.String("method", msg.Method),
+			slog.String("id", msg.ID),
+			slog.String("type", msg.Type),
+		))
+	}
+
 	return h.Handler.Handle(ctx, r)
 }
 
