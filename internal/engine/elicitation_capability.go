@@ -40,17 +40,17 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 				defer func() {
 					if r := recover(); r != nil {
 						bindErr = errors.New("elicitation: panic during schema reflection")
-						c.log.Error("elicitation.bind.panic", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.Any("recover", r))
+						c.log.ErrorContext(ctx, "elicitation.bind.panic", slog.Any("recover", r))
 					}
 				}()
 				decoder, bindErr = pubelicit.BindStruct(subject)
 			}()
 			if bindErr != nil {
-				c.log.Error("elicitation.bind.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", bindErr.Error()))
+				c.log.ErrorContext(ctx, "elicitation.bind.err", slog.String("err", bindErr.Error()))
 				return sessions.ElicitActionCancel, bindErr
 			}
 		} else {
-			c.log.Error("elicitation.subject.invalid", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+			c.log.ErrorContext(ctx, "elicitation.subject.invalid")
 			return sessions.ElicitActionCancel, sessions.ErrInvalidElicitSubject
 		}
 	}
@@ -58,7 +58,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 	// Obtain schema (cached or constructed lazily by implementation)
 	sch, err := decoder.Schema()
 	if err != nil {
-		c.log.Error("elicitation.schema.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.ErrorContext(ctx, "elicitation.schema.err", slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 
@@ -75,17 +75,17 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 	// Marshal schema JSON once
 	jsonBytes, err := sch.MarshalJSON()
 	if err != nil {
-		c.log.Error("elicitation.schema.marshal.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.ErrorContext(ctx, "elicitation.schema.marshal.err", slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 	var wireSchema mcp.ElicitationSchema
 	if err := json.Unmarshal(jsonBytes, &wireSchema); err != nil { // should not fail; defensive
-		c.log.Error("elicitation.schema.unmarshal.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.ErrorContext(ctx, "elicitation.schema.unmarshal.err", slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 	params, err := json.Marshal(mcp.ElicitRequest{Message: text, RequestedSchema: wireSchema})
 	if err != nil {
-		c.log.Error("elicitation.create.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.ErrorContext(ctx, "elicitation.create.err", slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 
@@ -93,7 +93,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 
 	bytes, err := json.Marshal(clientReq)
 	if err != nil {
-		c.log.Error("elicitation.create.marshal.err", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.ErrorContext(ctx, "elicitation.create.marshal.err", slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 
@@ -102,7 +102,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 	defer closeRdv()
 
 	if err := c.requestScopedWriter.WriteMessage(ctx, bytes); err != nil {
-		c.log.Error("elicitation.create.write.fail", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+		c.log.ErrorContext(ctx, "elicitation.create.write.fail", slog.String("err", err.Error()))
 		return sessions.ElicitActionCancel, ErrInternal
 	}
 
@@ -110,25 +110,25 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 	select {
 	case msg, ok := <-rdvCh:
 		if !ok {
-			c.log.Error("elicitation.create.cancelled", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+			c.log.ErrorContext(ctx, "elicitation.create.cancelled")
 			return sessions.ElicitActionCancel, ErrCancelled
 		}
 
 		// Decode JSON-RPC response envelope first
 		var resp jsonrpc.Response
 		if err := json.Unmarshal(msg, &resp); err != nil {
-			c.log.Error("elicitation.create.unmarshal_response.fail", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+			c.log.ErrorContext(ctx, "elicitation.create.unmarshal_response.fail", slog.String("err", err.Error()))
 			return sessions.ElicitActionCancel, ErrInternal
 		}
 		if resp.Error != nil {
-			c.log.Error("elicitation.create.error", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message))
+			c.log.ErrorContext(ctx, "elicitation.create.error", slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message))
 			return sessions.ElicitActionCancel, ErrInternal
 		}
 
 		// Unmarshal result payload
 		var er mcp.ElicitResult
 		if err := json.Unmarshal(resp.Result, &er); err != nil {
-			c.log.Error("elicitation.create.result.unmarshal.fail", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+			c.log.ErrorContext(ctx, "elicitation.create.result.unmarshal.fail", slog.String("err", err.Error()))
 			return sessions.ElicitActionCancel, ErrInternal
 		}
 
@@ -158,14 +158,14 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 		// Only decode when accepted
 		if action == sessions.ElicitActionAccept {
 			if err := decoder.Decode(er.Content, nil); err != nil { // nil => use bound destination if implementation supports it
-				c.log.Error("elicitation.create.decode.fail", slog.String("session_id", c.sessID), slog.String("user_id", c.userID), slog.String("err", err.Error()))
+				c.log.ErrorContext(ctx, "elicitation.create.decode.fail", slog.String("err", err.Error()))
 				return sessions.ElicitActionCancel, ErrInternal
 			}
 		}
 
 		return action, nil
 	case <-ctx.Done():
-		c.log.Error("elicitation.create.ctx.done", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+		c.log.ErrorContext(ctx, "elicitation.create.ctx.done")
 		return sessions.ElicitActionCancel, ctx.Err()
 	}
 }

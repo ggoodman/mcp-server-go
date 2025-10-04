@@ -39,6 +39,12 @@ func (h Handler) Handle(ctx context.Context, r slog.Record) error {
 		))
 	}
 
+	if td, ok := ctx.Value(toolCallDataKey{}).(*ToolCallData); ok {
+		r.AddAttrs(slog.Group("tool",
+			slog.String("name", td.ToolName),
+		))
+	}
+
 	return h.Handler.Handle(ctx, r)
 }
 
@@ -79,4 +85,14 @@ type SessionData struct {
 
 func WithSessionData(ctx context.Context, data *SessionData) context.Context {
 	return context.WithValue(ctx, sessionDataKey{}, data)
+}
+
+type toolCallDataKey struct{}
+
+type ToolCallData struct {
+	ToolName string
+}
+
+func WithToolCallData(ctx context.Context, data *ToolCallData) context.Context {
+	return context.WithValue(ctx, toolCallDataKey{}, data)
 }

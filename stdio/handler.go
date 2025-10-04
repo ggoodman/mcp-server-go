@@ -159,7 +159,7 @@ func (h *Handler) startSessionPump(ctx context.Context, sessionID string) {
 			return h.writeMessageBytes(msg)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
-			h.log.ErrorContext(ctx, "session.stream.fail", slog.String("session_id", sessionID), slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "session.stream.fail", slog.String("err", err.Error()))
 		}
 	}()
 }

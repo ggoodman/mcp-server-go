@@ -62,7 +62,7 @@ func (s *samplingCapabilty) CreateMessage(ctx context.Context, system string, us
 	reqID := uuid.NewString()
 	params, err := json.Marshal(req)
 	if err != nil {
-		s.log.Error("sampling.create_message.err", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
+		s.log.ErrorContext(ctx, "sampling.create_message.err", slog.String("err", err.Error()))
 		return nil, ErrInternal
 	}
 
@@ -75,7 +75,7 @@ func (s *samplingCapabilty) CreateMessage(ctx context.Context, system string, us
 
 	bytes, err := json.Marshal(clientReq)
 	if err != nil {
-		s.log.Error("failed to marshal sampling create message request", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
+		s.log.ErrorContext(ctx, "failed to marshal sampling create message request", slog.String("err", err.Error()))
 		return nil, ErrInternal
 	}
 
@@ -84,7 +84,7 @@ func (s *samplingCapabilty) CreateMessage(ctx context.Context, system string, us
 	defer close()
 
 	if err := s.requestScopedWriter.WriteMessage(ctx, bytes); err != nil {
-		s.log.Error("failed to write sampling create message request", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
+		s.log.ErrorContext(ctx, "failed to write sampling create message request", slog.String("err", err.Error()))
 		return nil, ErrInternal
 	}
 
@@ -93,24 +93,24 @@ func (s *samplingCapabilty) CreateMessage(ctx context.Context, system string, us
 	case msg, ok := <-rdvCh:
 		if !ok {
 			// A notifications/cancelled message cancelled this
-			s.log.Error("sampling.create_message.err", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", "rendez-vous channel closed"))
+			s.log.ErrorContext(ctx, "sampling.create_message.err", slog.String("err", "rendez-vous channel closed"))
 			return nil, ErrCancelled
 		}
 
 		// Decode JSON-RPC response envelope first, then extract result payload
 		var resp jsonrpc.Response
 		if err := json.Unmarshal(msg, &resp); err != nil {
-			s.log.Error("sampling.create_message.unmarshal_response.fail", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
+			s.log.ErrorContext(ctx, "sampling.create_message.unmarshal_response.fail", slog.String("err", err.Error()))
 			return nil, ErrInternal
 		}
 		if resp.Error != nil {
-			s.log.Error("sampling.create_message.error", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message))
+			s.log.ErrorContext(ctx, "sampling.create_message.error", slog.Int("code", int(resp.Error.Code)), slog.String("message", resp.Error.Message))
 			return nil, ErrInternal
 		}
 
 		var res mcp.CreateMessageResult
 		if err := json.Unmarshal(resp.Result, &res); err != nil {
-			s.log.Error("sampling.create_message.result.unmarshal.fail", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", err.Error()))
+			s.log.ErrorContext(ctx, "sampling.create_message.result.unmarshal.fail", slog.String("err", err.Error()))
 			return nil, ErrInternal
 		}
 
@@ -138,7 +138,7 @@ func (s *samplingCapabilty) CreateMessage(ctx context.Context, system string, us
 		}
 		return &sessions.SampleResult{Message: sampledMsg, Model: res.Model, StopReason: res.StopReason, Meta: meta}, nil
 	case <-ctx.Done():
-		s.log.Error("sampling.create_message.err", slog.String("session_id", s.sessID), slog.String("user_id", s.userID), slog.String("err", "context done before response received"))
+		s.log.ErrorContext(ctx, "sampling.create_message.err", slog.String("err", "context done before response received"))
 		return nil, ctx.Err()
 	}
 }
