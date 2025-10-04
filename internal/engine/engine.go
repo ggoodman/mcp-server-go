@@ -875,23 +875,23 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 		Revoked:         false,
 	}
 	if err := e.host.CreateSession(ctx, metaRec); err != nil {
-		e.log.ErrorContext(ctx, "engine.create_session.fail", slog.String("session_id", sid), slog.String("user_id", userID), slog.String("err", err.Error()))
+		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{SessionID: sid, UserID: userID})
+		e.log.ErrorContext(ctx, "engine.create_session.fail", slog.String("err", err.Error()))
 		return nil, fmt.Errorf("create session: %w", err)
 	}
-	e.log.InfoContext(ctx, "engine.create_session.ok",
-		slog.String("session_id", sid),
-		slog.String("user_id", userID),
-		slog.String("protocol_version", protocolVersion),
-		slog.Bool("cap_sampling", caps.Sampling),
-		slog.Bool("cap_roots", caps.Roots),
-		slog.Bool("cap_roots_list_changed", caps.RootsListChanged),
-		slog.Bool("cap_elicitation", caps.Elicitation),
-		slog.Duration("dur", time.Since(start)),
-	)
 
-	opts := []SessionHandleOption{}
+	sess := NewSessionHandle(e.host, metaRec)
 
-	return NewSessionHandle(e.host, metaRec, opts...), nil
+	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+		SessionID:       sess.SessionID(),
+		UserID:          sess.UserID(),
+		ProtocolVersion: sess.ProtocolVersion(),
+		State:           sess.State(),
+	})
+
+	e.log.InfoContext(ctx, "engine.create_session.ok", slog.Duration("dur", time.Since(start)))
+
+	return sess, nil
 }
 
 // wireListChangedEmitters ensures that the given session has listeners
@@ -914,7 +914,6 @@ func (e *Engine) wireListChangedEmitters(ctx context.Context, sess *SessionHandl
 // notifications on the per-session client stream. It is idempotent per session.
 func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionHandle) {
 	sid := sess.SessionID()
-	uid := sess.UserID()
 
 	e.wireMu.Lock()
 	if e.wired[sid] {
@@ -932,11 +931,11 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 		note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(method)}
 		bytes, err := json.Marshal(note)
 		if err != nil {
-			e.log.ErrorContext(ctx, "engine.emitter.encode.fail", slog.String("session_id", sid), slog.String("user_id", uid), slog.String("method", string(method)), slog.String("err", err.Error()))
+			e.log.ErrorContext(ctx, "engine.emitter.encode.fail", slog.String("err", err.Error()))
 			return
 		}
 		if _, err := e.host.PublishSession(bg, sid, bytes); err != nil {
-			e.log.ErrorContext(ctx, "engine.emitter.publish.fail", slog.String("session_id", sid), slog.String("user_id", uid), slog.String("method", string(method)), slog.String("err", err.Error()))
+			e.log.ErrorContext(ctx, "engine.emitter.publish.fail", slog.String("err", err.Error()))
 		}
 	}
 
@@ -977,17 +976,17 @@ func (e *Engine) LoadSession(ctx context.Context, sessID, userID string, request
 	start := time.Now()
 	metaRec, err := e.host.GetSession(ctx, sessID)
 	if err != nil {
-		e.log.InfoContext(ctx, "engine.load_session.fail", slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("err", err.Error()))
+		e.log.InfoContext(ctx, "engine.load_session.fail", slog.String("err", err.Error()))
 		return nil, err
 	}
 	if metaRec.Revoked || metaRec.UserID == "" || metaRec.UserID != userID {
-		e.log.InfoContext(ctx, "engine.load_session.denied", slog.String("session_id", sessID), slog.String("user_id", userID))
+		e.log.InfoContext(ctx, "engine.load_session.denied")
 		return nil, sessions.ErrSessionNotFound
 	}
 	// Best-effort sliding TTL touch.
 	_ = e.host.TouchSession(ctx, sessID)
 
-	e.log.InfoContext(ctx, "engine.load_session.ok", slog.String("session_id", sessID), slog.String("user_id", userID), slog.Duration("dur", time.Since(start)))
+	e.log.InfoContext(ctx, "engine.load_session.ok", slog.Duration("dur", time.Since(start)))
 
 	opts := []SessionHandleOption{}
 
@@ -995,7 +994,7 @@ func (e *Engine) LoadSession(ctx context.Context, sessID, userID string, request
 		if metaRec.Capabilities.Sampling {
 			opts = append(opts, WithSamplingCapability(&samplingCapabilty{
 				eng:                 e,
-				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "sampling")),
+				log:                 e.log.With(slog.String("capability", "sampling")),
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,
@@ -1004,7 +1003,7 @@ func (e *Engine) LoadSession(ctx context.Context, sessID, userID string, request
 		if metaRec.Capabilities.Roots {
 			opts = append(opts, WithRootsCapability(&rootsCapability{
 				eng:                 e,
-				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "roots")),
+				log:                 e.log.With(slog.String("capability", "roots")),
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,
@@ -1013,7 +1012,7 @@ func (e *Engine) LoadSession(ctx context.Context, sessID, userID string, request
 		if metaRec.Capabilities.Elicitation {
 			opts = append(opts, WithElicitationCapability(&elicitationCapability{
 				eng:                 e,
-				log:                 e.log.With(slog.String("session_id", sessID), slog.String("user_id", userID), slog.String("capability", "elicitation")),
+				log:                 e.log.With(slog.String("capability", "elicitation")),
 				sessID:              sessID,
 				userID:              userID,
 				requestScopedWriter: requestScopedWriter,

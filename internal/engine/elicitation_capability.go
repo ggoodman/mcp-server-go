@@ -50,7 +50,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 				return sessions.ElicitActionCancel, bindErr
 			}
 		} else {
-			c.log.ErrorContext(ctx, "elicitation.subject.invalid", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+			c.log.ErrorContext(ctx, "elicitation.subject.invalid")
 			return sessions.ElicitActionCancel, sessions.ErrInvalidElicitSubject
 		}
 	}
@@ -110,7 +110,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 	select {
 	case msg, ok := <-rdvCh:
 		if !ok {
-			c.log.ErrorContext(ctx, "elicitation.create.cancelled", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+			c.log.ErrorContext(ctx, "elicitation.create.cancelled")
 			return sessions.ElicitActionCancel, ErrCancelled
 		}
 
@@ -165,7 +165,7 @@ func (c *elicitationCapability) Elicit(ctx context.Context, text string, subject
 
 		return action, nil
 	case <-ctx.Done():
-		c.log.ErrorContext(ctx, "elicitation.create.ctx.done", slog.String("session_id", c.sessID), slog.String("user_id", c.userID))
+		c.log.ErrorContext(ctx, "elicitation.create.ctx.done")
 		return sessions.ElicitActionCancel, ctx.Err()
 	}
 }
