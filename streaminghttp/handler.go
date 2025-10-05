@@ -106,7 +106,9 @@ func WithRealm(realm string) Option {
 //
 //	http.req.start  (immediately after context enrichment)
 //	http.req.end    (after downstream handler completes) with duration
-func WithVerboseRequestLogging() Option { return func(c *newConfig) { c.verboseRequests = true } }
+func WithVerboseRequestLogging(enabled bool) Option {
+	return func(c *newConfig) { c.verboseRequests = enabled }
+}
 
 // buildBearerChallenge builds a standardized Bearer challenge header value.
 // Format:
@@ -354,12 +356,16 @@ func pathOnly(u *url.URL) string {
 	return u.Path
 }
 
+var _ http.ResponseWriter = (*loggingResponseWriter)(nil)
+var _ http.Flusher = (*loggingResponseWriter)(nil)
+
 // loggingResponseWriter wraps http.ResponseWriter to capture status code,
 // bytes written and content-type for end-of-request logging. It is only
 // allocated when verbose request logging is enabled to keep the normal path
 // allocation free.
 type loggingResponseWriter struct {
 	http.ResponseWriter
+	http.Flusher
 	status      int
 	wroteHeader bool
 	bytes       int
@@ -410,7 +416,14 @@ func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	start := time.Now()
 	h.log.InfoContext(ctx, "http.req.start")
 
-	lrw := &loggingResponseWriter{ResponseWriter: w}
+	f, ok := w.(http.Flusher)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		h.log.ErrorContext(ctx, "flusher.missing")
+		return
+	}
+
+	lrw := &loggingResponseWriter{ResponseWriter: w, Flusher: f}
 	h.mux.ServeHTTP(lrw, r)
 
 	// Default values if nothing written.
