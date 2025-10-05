@@ -67,10 +67,11 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 type Option func(*newConfig)
 
 type newConfig struct {
-	serverName     string
-	logger         *slog.Logger
-	securityConfig *auth.SecurityConfig
-	realm          string
+	serverName      string
+	logger          *slog.Logger
+	securityConfig  *auth.SecurityConfig
+	realm           string
+	verboseRequests bool
 }
 
 // WithServerName sets a human-readable server name surfaced in PRM.
@@ -96,6 +97,17 @@ func WithSecurityConfig(sc auth.SecurityConfig) Option {
 // handlers.
 func WithRealm(realm string) Option {
 	return func(c *newConfig) { c.realm = strings.TrimSpace(realm) }
+}
+
+// WithVerboseRequestLogging enables leading/trailing edge logging for each HTTP
+// request that passes through the top-level StreamingHTTPHandler.ServeHTTP.
+// This is off by default to avoid log noise in high-throughput deployments.
+// When enabled, two info logs are emitted per request:
+//
+//	http.req.start  (immediately after context enrichment)
+//	http.req.end    (after downstream handler completes) with duration
+func WithVerboseRequestLogging(enabled bool) Option {
+	return func(c *newConfig) { c.verboseRequests = enabled }
 }
 
 // buildBearerChallenge builds a standardized Bearer challenge header value.
@@ -159,45 +171,52 @@ type StreamingHTTPHandler struct {
 	authServerMetadata    wellknown.AuthServerMetadata
 	authServerMetadataURL *url.URL
 
-	auth        auth.Authenticator
-	mcp         mcpservice.ServerCapabilities
-	eng         *engine.Engine
-	sessionHost sessions.SessionHost
-	realm       string
+	auth            auth.Authenticator
+	mcp             mcpservice.ServerCapabilities
+	eng             *engine.Engine
+	sessionHost     sessions.SessionHost
+	realm           string
+	verboseRequests bool
 }
 
-// lockedWriteFlusher wraps an io.Writer + http.Flusher with a mutex and an optional context.
-// It serializes concurrent writes/flushes and avoids writing after ctx is canceled.
-type lockedWriteFlusher struct {
-	io.Writer
-	http.Flusher
+type lockedSSEWriter struct {
+	w   io.Writer
+	f   http.Flusher
 	mu  sync.Mutex
 	ctx context.Context
 }
 
-func (l *lockedWriteFlusher) Write(p []byte) (int, error) {
+func (l *lockedSSEWriter) WriteMessageID(msgID string, data []byte) error {
 	if l.ctx != nil && l.ctx.Err() != nil {
-		return 0, l.ctx.Err()
+		return l.ctx.Err()
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// Re-check after acquiring the lock to minimize races with cancellation
-	if l.ctx != nil && l.ctx.Err() != nil {
-		return 0, l.ctx.Err()
-	}
-	return l.Writer.Write(p)
-}
 
-func (l *lockedWriteFlusher) Flush() {
-	if l.ctx != nil && l.ctx.Err() != nil {
-		return
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Re-check after acquiring the lock
 	if l.ctx != nil && l.ctx.Err() != nil {
-		return
+		return l.ctx.Err()
 	}
-	l.Flusher.Flush()
+
+	if msgID != "" {
+		if _, err := fmt.Fprintf(l.w, "id: %s\n", msgID); err != nil {
+			return fmt.Errorf("failed to write SSE event ID: %w", err)
+		}
+	}
+	if _, err := l.w.Write([]byte("data: ")); err != nil {
+		return fmt.Errorf("failed to write SSE data prefix: %w", err)
+	}
+	if _, err := l.w.Write(data); err != nil {
+		return fmt.Errorf("failed to write SSE payload: %w", err)
+	}
+	if _, err := l.w.Write([]byte("\n\n")); err != nil {
+		return fmt.Errorf("failed to write SSE frame terminator: %w", err)
+	}
+
+	l.f.Flush()
+
+	return nil
 }
 
 // New constructs a StreamingHTTPHandler using required formal parameters and optional settings.
@@ -253,12 +272,12 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 
 	loggerWithContextHandler := slog.New(logctx.Handler{Handler: cfg.logger.Handler()})
 
-	h := &StreamingHTTPHandler{log: loggerWithContextHandler, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm}
+	h := &StreamingHTTPHandler{log: loggerWithContextHandler, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm, verboseRequests: cfg.verboseRequests}
 
 	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
 		if err := h.eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			h.log.Error("engine.run.fail", slog.String("err", err.Error()))
+			h.log.ErrorContext(ctx, "engine.run.fail", slog.String("err", err.Error()))
 		}
 	}()
 
@@ -337,14 +356,89 @@ func pathOnly(u *url.URL) string {
 	return u.Path
 }
 
+var _ http.ResponseWriter = (*loggingResponseWriter)(nil)
+var _ http.Flusher = (*loggingResponseWriter)(nil)
+
+// loggingResponseWriter wraps http.ResponseWriter to capture status code,
+// bytes written and content-type for end-of-request logging. It is only
+// allocated when verbose request logging is enabled to keep the normal path
+// allocation free.
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	http.Flusher
+	status      int
+	wroteHeader bool
+	bytes       int
+	contentType string
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	if !lrw.wroteHeader {
+		lrw.status = code
+		lrw.wroteHeader = true
+		if ct := lrw.Header().Get("Content-Type"); ct != "" {
+			lrw.contentType = ct
+		}
+	}
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func (lrw *loggingResponseWriter) Write(p []byte) (int, error) {
+	if !lrw.wroteHeader {
+		// Implicit 200
+		lrw.WriteHeader(http.StatusOK)
+	}
+	n, err := lrw.ResponseWriter.Write(p)
+	lrw.bytes += n
+	if lrw.contentType == "" {
+		if ct := lrw.Header().Get("Content-Type"); ct != "" {
+			lrw.contentType = ct
+		}
+	}
+	return n, err
+}
+
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r.WithContext(logctx.WithRequestData(r.Context(), &logctx.RequestData{
+	ctx := logctx.WithRequestData(r.Context(), &logctx.RequestData{
 		RequestID:  uuid.NewString(),
 		Method:     r.Method,
 		UserAgent:  r.UserAgent(),
 		RemoteAddr: r.RemoteAddr,
 		Path:       r.URL.Path,
-	})))
+	})
+	r = r.WithContext(ctx)
+
+	if !h.verboseRequests {
+		h.mux.ServeHTTP(w, r)
+		return
+	}
+
+	start := time.Now()
+	h.log.InfoContext(ctx, "http.req.start")
+
+	f, ok := w.(http.Flusher)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		h.log.ErrorContext(ctx, "flusher.missing")
+		return
+	}
+
+	lrw := &loggingResponseWriter{ResponseWriter: w, Flusher: f}
+	h.mux.ServeHTTP(lrw, r)
+
+	// Default values if nothing written.
+	status := lrw.status
+	if status == 0 { // never wrote header
+		status = http.StatusOK
+	}
+	h.log.InfoContext(ctx, "http.req.end",
+		slog.Duration("dur", time.Since(start)),
+		slog.Group("resp",
+			slog.Int("status", status),
+			slog.String("content_type", lrw.contentType),
+			slog.Int("bytes", lrw.bytes),
+		),
+	)
 }
 
 // handleDeleteMCP handles the DELETE /mcp endpoint, which terminates an existing
@@ -445,7 +539,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	}
 
 	ctx = r.Context()
-	wf := &lockedWriteFlusher{Writer: w, Flusher: f, ctx: ctx}
+	wf := &lockedSSEWriter{w: w, f: f, ctx: ctx}
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
@@ -533,7 +627,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		//
 		// This is a trade-off we make to support some unfortunate wording in the MCP spec (2.1, bullet 6):
 		// https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#sending-messages-to-the-server
-		if err := writeSSEEvent(wf, "", msg); err != nil {
+		if err := wf.WriteMessageID("", msg); err != nil {
 			if _, pubErr := h.eng.PublishToSession(dwCtx, sessID, userInfo.UserID(), msg); pubErr != nil {
 				return fmt.Errorf("direct write failed: %v; fallback publish failed: %v", err, pubErr)
 			}
@@ -605,13 +699,12 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
-		wf.Flush()
+		f.Flush()
 
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
+		ctx := r.Context()
 
 		rid := req.ID.String()
-		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{mw: wf, requestID: rid})
+		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{lw: wf, requestID: rid})
 
 		res, err := h.eng.HandleRequest(ctx, sess, req)
 		if err != nil {
@@ -674,7 +767,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 
 	ctx = r.Context()
-	wf := &lockedWriteFlusher{Writer: w, Flusher: f, ctx: ctx}
+	wf := &lockedSSEWriter{w: w, f: f, ctx: ctx}
 
 	userInfo := h.checkAuthentication(ctx, r, w)
 	if userInfo == nil {
@@ -723,12 +816,12 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	wf.Flush()
+	f.Flush()
 
 	h.log.InfoContext(ctx, "sse.stream.start")
 
 	if err := h.eng.StreamSession(ctx, sess, lastEventID, func(cbCtx context.Context, msgID string, bytes []byte) error {
-		if err := writeSSEEvent(wf, msgID, bytes); err != nil {
+		if err := wf.WriteMessageID(msgID, bytes); err != nil {
 			h.log.ErrorContext(cbCtx, "sse.write.fail", slog.String("err", err.Error()))
 			return err
 		}
@@ -846,31 +939,9 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 	return userInfo
 }
 
-// writeSSEEvent writes a Server-Sent Event to the response writer with the given event type and message.
-// The message will be JSON encoded and written as the data field of the SSE event.
-// It automatically flushes the response after writing.
-func writeSSEEvent(wf *lockedWriteFlusher, msgID string, payload []byte) error {
-	if msgID != "" {
-		if _, err := fmt.Fprintf(wf, "id: %s\n", msgID); err != nil {
-			return fmt.Errorf("failed to write SSE event ID: %w", err)
-		}
-	}
-	if _, err := wf.Write([]byte("data: ")); err != nil {
-		return fmt.Errorf("failed to write SSE data prefix: %w", err)
-	}
-	if _, err := wf.Write(payload); err != nil {
-		return fmt.Errorf("failed to write SSE payload: %w", err)
-	}
-	if _, err := wf.Write([]byte("\n\n")); err != nil {
-		return fmt.Errorf("failed to write SSE frame terminator: %w", err)
-	}
-	wf.Flush()
-	return nil
-}
-
 // streamingProgressReporter emits notifications/progress for a given request over the session stream.
 type streamingProgressReporter struct {
-	mw        io.Writer
+	lw        *lockedSSEWriter
 	requestID string
 }
 
@@ -889,6 +960,6 @@ func (p streamingProgressReporter) Report(ctx context.Context, progress, total f
 	if err != nil {
 		return err
 	}
-	_, err = p.mw.Write(msg)
-	return err
+
+	return p.lw.WriteMessageID("", msg)
 }
