@@ -701,8 +701,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		w.WriteHeader(http.StatusOK)
 		f.Flush()
 
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
+		ctx := r.Context()
 
 		rid := req.ID.String()
 		ctx = mcpservice.WithProgressReporter(ctx, streamingProgressReporter{lw: wf, requestID: rid})
