@@ -67,10 +67,11 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 type Option func(*newConfig)
 
 type newConfig struct {
-	serverName     string
-	logger         *slog.Logger
-	securityConfig *auth.SecurityConfig
-	realm          string
+	serverName      string
+	logger          *slog.Logger
+	securityConfig  *auth.SecurityConfig
+	realm           string
+	verboseRequests bool
 }
 
 // WithServerName sets a human-readable server name surfaced in PRM.
@@ -97,6 +98,15 @@ func WithSecurityConfig(sc auth.SecurityConfig) Option {
 func WithRealm(realm string) Option {
 	return func(c *newConfig) { c.realm = strings.TrimSpace(realm) }
 }
+
+// WithVerboseRequestLogging enables leading/trailing edge logging for each HTTP
+// request that passes through the top-level StreamingHTTPHandler.ServeHTTP.
+// This is off by default to avoid log noise in high-throughput deployments.
+// When enabled, two info logs are emitted per request:
+//
+//	http.req.start  (immediately after context enrichment)
+//	http.req.end    (after downstream handler completes) with duration
+func WithVerboseRequestLogging() Option { return func(c *newConfig) { c.verboseRequests = true } }
 
 // buildBearerChallenge builds a standardized Bearer challenge header value.
 // Format:
@@ -159,11 +169,12 @@ type StreamingHTTPHandler struct {
 	authServerMetadata    wellknown.AuthServerMetadata
 	authServerMetadataURL *url.URL
 
-	auth        auth.Authenticator
-	mcp         mcpservice.ServerCapabilities
-	eng         *engine.Engine
-	sessionHost sessions.SessionHost
-	realm       string
+	auth            auth.Authenticator
+	mcp             mcpservice.ServerCapabilities
+	eng             *engine.Engine
+	sessionHost     sessions.SessionHost
+	realm           string
+	verboseRequests bool
 }
 
 type lockedSSEWriter struct {
@@ -259,7 +270,7 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 
 	loggerWithContextHandler := slog.New(logctx.Handler{Handler: cfg.logger.Handler()})
 
-	h := &StreamingHTTPHandler{log: loggerWithContextHandler, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm}
+	h := &StreamingHTTPHandler{log: loggerWithContextHandler, serverURL: mcpURL, auth: authenticator, mcp: server, sessionHost: host, realm: cfg.realm, verboseRequests: cfg.verboseRequests}
 
 	h.eng = engine.NewEngine(host, server, engine.WithLogger(h.log))
 	go func() {
@@ -343,14 +354,78 @@ func pathOnly(u *url.URL) string {
 	return u.Path
 }
 
+// loggingResponseWriter wraps http.ResponseWriter to capture status code,
+// bytes written and content-type for end-of-request logging. It is only
+// allocated when verbose request logging is enabled to keep the normal path
+// allocation free.
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	bytes       int
+	contentType string
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	if !lrw.wroteHeader {
+		lrw.status = code
+		lrw.wroteHeader = true
+		if ct := lrw.Header().Get("Content-Type"); ct != "" {
+			lrw.contentType = ct
+		}
+	}
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+func (lrw *loggingResponseWriter) Write(p []byte) (int, error) {
+	if !lrw.wroteHeader {
+		// Implicit 200
+		lrw.WriteHeader(http.StatusOK)
+	}
+	n, err := lrw.ResponseWriter.Write(p)
+	lrw.bytes += n
+	if lrw.contentType == "" {
+		if ct := lrw.Header().Get("Content-Type"); ct != "" {
+			lrw.contentType = ct
+		}
+	}
+	return n, err
+}
+
 func (h *StreamingHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r.WithContext(logctx.WithRequestData(r.Context(), &logctx.RequestData{
+	ctx := logctx.WithRequestData(r.Context(), &logctx.RequestData{
 		RequestID:  uuid.NewString(),
 		Method:     r.Method,
 		UserAgent:  r.UserAgent(),
 		RemoteAddr: r.RemoteAddr,
 		Path:       r.URL.Path,
-	})))
+	})
+	r = r.WithContext(ctx)
+
+	if !h.verboseRequests {
+		h.mux.ServeHTTP(w, r)
+		return
+	}
+
+	start := time.Now()
+	h.log.InfoContext(ctx, "http.req.start")
+
+	lrw := &loggingResponseWriter{ResponseWriter: w}
+	h.mux.ServeHTTP(lrw, r)
+
+	// Default values if nothing written.
+	status := lrw.status
+	if status == 0 { // never wrote header
+		status = http.StatusOK
+	}
+	h.log.InfoContext(ctx, "http.req.end",
+		slog.Duration("dur", time.Since(start)),
+		slog.Group("resp",
+			slog.Int("status", status),
+			slog.String("content_type", lrw.contentType),
+			slog.Int("bytes", lrw.bytes),
+		),
+	)
 }
 
 // handleDeleteMCP handles the DELETE /mcp endpoint, which terminates an existing

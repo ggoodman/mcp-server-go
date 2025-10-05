@@ -812,10 +812,20 @@ func (e *Engine) HandleNotification(ctx context.Context, sess *SessionHandle, no
 			m.TTL = e.sessionTTL
 			m.UpdatedAt = now
 			m.LastAccess = now
+
+			ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
+				SessionID:       sess.SessionID(),
+				UserID:          sess.UserID(),
+				ProtocolVersion: sess.ProtocolVersion(),
+				State:           m.State,
+			})
+
 			return nil
 		}); err != nil {
 			e.log.ErrorContext(ctx, "engine.handle_notification.open.fail", slog.String("err", err.Error()))
 		}
+
+		e.log.InfoContext(ctx, "engine.session.initialized")
 
 		// Note: No need to dispatch this to peers; the mutation of the session state will
 		// be observed by peers when they next load the session.
