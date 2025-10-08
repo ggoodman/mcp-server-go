@@ -264,12 +264,6 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 }
 
 func (e *Engine) HandleRequest(ctx context.Context, sess *SessionHandle, req *jsonrpc.Request) (*jsonrpc.Response, error) {
-	// Require session to be open before serving requests (except initialize, which
-	// doesn't reach here).
-	if st := sess.State(); st != "" && st != sessions.SessionStateOpen {
-		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidRequest, "session not initialized", nil), nil
-	}
-
 	switch req.Method {
 	case string(mcp.ToolsListMethod):
 		return e.handleToolsList(ctx, sess, req)
