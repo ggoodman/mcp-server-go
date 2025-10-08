@@ -338,17 +338,17 @@ func TestTools_ListAndCall(t *testing.T) {
 	}
 }
 
-// Handshake gating: requests must fail until client sends notifications/initialized.
-func TestHandshake_PendingRejectsRequests(t *testing.T) {
+// Half-open sessions: requests are now allowed (no gating InvalidRequest error) before client sends notifications/initialized.
+func TestHandshake_PreInitializedRequestsAllowed(t *testing.T) {
 	srv := mcpservice.NewServer(
 		mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()),
 	)
 	th := newHarness(t, srv)
 
-	// Initialize session
+	// Initialize session (server responds) but do NOT send notifications/initialized yet.
 	_ = th.initialize(t, "init-1", defaultInitializeRequest())
 
-	// Immediately send a ping request before initialized; expect InvalidRequest error
+	// Send a ping request before initialized; it should NOT fail with "session not initialized".
 	ping := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.PingMethod), ID: jsonrpc.NewRequestID("1")}
 	if err := th.send(ping); err != nil {
 		t.Fatal(err)
@@ -357,8 +357,8 @@ func TestHandshake_PendingRejectsRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Error == nil || res.Error.Code != jsonrpc.ErrorCodeInvalidRequest {
-		t.Fatalf("expected invalid request error before initialized, got: %+v", res.Error)
+	if res.Error != nil && res.Error.Message == "session not initialized" {
+		t.Fatalf("did not expect gating error before initialized: %+v", res.Error)
 	}
 }
 
