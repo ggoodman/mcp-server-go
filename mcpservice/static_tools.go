@@ -63,6 +63,7 @@ func NewTool[A any](name string, fn func(ctx context.Context, session sessions.S
 		Name:        name,
 		Description: cfg.description,
 		InputSchema: input,
+		Meta:        cloneMeta(cfg.meta),
 	}
 
 	handler := func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
@@ -115,6 +116,7 @@ type ToolOption func(*toolConfig)
 type toolConfig struct {
 	description               string
 	allowAdditionalProperties bool // default false (strict)
+	meta                      map[string]any
 }
 
 // WithToolDescription sets the tool description used in listings.
@@ -127,6 +129,25 @@ func WithToolDescription(desc string) ToolOption {
 // runtime decoding rejects unknown fields.
 func WithToolAllowAdditionalProperties(allow bool) ToolOption {
 	return func(c *toolConfig) { c.allowAdditionalProperties = allow }
+}
+
+// WithToolMeta attaches arbitrary metadata to the tool descriptor that will be
+// surfaced under the `_meta` field when the tool is listed. Multiple
+// invocations merge keys (later values overwrite earlier ones). A nil or empty
+// map is ignored. The map is shallow-copied at option application time so the
+// caller can mutate their original without affecting the descriptor.
+func WithToolMeta(meta map[string]any) ToolOption {
+	return func(c *toolConfig) {
+		if len(meta) == 0 {
+			return
+		}
+		if c.meta == nil {
+			c.meta = make(map[string]any, len(meta))
+		}
+		for k, v := range meta {
+			c.meta[k] = v
+		}
+	}
 }
 
 // NewTool constructs a StaticTool from a typed args struct A. It:
@@ -148,6 +169,7 @@ func NewToolWithOutput[A, O any](name string, fn func(ctx context.Context, sessi
 		Description:  cfg.description,
 		InputSchema:  input,
 		OutputSchema: &outSchema,
+		Meta:         cloneMeta(cfg.meta),
 	}
 	handler := func(ctx context.Context, session sessions.Session, req *mcp.CallToolRequestReceived) (*mcp.CallToolResult, error) {
 		var a A

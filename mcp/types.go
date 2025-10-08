@@ -120,6 +120,9 @@ type Tool struct {
 	// OutputSchema optionally declares the structure of structuredContent
 	// in CallToolResult for this tool.
 	OutputSchema *ToolOutputSchema `json:"outputSchema,omitempty"`
+	// Meta carries arbitrary metadata exposed via the `_meta` field in the MCP spec.
+	// Keys must follow the naming constraints described in the spec.
+	Meta map[string]any `json:"_meta,omitempty"`
 }
 
 // ToolInputSchema is a JSON-schema-like description of tool input.
