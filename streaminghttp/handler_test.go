@@ -468,7 +468,7 @@ func TestMultiInstance(t *testing.T) {
 		sharedHost := memoryhost.New()
 
 		// Shared static resources container across handler instances
-		sharedSR := mcpservice.NewResourcesContainer(nil, nil, nil)
+		sharedSR := mcpservice.NewResourcesContainer()
 
 		// Distinct server instances per handler: share the static resources container
 		mcpFactory := func() mcpservice.ServerCapabilities {
@@ -522,7 +522,7 @@ func TestMultiInstance(t *testing.T) {
 		defer respGet.Body.Close()
 
 		// Step 4/5: Trigger and wait (with retries) for resources list_changed
-		trigger := func() { sharedSR.ReplaceResources(context.Background(), sharedSR.SnapshotResources()) }
+		trigger := func() { sharedSR.ReplaceResources(sharedSR.SnapshotResources()) }
 		// Initial trigger before entering retry loop to preserve existing behavior
 		trigger()
 		waitForListChanged(t, t.Context(), eventsCh, trigger)

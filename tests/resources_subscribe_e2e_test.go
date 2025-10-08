@@ -30,12 +30,9 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	// Static container with a single resource; updates come from ReplaceAllContents.
-	static := mcpservice.NewResourcesContainer(
-		[]mcp.Resource{{URI: "res://x", Name: "x"}},
-		nil,
-		map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v1"}}},
-	)
+	// Static container with a single resource; updates come from UpsertResource.
+	static := mcpservice.NewResourcesContainer()
+	static.UpsertResource(mcpservice.TextResource("res://x", "v1", mcpservice.WithName("x")))
 	srvCaps := mcpservice.NewServer(
 		mcpservice.WithResourcesCapability(static),
 	)
@@ -156,8 +153,8 @@ func TestResources_SubscribeUpdated_Unsubscribe_E2E(t *testing.T) {
 		t.Fatalf("unexpected subscribe response: %s", string(respBytes))
 	}
 
-	// 4) Trigger an update via ReplaceAllContents (which marks updated on res://x)
-	static.ReplaceAllContents(ctx, map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v2"}}})
+	// 4) Trigger an update via UpsertResource (which marks updated when variants change)
+	static.UpsertResource(mcpservice.TextResource("res://x", "v2", mcpservice.WithName("x")))
 
 	// 5) Expect a notifications/resources/updated on SSE with bounded wait via helper
 	if err := waitForNotification(t.Context(), getResp.Body, string(mcp.ResourcesUpdatedNotificationMethod), 8*time.Second); err != nil {
