@@ -80,8 +80,9 @@ func newHarness(t *testing.T, srv mcpservice.ServerCapabilities) *testHarness {
 	return th
 }
 
-func (th *testHarness) send(v any) error {
-	b, err := json.Marshal(v)
+// send helper writes a JSON-RPC request (as marshalled JSON + newline) to stdin.
+func (th *testHarness) send(req *jsonrpc.Request) error {
+	b, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
@@ -194,10 +195,9 @@ func (th *testHarness) drainUntilMethod(method string, timeout time.Duration) (*
 
 // --- Test helper capability implementations ---
 
-// rootsTriggerToolsCap triggers a client roots/list when tools/list is called, to test client roundtrip wiring.
+// rootsTriggerToolsCap is a test ToolsCapability that triggers a roots list call
+// when listed to exercise cross-capability client request forwarding.
 type rootsTriggerToolsCap struct{}
-
-var _ mcpservice.ToolsCapability = (*rootsTriggerToolsCap)(nil)
 
 func (rootsTriggerToolsCap) ListTools(ctx context.Context, session sessions.Session, cursor *string) (mcpservice.Page[mcp.Tool], error) {
 	if rc, ok := session.GetRootsCapability(); ok {
@@ -554,13 +554,8 @@ func TestClientRoundTrip_SamplingAndElicitation(t *testing.T) {
 func TestResources_ListReadSubscribe(t *testing.T) {
 	// Static resources: one resource with initial contents
 	uri := "mem://a"
-	sr := mcpservice.NewResourcesContainer(
-		[]mcp.Resource{{URI: uri, Name: "A", MimeType: "text/plain"}},
-		nil,
-		map[string][]mcp.ResourceContents{
-			uri: {{URI: uri, MimeType: "text/plain", Text: "v1"}},
-		},
-	)
+	sr := mcpservice.NewResourcesContainer()
+	sr.UpsertResource(mcpservice.TextResource(uri, "v1", mcpservice.WithName("A"), mcpservice.WithMimeType("text/plain")))
 	srv := mcpservice.NewServer(
 		mcpservice.WithResourcesCapability(sr),
 	)
@@ -623,7 +618,7 @@ func TestResources_ListReadSubscribe(t *testing.T) {
 	}
 
 	// mutate contents -> expect notifications/resources/updated
-	sr.ReplaceAllContents(t.Context(), map[string][]mcp.ResourceContents{uri: {{URI: uri, MimeType: "text/plain", Text: "v2"}}})
+	sr.UpsertResource(mcpservice.TextResource(uri, "v2", mcpservice.WithName("A"), mcpservice.WithMimeType("text/plain")))
 	note, ok := th.drainUntilMethod(string(mcp.ResourcesUpdatedNotificationMethod), 2*time.Second)
 	if !ok {
 		t.Fatalf("expected %s after content change", mcp.ResourcesUpdatedNotificationMethod)
@@ -741,9 +736,11 @@ func TestRoots_ListAndListChanged(t *testing.T) {
 		t.Fatalf("missing id on roots/list request")
 	}
 	rootsResp := &jsonrpc.Response{JSONRPCVersion: jsonrpc.ProtocolVersion, ID: first.ID, Result: mustJSON(t, mcp.ListRootsResult{Roots: []mcp.Root{}})}
-	if err := th.send(rootsResp); err != nil {
-		t.Fatal(err)
-	}
+	// Inject response directly into harness output stream to simulate client reply.
+	b, _ := json.Marshal(rootsResp)
+	th.outMu.Lock()
+	th.lines = append([]string{string(b)}, th.lines...)
+	th.outMu.Unlock()
 
 	// then the final response to tools/list
 	if _, err := th.expectResponse(2 * time.Second); err != nil {

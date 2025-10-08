@@ -31,11 +31,8 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	// emits list-changed notifications on mutations (add/remove/replace), and
 	// the resources capability advertises listChanged support when a container
 	// is used—no explicit ChangeNotifier wiring required.
-	static := mcpservice.NewResourcesContainer(
-		[]mcp.Resource{{URI: "res://a", Name: "a"}},
-		nil,
-		map[string][]mcp.ResourceContents{"res://a": {{URI: "res://a", Text: "A"}}},
-	)
+	static := mcpservice.NewResourcesContainer()
+	static.UpsertResource(mcpservice.TextResource("res://a", "A", mcpservice.WithName("a")))
 	srvCaps := mcpservice.NewServer(
 		mcpservice.WithResourcesCapability(static),
 	)
@@ -106,7 +103,7 @@ func TestResources_ListChanged_E2E(t *testing.T) {
 	// 3) Give the GET handler a brief moment to subscribe and register publishers, then trigger list-changed
 	time.Sleep(150 * time.Millisecond)
 	// Trigger list-changed by mutating the static set (auto-notifies)
-	_ = static.AddResource(ctx, mcp.Resource{URI: "res://b", Name: "b"})
+	static.AddResource(mcpservice.Resource{URI: "res://b", Name: "b"})
 
 	var getResp *http.Response
 	select {

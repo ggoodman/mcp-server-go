@@ -1,462 +1,569 @@
 package mcpservice
 
+// Rewritten static resources container providing an ergonomic API similar to
+// ToolsContainer. This version intentionally decouples the public API from the
+// wire-level MCP resource content types while still implementing
+// ResourcesCapability internally for the engine/handler.
+
 import (
 	"context"
-	"fmt"
+	"encoding/base64"
+	"errors"
+	"strconv"
 	"sync"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
-// ResourcesContainer owns a mutable, threadsafe set of resources, templates,
-// and their contents. It also tracks per-session subscriptions and will prune
-// subscriptions automatically when resources are removed.
+// Resource models a static resource's metadata and its content variants. Each
+// element in Variants is mapped to a distinct mcp.ResourceContents when read.
+// A resource may have zero variants (allowing metadata-only listing) and can
+// later be Upserted with content.
+type Resource struct {
+	URI      string
+	Name     string
+	Desc     string
+	MimeType string
+	Variants []ContentVariant
+}
+
+// ContentVariant represents one textual or binary variant of a resource. Text
+// and Blob are mutually exclusive; if both are populated Text takes precedence.
+// MimeType overrides the parent Resource.MimeType when non-empty.
+type ContentVariant struct {
+	Text     string
+	Blob     []byte
+	MimeType string
+}
+
+// ResourceTemplate mirrors the MCP resource template shape while remaining
+// decoupled from the wire types.
+type ResourceTemplate struct {
+	URITemplate string
+	Name        string
+	Desc        string
+	MimeType    string
+}
+
+// Helper constructors ----------------------------------------------------------------
+
+func TextResource(uri, text string, opts ...ResourceOption) Resource {
+	r := Resource{URI: uri, Variants: []ContentVariant{TextVariant(text)}}
+	for _, opt := range opts {
+		opt(&r)
+	}
+	return r
+}
+
+func BlobResource(uri string, blob []byte, mime string, opts ...ResourceOption) Resource {
+	r := Resource{URI: uri, MimeType: mime, Variants: []ContentVariant{BlobVariant(blob, mime)}}
+	for _, opt := range opts {
+		opt(&r)
+	}
+	return r
+}
+
+func ResourceWithVariants(uri string, variants []ContentVariant, opts ...ResourceOption) Resource {
+	cp := make([]ContentVariant, len(variants))
+	copy(cp, variants)
+	r := Resource{URI: uri, Variants: cp}
+	for _, opt := range opts {
+		opt(&r)
+	}
+	return r
+}
+
+func NewTemplate(uriTemplate string, opts ...TemplateOption) ResourceTemplate {
+	t := ResourceTemplate{URITemplate: uriTemplate}
+	for _, opt := range opts {
+		opt(&t)
+	}
+	return t
+}
+
+// Variant helpers --------------------------------------------------------------------
+
+func TextVariant(text string, mime ...string) ContentVariant {
+	cv := ContentVariant{Text: text}
+	if len(mime) > 0 {
+		cv.MimeType = mime[0]
+	}
+	return cv
+}
+
+func BlobVariant(data []byte, mime string) ContentVariant {
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	return ContentVariant{Blob: cp, MimeType: mime}
+}
+
+// Options ---------------------------------------------------------------------------
+
+type ResourceOption func(*Resource)
+
+func WithName(name string) ResourceOption        { return func(r *Resource) { r.Name = name } }
+func WithDescription(desc string) ResourceOption { return func(r *Resource) { r.Desc = desc } }
+func WithMimeType(mime string) ResourceOption    { return func(r *Resource) { r.MimeType = mime } }
+func WithVariants(vs ...ContentVariant) ResourceOption {
+	return func(r *Resource) {
+		if len(vs) == 0 {
+			return
+		}
+		r.Variants = append(r.Variants, vs...)
+	}
+}
+
+type TemplateOption func(*ResourceTemplate)
+
+func WithTemplateName(name string) TemplateOption { return func(t *ResourceTemplate) { t.Name = name } }
+func WithTemplateDescription(desc string) TemplateOption {
+	return func(t *ResourceTemplate) { t.Desc = desc }
+}
+func WithTemplateMimeType(mime string) TemplateOption {
+	return func(t *ResourceTemplate) { t.MimeType = mime }
+}
+
+// Container options -----------------------------------------------------------------
+
+type ContainerOption func(*resourcesContainerConfig)
+
+type resourcesContainerConfig struct {
+	pageSize int
+}
+
+// WithPageSize sets initial pagination size. Values <1 ignored (default 50).
+func WithPageSize(n int) ContainerOption {
+	return func(c *resourcesContainerConfig) {
+		if n > 0 {
+			c.pageSize = n
+		}
+	}
+}
+
+// ResourcesContainer owns a static, in-memory collection of resources and
+// templates with subscription support and change notifications. CRUD methods
+// are synchronous and do not take contexts; capability methods (List*/Read*)
+// adapt to context-aware interfaces required by the engine.
 type ResourcesContainer struct {
 	mu sync.RWMutex
 
-	resources []mcp.Resource
-	templates []mcp.ResourceTemplate
-	contents  map[string][]mcp.ResourceContents
+	resources []Resource
+	templates []ResourceTemplate
 
-	// URI membership index for quick existence checks and diffing
-	uriSet map[string]struct{}
+	// index for fast existence checks
+	uriSet map[string]int // uri -> index in resources slice
 
-	// Subscription registry
-	subsByURI     map[string]map[string]struct{} // uri -> set(sessionID)
-	subsBySession map[string]map[string]struct{} // sessionID -> set(uri)
+	// contents per URI (derived from resources.Variants). Stored pre-translated
+	// to avoid repeated base64 work? We intentionally store logical variants
+	// and translate on Read to keep API simpler and avoid premature caching.
 
-	// notifier emits a signal when the resource list (or templates) changes.
-	notifier ChangeNotifier
+	// subscriptions
+	subsByURI     map[string]map[string]struct{}
+	subsBySession map[string]map[string]struct{}
 
-	// updatedNotifiers contains per-URI notifiers that tick when contents for a
-	// URI are updated. This is used for bridging notifications/resources/updated
-	// in transports that support subscriptions.
+	notifier         ChangeNotifier
 	updatedNotifiers map[string]*ChangeNotifier
 
-	pageSize int // pagination size (default 50)
+	pageSize int
 }
 
-// SetPageSize configures the maximum number of items returned per page when
-// listing resources or templates. Values < 1 are ignored.
-func (sr *ResourcesContainer) SetPageSize(n int) {
-	if n < 1 {
-		return
+// NewResourcesContainer constructs an empty container.
+func NewResourcesContainer(opts ...ContainerOption) *ResourcesContainer {
+	cfg := resourcesContainerConfig{pageSize: 50}
+	for _, opt := range opts {
+		opt(&cfg)
 	}
-	sr.mu.Lock()
-	sr.pageSize = n
-	sr.mu.Unlock()
-}
-
-// NewResourcesContainer constructs a ResourcesContainer with initial
-// resources, templates and contents. Slices and maps are copied so callers may
-// retain ownership of their inputs.
-func NewResourcesContainer(resources []mcp.Resource, templates []mcp.ResourceTemplate, contents map[string][]mcp.ResourceContents) *ResourcesContainer {
-	sr := &ResourcesContainer{
-		contents:         make(map[string][]mcp.ResourceContents),
-		uriSet:           make(map[string]struct{}),
+	return &ResourcesContainer{
+		uriSet:           make(map[string]int),
 		subsByURI:        make(map[string]map[string]struct{}),
 		subsBySession:    make(map[string]map[string]struct{}),
 		updatedNotifiers: make(map[string]*ChangeNotifier),
-		pageSize:         50,
+		pageSize:         cfg.pageSize,
 	}
-	sr.ReplaceResources(context.Background(), resources)
-	sr.ReplaceTemplates(context.Background(), templates)
-	sr.ReplaceAllContents(context.Background(), contents)
-	return sr
 }
 
-// ProvideResources implements ResourcesCapabilityProvider for a static container.
-// Always returns itself as present (ok=true) even if empty.
-func (sr *ResourcesContainer) ProvideResources(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error) {
-	return sr, true, nil
-}
-
-// SnapshotResources returns a copy of the current resources slice.
-func (sr *ResourcesContainer) SnapshotResources() []mcp.Resource {
-	sr.mu.RLock()
-	defer sr.mu.RUnlock()
-	out := make([]mcp.Resource, len(sr.resources))
-	copy(out, sr.resources)
-	return out
-}
-
-// SnapshotTemplates returns a copy of the current templates slice.
-func (sr *ResourcesContainer) SnapshotTemplates() []mcp.ResourceTemplate {
-	sr.mu.RLock()
-	defer sr.mu.RUnlock()
-	out := make([]mcp.ResourceTemplate, len(sr.templates))
-	copy(out, sr.templates)
-	return out
-}
-
-// ReadContents returns a copy of the contents for a URI if present.
-func (sr *ResourcesContainer) ReadContents(uri string) ([]mcp.ResourceContents, bool) {
-	sr.mu.RLock()
-	defer sr.mu.RUnlock()
-	c, ok := sr.contents[uri]
-	if !ok {
-		return nil, false
+// SetPageSize adjusts pagination size (ignored if n<1).
+func (rc *ResourcesContainer) SetPageSize(n int) {
+	if n > 0 {
+		rc.mu.Lock()
+		rc.pageSize = n
+		rc.mu.Unlock()
 	}
-	out := make([]mcp.ResourceContents, len(c))
-	copy(out, c)
-	return out, true
 }
 
-// HasResource reports whether a URI exists in the current static set.
-func (sr *ResourcesContainer) HasResource(uri string) bool {
-	sr.mu.RLock()
-	defer sr.mu.RUnlock()
-	_, ok := sr.uriSet[uri]
+// HasResource reports whether a resource URI exists.
+func (rc *ResourcesContainer) HasResource(uri string) bool {
+	rc.mu.RLock()
+	_, ok := rc.uriSet[uri]
+	rc.mu.RUnlock()
 	return ok
 }
 
-// ReplaceResources atomically replaces the static resource set.
-// It returns the list of URIs that were removed, and prunes any subscriptions to them.
-func (sr *ResourcesContainer) ReplaceResources(_ context.Context, resources []mcp.Resource) (removedURIs []string) {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
+// SnapshotResources returns a copy of current resources.
+func (rc *ResourcesContainer) SnapshotResources() []Resource {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	out := make([]Resource, len(rc.resources))
+	copy(out, rc.resources)
+	return out
+}
 
-	// Build new uri set
-	newURIs := make(map[string]struct{}, len(resources))
-	for _, r := range resources {
-		newURIs[r.URI] = struct{}{}
+// SnapshotTemplates returns a copy of current templates.
+func (rc *ResourcesContainer) SnapshotTemplates() []ResourceTemplate {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	out := make([]ResourceTemplate, len(rc.templates))
+	copy(out, rc.templates)
+	return out
+}
+
+// Read returns a defensive copy of the resource's content variants.
+func (rc *ResourcesContainer) Read(uri string) ([]ContentVariant, bool) {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	idx, ok := rc.uriSet[uri]
+	if !ok {
+		return nil, false
 	}
+	res := rc.resources[idx]
+	out := make([]ContentVariant, len(res.Variants))
+	copy(out, res.Variants)
+	return out, true
+}
 
-	// Compute removed URIs
-	for uri := range sr.uriSet {
-		if _, ok := newURIs[uri]; !ok {
-			removedURIs = append(removedURIs, uri)
+// AddResource adds a new resource; returns true if newly added.
+func (rc *ResourcesContainer) AddResource(r Resource) bool {
+	if r.URI == "" {
+		return false
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if _, exists := rc.uriSet[r.URI]; exists {
+		return false
+	}
+	rc.resources = append(rc.resources, normalizeResource(r))
+	rc.uriSet[r.URI] = len(rc.resources) - 1
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
+	return true
+}
+
+// UpsertResource inserts or updates a resource. Returns true if created.
+// Emits listChanged if created or metadata (Name/Desc/MimeType) changed.
+// Emits per-URI updated only if variants changed.
+func (rc *ResourcesContainer) UpsertResource(r Resource) (created bool) {
+	if r.URI == "" {
+		return false
+	}
+	nr := normalizeResource(r)
+	rc.mu.Lock()
+	if idx, ok := rc.uriSet[nr.URI]; ok {
+		prev := rc.resources[idx]
+		metaChanged := prev.Name != nr.Name || prev.Desc != nr.Desc || prev.MimeType != nr.MimeType
+		variantsChanged := !equalVariants(prev.Variants, nr.Variants)
+		rc.resources[idx] = nr
+		rc.mu.Unlock()
+		if metaChanged {
+			go func() { _ = rc.notifier.Notify(context.Background()) }()
+		}
+		if variantsChanged {
+			rc.markUpdated(nr.URI)
+		}
+		return false
+	}
+	rc.resources = append(rc.resources, nr)
+	rc.uriSet[nr.URI] = len(rc.resources) - 1
+	rc.mu.Unlock()
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
+	if len(nr.Variants) > 0 {
+		rc.markUpdated(nr.URI)
+	}
+	return true
+}
+
+// RemoveResource removes a resource by URI.
+func (rc *ResourcesContainer) RemoveResource(uri string) bool {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	idx, ok := rc.uriSet[uri]
+	if !ok {
+		return false
+	}
+	// remove without preserving order (swap delete)
+	last := len(rc.resources) - 1
+	rc.resources[idx] = rc.resources[last]
+	rc.uriSet[rc.resources[idx].URI] = idx
+	rc.resources = rc.resources[:last]
+	delete(rc.uriSet, uri)
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
+	return true
+}
+
+// ReplaceResources atomically replaces the entire resource set. Returns URIs removed.
+func (rc *ResourcesContainer) ReplaceResources(resources []Resource) (removed []string) {
+	nr := make([]Resource, 0, len(resources))
+	uriSet := make(map[string]int, len(resources))
+	for _, r := range resources {
+		if r.URI != "" {
+			nr = append(nr, normalizeResource(r))
 		}
 	}
-
-	// Replace data
-	sr.resources = make([]mcp.Resource, len(resources))
-	copy(sr.resources, resources)
-	sr.uriSet = newURIs
-
-	// Prune subscriptions to removed URIs
-	for _, uri := range removedURIs {
-		sr.unsubscribeAllForURILocked(uri)
+	// Build new index
+	for i, r := range nr {
+		uriSet[r.URI] = i
 	}
-	// Signal list-changed (best effort)
-	go func() { _ = sr.notifier.Notify(context.Background()) }()
-	return removedURIs
+
+	rc.mu.Lock()
+	// Compute removed
+	for uri := range rc.uriSet {
+		if _, ok := uriSet[uri]; !ok {
+			removed = append(removed, uri)
+		}
+	}
+	rc.resources = nr
+	rc.uriSet = uriSet
+	// clear per-URI notifiers for removed URIs
+	for _, uri := range removed {
+		delete(rc.updatedNotifiers, uri)
+	}
+	rc.mu.Unlock()
+	// Always signal listChanged even if no structural diff so callers can
+	// force a refresh (parity with tools container + test expectations).
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
+	// mark all updated (conservative) – could diff but simplicity wins
+	for _, r := range nr {
+		if len(r.Variants) > 0 {
+			rc.markUpdated(r.URI)
+		}
+	}
+	return removed
+}
+
+// Template CRUD ---------------------------------------------------------------------
+
+// AddTemplate adds a template; returns true if new.
+func (rc *ResourcesContainer) AddTemplate(t ResourceTemplate) bool {
+	if t.URITemplate == "" {
+		return false
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	for _, existing := range rc.templates {
+		if existing.URITemplate == t.URITemplate {
+			return false
+		}
+	}
+	rc.templates = append(rc.templates, t)
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
+	return true
+}
+
+// RemoveTemplate removes a template by uriTemplate.
+func (rc *ResourcesContainer) RemoveTemplate(uriTemplate string) bool {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	n := 0
+	removed := false
+	for _, t := range rc.templates {
+		if t.URITemplate == uriTemplate {
+			removed = true
+			continue
+		}
+		rc.templates[n] = t
+		n++
+	}
+	if !removed {
+		return false
+	}
+	rc.templates = rc.templates[:n]
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
+	return true
 }
 
 // ReplaceTemplates atomically replaces templates.
-func (sr *ResourcesContainer) ReplaceTemplates(_ context.Context, templates []mcp.ResourceTemplate) {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-	sr.templates = make([]mcp.ResourceTemplate, len(templates))
-	copy(sr.templates, templates)
-	// Signal list-changed (best effort)
-	go func() { _ = sr.notifier.Notify(context.Background()) }()
+func (rc *ResourcesContainer) ReplaceTemplates(ts []ResourceTemplate) {
+	cp := make([]ResourceTemplate, len(ts))
+	copy(cp, ts)
+	rc.mu.Lock()
+	rc.templates = cp
+	rc.mu.Unlock()
+	go func() { _ = rc.notifier.Notify(context.Background()) }()
 }
 
-// ReplaceAllContents atomically replaces contents.
-func (sr *ResourcesContainer) ReplaceAllContents(_ context.Context, contents map[string][]mcp.ResourceContents) {
-	sr.mu.Lock()
-	// Track which URIs were updated so we can signal after releasing the lock.
-	var updatedURIs []string
-	if contents == nil {
-		sr.contents = make(map[string][]mcp.ResourceContents)
-		// Nothing to signal
-		sr.mu.Unlock()
-		return
+// Event source accessors (engine-owned subscription lifecycle) ----------------------
+
+// ListChangedChan returns a channel signaled when resources/templates set changes.
+func (rc *ResourcesContainer) ListChangedChan() <-chan struct{} { return rc.notifier.Subscriber() }
+
+// UpdatedChan returns a channel signaled when URI content/metadata changes.
+func (rc *ResourcesContainer) UpdatedChan(uri string) <-chan struct{} {
+	rc.mu.Lock()
+	nt := rc.updatedNotifiers[uri]
+	if nt == nil {
+		nt = &ChangeNotifier{}
+		rc.updatedNotifiers[uri] = nt
 	}
-	sr.contents = make(map[string][]mcp.ResourceContents, len(contents))
-	for k, v := range contents {
-		vv := make([]mcp.ResourceContents, len(v))
-		copy(vv, v)
-		sr.contents[k] = vv
-		updatedURIs = append(updatedURIs, k)
-	}
-	sr.mu.Unlock()
-	// Best-effort: notify per-URI updated after contents replaced.
-	for _, uri := range updatedURIs {
-		sr.markUpdated(uri)
+	rc.mu.Unlock()
+	return nt.Subscriber()
+}
+
+func (rc *ResourcesContainer) markUpdated(uri string) {
+	rc.mu.RLock()
+	nt := rc.updatedNotifiers[uri]
+	rc.mu.RUnlock()
+	if nt != nil {
+		_ = nt.Notify(context.Background())
 	}
 }
 
-// AddResource adds a resource; returns true if newly added.
-func (sr *ResourcesContainer) AddResource(_ context.Context, res mcp.Resource) bool {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-	if _, exists := sr.uriSet[res.URI]; exists {
+// internal helpers ------------------------------------------------------------------
+
+func normalizeResource(r Resource) Resource {
+	// Defensive deep copy of variants & blob slices
+	if len(r.Variants) > 0 {
+		vs := make([]ContentVariant, len(r.Variants))
+		for i, v := range r.Variants {
+			if len(v.Blob) > 0 {
+				cp := make([]byte, len(v.Blob))
+				copy(cp, v.Blob)
+				v.Blob = cp
+			}
+			vs[i] = v
+		}
+		r.Variants = vs
+	}
+	return r
+}
+
+func equalVariants(a, b []ContentVariant) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	sr.resources = append(sr.resources, res)
-	if sr.uriSet == nil {
-		sr.uriSet = make(map[string]struct{})
+	for i := range a {
+		av, bv := a[i], b[i]
+		if av.Text != bv.Text || av.MimeType != bv.MimeType {
+			return false
+		}
+		if len(av.Blob) != len(bv.Blob) {
+			return false
+		}
+		for j := range av.Blob {
+			if av.Blob[j] != bv.Blob[j] {
+				return false
+			}
+		}
 	}
-	sr.uriSet[res.URI] = struct{}{}
-	// Signal list-changed (best effort)
-	go func() { _ = sr.notifier.Notify(context.Background()) }()
 	return true
 }
 
-// RemoveResource removes a resource by URI; returns true if removed.
-// Any subscriptions for this URI are pruned.
-func (sr *ResourcesContainer) RemoveResource(_ context.Context, uri string) bool {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-	if _, exists := sr.uriSet[uri]; !exists {
-		return false
+// unsubscribeLocked assumes write lock held.
+// (legacy subscription helper functions removed; engine owns subscription lifecycle)
+
+// --- ResourcesCapability implementation -------------------------------------------
+
+// ProvideResources implements ResourcesCapabilityProvider (self-providing static capability).
+func (rc *ResourcesContainer) ProvideResources(ctx context.Context, session sessions.Session) (ResourcesCapability, bool, error) {
+	if rc == nil {
+		return nil, false, nil
 	}
-	// remove from slice (order not preserved strictly; stable remove if needed later)
-	n := 0
-	for _, r := range sr.resources {
-		if r.URI != uri {
-			sr.resources[n] = r
-			n++
-		}
-	}
-	sr.resources = sr.resources[:n]
-	delete(sr.uriSet, uri)
-	sr.unsubscribeAllForURILocked(uri)
-	// Signal list-changed (best effort)
-	go func() { _ = sr.notifier.Notify(context.Background()) }()
-	return true
+	return rc, true, nil
 }
 
-// Subscribe adds a subscription mapping; returns true if newly added.
-func (sr *ResourcesContainer) Subscribe(_ context.Context, sessionID string, uri string) bool {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-	if _, ok := sr.uriSet[uri]; !ok {
-		return false
-	}
-	if _, ok := sr.subsByURI[uri]; !ok {
-		sr.subsByURI[uri] = make(map[string]struct{})
-	}
-	if _, ok := sr.subsBySession[sessionID]; !ok {
-		sr.subsBySession[sessionID] = make(map[string]struct{})
-	}
-	_, existed := sr.subsByURI[uri][sessionID]
-	sr.subsByURI[uri][sessionID] = struct{}{}
-	sr.subsBySession[sessionID][uri] = struct{}{}
-	return !existed
-}
-
-// Unsubscribe removes a subscription mapping; returns true if removed.
-func (sr *ResourcesContainer) Unsubscribe(_ context.Context, sessionID string, uri string) bool {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-	return sr.unsubscribeLocked(sessionID, uri)
-}
-
-func (sr *ResourcesContainer) unsubscribeLocked(sessionID string, uri string) bool {
-	changed := false
-	if m, ok := sr.subsByURI[uri]; ok {
-		if _, ok := m[sessionID]; ok {
-			delete(m, sessionID)
-			changed = true
-			if len(m) == 0 {
-				delete(sr.subsByURI, uri)
-			}
-		}
-	}
-	if m, ok := sr.subsBySession[sessionID]; ok {
-		if _, ok := m[uri]; ok {
-			delete(m, uri)
-			if len(m) == 0 {
-				delete(sr.subsBySession, sessionID)
-			}
-		}
-	}
-	return changed
-}
-
-// UnsubscribeAllForSession removes all subscriptions for a sessionID.
-func (sr *ResourcesContainer) UnsubscribeAllForSession(_ context.Context, sessionID string) {
-	sr.mu.Lock()
-	defer sr.mu.Unlock()
-	uris := sr.listURIsForSessionLocked(sessionID)
-	for _, uri := range uris {
-		sr.unsubscribeLocked(sessionID, uri)
-	}
-}
-
-// ListSessionsForURI returns the set of sessionIDs subscribed to a URI.
-func (sr *ResourcesContainer) ListSessionsForURI(_ context.Context, uri string) []string {
-	sr.mu.RLock()
-	defer sr.mu.RUnlock()
-	sessions := sr.subsByURI[uri]
-	if len(sessions) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(sessions))
-	for sid := range sessions {
-		out = append(out, sid)
-	}
-	return out
-}
-
-// Subscriber implements ChangeSubscriber by returning a channel that
-// receives a signal whenever the resource list or templates change.
-func (sr *ResourcesContainer) Subscriber() <-chan struct{} {
-	return sr.notifier.Subscriber()
-}
-
-// SubscriberForURI returns a channel that receives a tick each time the
-// specific URI's contents are updated via ReplaceAllContents (or other future
-// content mutation paths). The channel is closed when the notifier is GC'd.
-func (sr *ResourcesContainer) SubscriberForURI(uri string) <-chan struct{} {
-	sr.mu.Lock()
-	if sr.updatedNotifiers == nil {
-		sr.updatedNotifiers = make(map[string]*ChangeNotifier)
-	}
-	n := sr.updatedNotifiers[uri]
-	if n == nil {
-		n = &ChangeNotifier{}
-		sr.updatedNotifiers[uri] = n
-	}
-	sr.mu.Unlock()
-	return n.Subscriber()
-}
-
-// markUpdated triggers a best-effort tick on the per-URI notifier, if any.
-func (sr *ResourcesContainer) markUpdated(uri string) {
-	sr.mu.RLock()
-	n := sr.updatedNotifiers[uri]
-	sr.mu.RUnlock()
-	if n == nil {
-		// Lazily create to ensure future subscribers see notifications.
-		sr.mu.Lock()
-		if sr.updatedNotifiers == nil {
-			sr.updatedNotifiers = make(map[string]*ChangeNotifier)
-		}
-		if sr.updatedNotifiers[uri] == nil {
-			sr.updatedNotifiers[uri] = &ChangeNotifier{}
-		}
-		n = sr.updatedNotifiers[uri]
-		sr.mu.Unlock()
-	}
-	// Best-effort notify without holding locks.
-	_ = n.Notify(context.Background())
-}
-
-func (sr *ResourcesContainer) listURIsForSessionLocked(sessionID string) []string {
-	m := sr.subsBySession[sessionID]
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(m))
-	for uri := range m {
-		out = append(out, uri)
-	}
-	return out
-}
-
-func (sr *ResourcesContainer) unsubscribeAllForURILocked(uri string) {
-	if sessions := sr.subsByURI[uri]; len(sessions) > 0 {
-		for sid := range sessions {
-			sr.unsubscribeLocked(sid, uri)
-		}
-	}
-}
-
-// --- ResourcesCapability implementation (static mode) ---
-
-// ListResources implements ResourcesCapability.
-func (sr *ResourcesContainer) ListResources(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Resource], error) {
-	sr.mu.RLock()
-	all := make([]mcp.Resource, len(sr.resources))
-	copy(all, sr.resources)
-	pageSize := sr.pageSize
-	sr.mu.RUnlock()
+// ListResources paginates over static resources.
+func (rc *ResourcesContainer) ListResources(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.Resource], error) {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
 	start := parseCursor(cursor)
-	if start < 0 || start > len(all) {
-		start = 0
+	if start >= len(rc.resources) {
+		return NewPage[mcp.Resource](nil), nil
 	}
-	end := start + pageSize
-	if end > len(all) {
-		end = len(all)
+	end := start + rc.pageSize
+	if end > len(rc.resources) {
+		end = len(rc.resources)
 	}
-	items := make([]mcp.Resource, end-start)
-	copy(items, all[start:end])
-	if end < len(all) {
-		return NewPage(items, WithNextCursor[mcp.Resource](fmt.Sprintf("%d", end))), nil
+	slice := rc.resources[start:end]
+	out := make([]mcp.Resource, 0, len(slice))
+	for _, r := range slice {
+		out = append(out, mcp.Resource{URI: r.URI, Name: r.Name, Description: r.Desc, MimeType: r.MimeType})
 	}
-	return NewPage(items), nil
+	page := NewPage(out)
+	if end < len(rc.resources) {
+		page.NextCursor = ptr(stringifyInt(end))
+	}
+	return page, nil
 }
 
-// ListResourceTemplates implements ResourcesCapability.
-func (sr *ResourcesContainer) ListResourceTemplates(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.ResourceTemplate], error) {
-	sr.mu.RLock()
-	all := make([]mcp.ResourceTemplate, len(sr.templates))
-	copy(all, sr.templates)
-	pageSize := sr.pageSize
-	sr.mu.RUnlock()
+// ListResourceTemplates paginates over templates.
+func (rc *ResourcesContainer) ListResourceTemplates(ctx context.Context, session sessions.Session, cursor *string) (Page[mcp.ResourceTemplate], error) {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
 	start := parseCursor(cursor)
-	if start < 0 || start > len(all) {
-		start = 0
+	if start >= len(rc.templates) {
+		return NewPage[mcp.ResourceTemplate](nil), nil
 	}
-	end := start + pageSize
-	if end > len(all) {
-		end = len(all)
+	end := start + rc.pageSize
+	if end > len(rc.templates) {
+		end = len(rc.templates)
 	}
-	items := make([]mcp.ResourceTemplate, end-start)
-	copy(items, all[start:end])
-	if end < len(all) {
-		return NewPage(items, WithNextCursor[mcp.ResourceTemplate](fmt.Sprintf("%d", end))), nil
+	slice := rc.templates[start:end]
+	out := make([]mcp.ResourceTemplate, 0, len(slice))
+	for _, t := range slice {
+		out = append(out, mcp.ResourceTemplate{URITemplate: t.URITemplate, Name: t.Name, Description: t.Desc, MimeType: t.MimeType})
 	}
-	return NewPage(items), nil
+	page := NewPage(out)
+	if end < len(rc.templates) {
+		page.NextCursor = ptr(stringifyInt(end))
+	}
+	return page, nil
 }
 
-// ReadResource implements ResourcesCapability.
-func (sr *ResourcesContainer) ReadResource(ctx context.Context, session sessions.Session, uri string) ([]mcp.ResourceContents, error) {
-	if c, ok := sr.ReadContents(uri); ok {
-		return c, nil
+// ReadResource returns contents variants for a URI translated to wire types.
+func (rc *ResourcesContainer) ReadResource(ctx context.Context, session sessions.Session, uri string) ([]mcp.ResourceContents, error) {
+	vs, ok := rc.Read(uri)
+	if !ok {
+		return nil, errors.New("resource not found: " + uri)
 	}
-	return nil, fmt.Errorf("resource not found: %s", uri)
-}
-
-// GetSubscriptionCapability implements ResourcesCapability.
-func (sr *ResourcesContainer) GetSubscriptionCapability(ctx context.Context, session sessions.Session) (ResourceSubscriptionCapability, bool, error) {
-	return resourceSubscriptionFromContainer{sr: sr}, true, nil
-}
-
-// GetListChangedCapability implements ResourcesCapability.
-func (sr *ResourcesContainer) GetListChangedCapability(ctx context.Context, session sessions.Session) (ResourceListChangedCapability, bool, error) {
-	return resourceListChangedFromSubscriber{sub: sr}, true, nil
-}
-
-// resourceSubscriptionFromContainer adapts ResourcesContainer to ResourceSubscriptionCapability.
-type resourceSubscriptionFromContainer struct{ sr *ResourcesContainer }
-
-func (r resourceSubscriptionFromContainer) Subscribe(ctx context.Context, session sessions.Session, uri string, emit NotifyResourceUpdatedFunc) (CancelSubscription, error) {
-	if r.sr == nil {
-		return func(context.Context) error { return nil }, nil
+	rc.mu.RLock()
+	mimeDefault := rc.resources[rc.uriSet[uri]].MimeType
+	rc.mu.RUnlock()
+	out := make([]mcp.ResourceContents, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, variantToWire(uri, v, mimeDefault))
 	}
-	if !r.sr.HasResource(uri) {
-		return nil, fmt.Errorf("resource not found: %s", uri)
-	}
-	sid := session.SessionID()
-	_ = r.sr.Subscribe(ctx, sid, uri)
-	fwdCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
-	ch := r.sr.SubscriberForURI(uri)
-	go func() {
-		for {
-			select {
-			case <-fwdCtx.Done():
-				return
-			case _, ok := <-ch:
-				if !ok {
-					return
-				}
-				select {
-				case <-fwdCtx.Done():
-					return
-				default:
-				}
-				if emit != nil {
-					emit(context.WithoutCancel(fwdCtx), uri)
-				}
-			}
-		}
-	}()
-	cancel := func(ctx context.Context) error { stop(); _ = r.sr.Unsubscribe(ctx, sid, uri); return nil }
-	return cancel, nil
+	return out, nil
 }
+
+// GetSubscriptionCapability intentionally returns (nil,false); engine synthesizes
+// subscription support using UpdatedChan & ListChangedChan when it detects this
+// container type (avoids duplicate subscription state across layers).
+func (rc *ResourcesContainer) GetSubscriptionCapability(ctx context.Context, session sessions.Session) (ResourceSubscriptionCapability, bool, error) {
+	return nil, false, nil
+}
+
+// GetListChangedCapability wires list changed notifications via the container's notifier.
+func (rc *ResourcesContainer) GetListChangedCapability(ctx context.Context, session sessions.Session) (ResourceListChangedCapability, bool, error) {
+	return resourceListChangedFromSubscriber{sub: &rc.notifier}, true, nil
+}
+
+// variantToWire converts a ContentVariant into an mcp.ResourceContents.
+func variantToWire(uri string, v ContentVariant, mimeDefault string) mcp.ResourceContents {
+	mime := v.MimeType
+	if mime == "" {
+		mime = mimeDefault
+	}
+	if v.Text != "" {
+		return mcp.ResourceContents{URI: uri, MimeType: mime, Text: v.Text}
+	}
+	if len(v.Blob) > 0 {
+		return mcp.ResourceContents{URI: uri, MimeType: mime, Blob: base64.StdEncoding.EncodeToString(v.Blob)}
+	}
+	// empty variant => empty text content
+	return mcp.ResourceContents{URI: uri, MimeType: mime}
+}
+
+// Utility helpers -------------------------------------------------------------------
+
+func stringifyInt(n int) string { return strconv.Itoa(n) }
+
+// ptr helper (avoid redefining in multiple files); could be consolidated if already present elsewhere.
+func ptr[T any](v T) *T { return &v }

@@ -41,11 +41,8 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	defer h.Close()
 
 	// Shared ResourcesContainer backing on handler A
-	static := mcpservice.NewResourcesContainer(
-		[]mcp.Resource{{URI: "res://x", Name: "x"}},
-		nil,
-		map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v1"}}},
-	)
+	static := mcpservice.NewResourcesContainer()
+	static.UpsertResource(mcpservice.TextResource("res://x", "v1", mcpservice.WithName("x")))
 	srvCapsA := mcpservice.NewServer(
 		mcpservice.WithResourcesCapability(static),
 	)
@@ -194,7 +191,7 @@ func TestResources_SubscribeUpdated_MultiNode_UnsubscribeFanout(t *testing.T) {
 	}()
 
 	// Trigger update on A and expect resources/updated on B within a reasonable bound
-	static.ReplaceAllContents(ctx, map[string][]mcp.ResourceContents{"res://x": {{URI: "res://x", Text: "v2"}}})
+	static.UpsertResource(mcpservice.TextResource("res://x", "v2", mcpservice.WithName("x")))
 	{
 		timeout := time.NewTimer(2 * time.Second)
 		defer timeout.Stop()

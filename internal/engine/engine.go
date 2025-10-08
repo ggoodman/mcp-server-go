@@ -68,6 +68,19 @@ type Engine struct {
 	subCancels map[string]map[string]mcpservice.CancelSubscription
 }
 
+// resourceEventSource is a narrow internal interface implemented by static
+// resource containers (e.g. ResourcesContainer) which expose only event
+// channels (UpdatedChan + ListChangedChan). The container does NOT manage
+// per-session subscription state or goroutines; the engine synthesizes the
+// ResourceSubscriptionCapability by attaching its own forwarder goroutines to
+// these channels. This avoids duplicate bookkeeping layer (container + engine)
+// and centralizes lifecycle (unsubscribe, session teardown, fanout) inside the
+// engine.
+type resourceEventSource interface {
+	UpdatedChan(uri string) <-chan struct{}
+	ListChangedChan() <-chan struct{}
+}
+
 func NewEngine(host sessions.SessionHost, srv mcpservice.ServerCapabilities, opts ...EngineOption) *Engine {
 	e := &Engine{
 		host:               host,
@@ -205,9 +218,12 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 			ListChanged bool `json:"listChanged"`
 			Subscribe   bool `json:"subscribe"`
 		}{}
+		// Prefer explicit subscription capability; otherwise infer from event source.
 		if subCap, hasSub, subErr := resCap.GetSubscriptionCapability(ctx, sess); subErr != nil {
 			return nil, nil, fmt.Errorf("get resources subscription capability: %w", subErr)
 		} else if hasSub && subCap != nil {
+			entry.Subscribe = true
+		} else if _, ok := resCap.(resourceEventSource); ok {
 			entry.Subscribe = true
 		}
 		if lcCap, hasLC, lcErr := resCap.GetListChangedCapability(ctx, sess); lcErr != nil {
@@ -347,14 +363,26 @@ func (e *Engine) handleResourcesSubscribe(ctx context.Context, sess *SessionHand
 		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
 		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "resources capability not supported", nil), nil
 	}
-	subCap, hasSub, err := resCap.GetSubscriptionCapability(ctx, sess)
-	if err != nil {
-		log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
-		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
-	}
-	if !hasSub || subCap == nil {
-		log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
-		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "subscriptions not supported", nil), nil
+	// Determine subscribe support via either provider capability or internal event source.
+	var (
+		useEventSource bool
+		evSrc          resourceEventSource
+		subCap         mcpservice.ResourceSubscriptionCapability
+	)
+	if rs, ok := resCap.(resourceEventSource); ok {
+		useEventSource = true
+		evSrc = rs
+	} else {
+		sc, hasSub, err := resCap.GetSubscriptionCapability(ctx, sess)
+		if err != nil {
+			log.ErrorContext(ctx, "engine.handle_request.fail", slog.String("err", err.Error()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil), nil
+		}
+		if !hasSub || sc == nil {
+			log.InfoContext(ctx, "engine.handle_request.unsupported", slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeMethodNotFound, "subscriptions not supported", nil), nil
+		}
+		subCap = sc
 	}
 
 	// Idempotency: if already subscribed, succeed.
@@ -388,11 +416,33 @@ func (e *Engine) handleResourcesSubscribe(ctx context.Context, sess *SessionHand
 		}
 	}
 
-	cancel, err := subCap.Subscribe(ctx, sess, params.URI, emit)
-	if err != nil {
-		// Treat not found or validation as InvalidParams if detectable; otherwise internal error.
-		log.InfoContext(ctx, "engine.handle_request.subscribe.fail", slog.String("err", err.Error()))
-		return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+	var cancel mcpservice.CancelSubscription
+	if useEventSource {
+		// Synthesize subscription: attach to UpdatedChan and forward events until canceled.
+		ch := evSrc.UpdatedChan(params.URI)
+		base := context.WithoutCancel(ctx)
+		fwdCtx, fwdCancel := context.WithCancel(base)
+		cancel = func(_ context.Context) error { fwdCancel(); return nil }
+		go func() {
+			for {
+				select {
+				case <-fwdCtx.Done():
+					return
+				case _, ok := <-ch:
+					if !ok {
+						return
+					}
+					emit(fwdCtx, params.URI)
+				}
+			}
+		}()
+	} else {
+		c, err := subCap.Subscribe(ctx, sess, params.URI, emit)
+		if err != nil {
+			log.InfoContext(ctx, "engine.handle_request.subscribe.fail", slog.String("err", err.Error()))
+			return jsonrpc.NewErrorResponse(req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", nil), nil
+		}
+		cancel = c
 	}
 
 	e.subMu.Lock()
@@ -947,7 +997,19 @@ func (e *Engine) registerListChangedEmitters(ctx context.Context, sess *SessionH
 	if resCap, ok, err := e.srv.GetResourcesCapability(bg, sess); err == nil && ok && resCap != nil {
 		if lc, hasLC, lErr := resCap.GetListChangedCapability(bg, sess); lErr == nil && hasLC && lc != nil {
 			_, _ = lc.Register(bg, sess, func(cbCtx context.Context, s sessions.Session, uri string) {
-				publishNote(mcp.ResourcesListChangedNotificationMethod)
+				// Build JSON-RPC notification
+				note := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.ResourcesListChangedNotificationMethod)}
+				bytes, err := json.Marshal(note)
+				if err != nil {
+					return
+				}
+				// Local publish (origin instance)
+				_, _ = e.host.PublishSession(context.WithoutCancel(cbCtx), sid, bytes)
+				// Cross-node fanout (best-effort)
+				outer := fanoutMessage{SessionID: sid, UserID: s.UserID(), Msg: bytes}
+				if payload, err := json.Marshal(outer); err == nil {
+					_ = e.host.PublishEvent(context.WithoutCancel(cbCtx), sessionFanoutTopic, payload)
+				}
 			})
 		}
 	}
@@ -1142,6 +1204,15 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 				}
 			}
 			e.subMu.Unlock()
+			return nil
+		case string(mcp.ResourcesListChangedNotificationMethod):
+			// Fanout of listChanged notification from another instance: publish full note to client.
+			bytes, err := json.Marshal(req)
+			if err == nil {
+				if _, perr := e.host.PublishSession(context.WithoutCancel(ctx), fanout.SessionID, bytes); perr != nil {
+					e.log.ErrorContext(ctx, "engine.handle_session_event.publish_fail", slog.String("err", perr.Error()))
+				}
+			}
 			return nil
 		default:
 			// Unknown request; ignore.
