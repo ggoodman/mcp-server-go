@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/internal/jwtauth"
@@ -62,6 +63,27 @@ func WithExtraAudience(aud string) AccessTokenAuthOption {
 	}
 }
 
+// WithScopeHint configures an optional set of scopes that will be echoed back
+// to clients via the WWW-Authenticate "scope" parameter when the transport
+// constructs Bearer challenges (for example on insufficient_scope errors).
+//
+// These hint scopes are advisory only: they do not affect token validation
+// (which remains governed by RequiredScopes/ScopeModeAny) but give generic MCP
+// clients a concrete scope set to request during authorization. The list is
+// copied so callers may reuse their slice safely.
+func WithScopeHint(scopes ...string) AccessTokenAuthOption {
+	return func(c *jwtauth.Config) {
+		// Normalize by trimming empties and storing a defensive copy.
+		filtered := scopes[:0]
+		for _, s := range scopes {
+			if s = strings.TrimSpace(s); s != "" {
+				filtered = append(filtered, s)
+			}
+		}
+		c.HintScopes = append([]string(nil), filtered...)
+	}
+}
+
 // NewFromDiscovery returns an Authenticator that verifies RFC 9068 JWT access
 // tokens discovered via OpenID Connect discovery (jwks_uri, issuer, etc.).
 //
@@ -103,6 +125,7 @@ func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts 
 		EnforceExp:  true,
 		EnforceNbf:  true,
 		Advertise:   true,
+		HintScopes:  append([]string(nil), cfg.HintScopes...),
 	}
 	// Populate advertisement-only OIDC metadata if discovery yielded endpoints.
 	// Attempt to extract extended discovery metadata via a private interface.

@@ -28,6 +28,11 @@ type SecurityConfig struct {
 	AllowedAlgs []string // default: ["RS256"] if empty
 	JWKSURL     string   // optional override / filled by discovery
 
+	// HintScopes carries an optional set of scopes that transports may echo in
+	// WWW-Authenticate "scope" parameters when constructing Bearer challenges.
+	// Advisory only: does not affect token validation.
+	HintScopes []string
+
 	Leeway     time.Duration // clock skew tolerance (default 60s)
 	EnforceExp bool          // default true
 	EnforceNbf bool          // default true
@@ -98,6 +103,7 @@ func (c SecurityConfig) Copy() SecurityConfig {
 	dup := c
 	dup.Audiences = append([]string(nil), c.Audiences...)
 	dup.AllowedAlgs = append([]string(nil), c.AllowedAlgs...)
+	dup.HintScopes = append([]string(nil), c.HintScopes...)
 	if c.OIDC != nil {
 		ox := *c.OIDC
 		ox.AuthorizationEndpoint = c.OIDC.AuthorizationEndpoint

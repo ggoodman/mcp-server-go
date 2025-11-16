@@ -177,6 +177,7 @@ type StreamingHTTPHandler struct {
 	sessionHost     sessions.SessionHost
 	realm           string
 	verboseRequests bool
+	hintScopes      []string
 }
 
 type lockedSSEWriter struct {
@@ -280,6 +281,11 @@ func New(ctx context.Context, publicEndpoint string, host sessions.SessionHost, 
 			h.log.ErrorContext(ctx, "engine.run.fail", slog.String("err", err.Error()))
 		}
 	}()
+
+	if resolved != nil {
+		// Capture any configured scope hints for use in WWW-Authenticate challenges.
+		h.hintScopes = append([]string(nil), resolved.HintScopes...)
+	}
 
 	if resolved != nil && resolved.Advertise {
 		issuer := resolved.Issuer
@@ -925,8 +931,11 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 		if errors.Is(err, auth.ErrInsufficientScope) {
 			// Auth succeeded but insufficient privileges -> 403 insufficient_scope
 			h.log.InfoContext(ctx, "auth.check.fail", slog.String("err", err.Error()))
-			// Optionally we could append scope="..." when we know required scopes.
-			w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), map[string]string{"error": "insufficient_scope", "error_description": err.Error()}))
+			params := map[string]string{"error": "insufficient_scope", "error_description": err.Error()}
+			if len(h.hintScopes) > 0 {
+				params["scope"] = strings.Join(h.hintScopes, " ")
+			}
+			w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), params))
 			w.WriteHeader(http.StatusForbidden)
 			return nil
 		}
