@@ -298,7 +298,7 @@ func TestSingleInstance(t *testing.T) {
 		// Custom authenticator that returns ErrInsufficientScope when token matches but lacks scope
 		inscopeAuth := &scopeFailAuth{token: "scoped"}
 		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
-		srv := mustServer(t, server, withAuth(inscopeAuth))
+		srv := mustServer(t, server, withAuth(inscopeAuth), withSecurity(auth.SecurityConfig{Issuer: "https://issuer.example", Audiences: []string{"https://mcp.example"}, HintScopes: []string{"files:read", "files:write"}}))
 		defer srv.Close()
 		initReq := &jsonrpc.Request{JSONRPCVersion: jsonrpc.ProtocolVersion, Method: string(mcp.InitializeMethod), ID: jsonrpc.NewRequestID("m4"), Params: mustJSON(mcp.InitializeRequest{ProtocolVersion: "2025-06-18", ClientInfo: mcp.ImplementationInfo{Name: "c", Version: "1"}})}
 		resp, _ := doPostMCP(t, srv, "Bearer scoped", "", initReq)
@@ -310,6 +310,9 @@ func TestSingleInstance(t *testing.T) {
 		resp.Body.Close()
 		if !strings.Contains(strings.ToLower(wa), "error=\"insufficient_scope\"") {
 			t.Fatalf("expected insufficient_scope error, got %q", wa)
+		}
+		if !strings.Contains(wa, `scope="files:read files:write"`) {
+			t.Fatalf("expected scope hint in header, got %q", wa)
 		}
 	})
 
@@ -859,6 +862,7 @@ type serverConfig struct {
 	jwksURI        string
 	overrideIssuer bool
 	overrideJWKS   bool
+	securityConfig *auth.SecurityConfig
 }
 
 // withAuth configures the server to use the provided authenticator.
@@ -886,6 +890,16 @@ func withLogger(log *slog.Logger) serverOption {
 func withServerName(name string) serverOption {
 	return func(cfg *serverConfig) {
 		cfg.serverName = name
+	}
+}
+
+// withSecurity allows tests to provide an explicit SecurityConfig used by the
+// streaming HTTP handler, including optional HintScopes for WWW-Authenticate
+// scope hints.
+func withSecurity(sc auth.SecurityConfig) serverOption {
+	return func(cfg *serverConfig) {
+		copy := sc.Copy()
+		cfg.securityConfig = &copy
 	}
 }
 
@@ -991,6 +1005,18 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		handler = streamingHandler
 		return srv
 	}
+	// Build a base SecurityConfig if caller did not supply one explicitly.
+	var baseSec auth.SecurityConfig
+	if cfg.securityConfig != nil {
+		baseSec = cfg.securityConfig.Copy()
+	} else if sd, ok := cfg.authenticator.(auth.SecurityDescriptor); ok {
+		baseSec = sd.SecurityConfig()
+		// Ensure Advertise true for tests
+		baseSec.Advertise = true
+	} else {
+		baseSec = auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true}
+	}
+
 	streamingHandler, err := streaminghttp.New(
 		ctx,
 		srv.URL,
@@ -999,15 +1025,7 @@ func mustServer(t *testing.T, mcp mcpservice.ServerCapabilities, options ...serv
 		cfg.authenticator,
 		streaminghttp.WithServerName(cfg.serverName),
 		streaminghttp.WithLogger(cfg.logger),
-		func() streaminghttp.Option {
-			if sd, ok := cfg.authenticator.(auth.SecurityDescriptor); ok {
-				sec := sd.SecurityConfig()
-				// Ensure Advertise true for tests
-				sec.Advertise = true
-				return streaminghttp.WithSecurityConfig(sec)
-			}
-			return streaminghttp.WithSecurityConfig(auth.SecurityConfig{Issuer: cfg.issuer, Audiences: []string{"test"}, JWKSURL: cfg.jwksURI, Advertise: true})
-		}(),
+		streaminghttp.WithSecurityConfig(baseSec),
 	)
 	if err != nil {
 		srv.Close()

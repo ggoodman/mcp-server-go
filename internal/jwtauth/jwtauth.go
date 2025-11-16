@@ -29,6 +29,10 @@ type Config struct {
 	ScopeModeAny      bool // if true, any of RequiredScopes is sufficient; else all are required
 	AllowedAlgs       []string
 	Leeway            time.Duration
+	// HintScopes carries an optional set of scopes that transports may echo
+	// in WWW-Authenticate "scope" parameters when constructing Bearer
+	// challenges. They are advisory only and do not affect token validation.
+	HintScopes []string
 }
 
 // DefaultConfig returns a Config with safe defaults for algorithm and leeway.
