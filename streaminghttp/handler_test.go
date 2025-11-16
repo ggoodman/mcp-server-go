@@ -239,9 +239,9 @@ func TestSingleInstance(t *testing.T) {
 	})
 
 	// New tests for WWW-Authenticate header semantics (RFC 6750 compliance)
-	t.Run("Auth missing header -> bare challenge no error", func(t *testing.T) {
+	t.Run("Auth missing header -> bare challenge with optional scope", func(t *testing.T) {
 		server := mcpservice.NewServer(mcpservice.WithToolsCapability(mcpservice.NewToolsContainer()))
-		srv := mustServer(t, server, withAuth(&noAuth{wantToken: "required"}))
+		srv := mustServer(t, server, withAuth(&noAuth{wantToken: "required"}), withSecurity(auth.SecurityConfig{Issuer: "https://issuer.example", Audiences: []string{"https://mcp.example"}, HintScopes: []string{"files:read"}}))
 		defer srv.Close()
 
 		// Initialize request without Authorization header
@@ -254,7 +254,10 @@ func TestSingleInstance(t *testing.T) {
 		wa := resp.Header.Get("WWW-Authenticate")
 		resp.Body.Close()
 		if wa == "" || !strings.HasPrefix(strings.ToLower(wa), "bearer") || strings.Contains(wa, "error=") {
-			t.Fatalf("expected bare Bearer challenge without error, got %q", wa)
+			t.Fatalf("expected Bearer challenge without error, got %q", wa)
+		}
+		if !strings.Contains(wa, `scope="files:read"`) {
+			t.Fatalf("expected scope hint in 401 header, got %q", wa)
 		}
 	})
 
