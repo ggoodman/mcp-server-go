@@ -894,10 +894,15 @@ func (h *StreamingHTTPHandler) checkAuthentication(ctx context.Context, r *http.
 
 	if authHeader == "" {
 		// RFC 6750 §3.1: If the request lacks any authentication information the
-		// resource server SHOULD NOT include an error code. Provide only a bare
-		// Bearer challenge with realm.
+		// resource server SHOULD NOT include an error code. We still provide a
+		// Bearer challenge with realm and optional scope hint so generic MCP
+		// clients know which scopes to request.
 		h.log.InfoContext(ctx, "auth.check.missing", slog.String("err", "no authorization header"))
-		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), nil))
+		params := map[string]string(nil)
+		if len(h.hintScopes) > 0 {
+			params = map[string]string{"scope": strings.Join(h.hintScopes, " ")}
+		}
+		w.Header().Add(wwwAuthenticateHeader, buildBearerChallenge(h.realm, pathIfSet(h.prmDocumentURL), params))
 		w.WriteHeader(http.StatusUnauthorized)
 		return nil
 	}
