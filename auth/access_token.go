@@ -84,6 +84,121 @@ func WithScopeHint(scopes ...string) AccessTokenAuthOption {
 	}
 }
 
+// StaticScopes returns a transform function that ignores discovered scopes and
+// returns a fixed set of scopes to advertise. Use with WithAdvertisedScopes to
+// advertise a specific set of scopes regardless of what the authorization server
+// advertises.
+//
+// Example:
+//
+//	WithAdvertisedScopes(auth.StaticScopes("mcp:read", "mcp:write"))
+func StaticScopes(scopes ...string) func([]string) []string {
+	// Make a defensive copy to avoid aliasing issues
+	static := append([]string(nil), scopes...)
+	return func(discovered []string) []string {
+		return static
+	}
+}
+
+// FilterScopes returns a transform function that filters discovered scopes
+// based on a predicate. Use with WithAdvertisedScopes to selectively advertise
+// a subset of discovered scopes.
+//
+// Example:
+//
+//	WithAdvertisedScopes(auth.FilterScopes(func(s string) bool {
+//	    return !strings.HasPrefix(s, "internal:")
+//	}))
+func FilterScopes(keep func(string) bool) func([]string) []string {
+	return func(discovered []string) []string {
+		filtered := make([]string, 0, len(discovered))
+		for _, s := range discovered {
+			if keep(s) {
+				filtered = append(filtered, s)
+			}
+		}
+		return filtered
+	}
+}
+
+// WithAdvertisedScopes configures a transform function that customizes which
+// scopes are advertised in the protected resource metadata (scopes_supported).
+// The function receives the scopes discovered from the authorization server's
+// OIDC metadata and returns the scopes to advertise.
+//
+// Use StaticScopes(...) to ignore discovery and advertise a fixed set, or
+// FilterScopes(...) to selectively include discovered scopes. For full control,
+// provide a custom function that can merge, filter, or transform the discovered
+// scopes as needed.
+//
+// If this option is not used, the discovered scopes are advertised as-is.
+func WithAdvertisedScopes(transform func(discovered []string) []string) AccessTokenAuthOption {
+	return func(c *jwtauth.Config) {
+		c.AdvertisedScopesTransform = transform
+	}
+}
+
+// buildSecurityConfig constructs a SecurityConfig from the jwtauth.Config and
+// an internal authenticator that may optionally expose extended discovery
+// metadata via the fullDiscovery interface. This is split out primarily to
+// make advertised scope behavior directly testable.
+func buildSecurityConfig(cfg *jwtauth.Config, internal any) SecurityConfig {
+	sec := SecurityConfig{
+		Issuer:      cfg.Issuer,
+		Audiences:   append([]string(nil), cfg.ExpectedAudiences...),
+		AllowedAlgs: append([]string(nil), cfg.AllowedAlgs...),
+		Leeway:      cfg.Leeway,
+		EnforceExp:  true,
+		EnforceNbf:  true,
+		Advertise:   true,
+		HintScopes:  append([]string(nil), cfg.HintScopes...),
+	}
+
+	// Populate advertisement-only OIDC metadata if discovery yielded endpoints.
+	// Attempt to extract extended discovery metadata via a private interface.
+	type fullDiscovery interface {
+		AuthorizationEndpoint() string
+		TokenEndpoint() string
+		ResponseTypes() []string
+		Scopes() []string
+		GrantTypes() []string
+		ResponseModes() []string
+		CodeChallengeMethods() []string
+		TokenEndpointAuthMethods() []string
+		TokenEndpointAuthAlgs() []string
+		ServiceDocumentation() string
+		PolicyURI() string
+		TosURI() string
+		RegistrationEndpoint() string
+	}
+	if dm, ok := internal.(fullDiscovery); ok {
+		// Apply advertised scopes transform if configured
+		discoveredScopes := dm.Scopes()
+		advertisedScopes := discoveredScopes
+		if cfg.AdvertisedScopesTransform != nil {
+			advertisedScopes = cfg.AdvertisedScopesTransform(discoveredScopes)
+		}
+		sec.OIDC = &OIDCExtra{
+			AuthorizationEndpoint:                      dm.AuthorizationEndpoint(),
+			TokenEndpoint:                              dm.TokenEndpoint(),
+			RegistrationEndpoint:                       dm.RegistrationEndpoint(),
+			ResponseTypesSupported:                     dm.ResponseTypes(),
+			ScopesSupported:                            advertisedScopes,
+			GrantTypesSupported:                        dm.GrantTypes(),
+			ResponseModesSupported:                     dm.ResponseModes(),
+			CodeChallengeMethodsSupported:              dm.CodeChallengeMethods(),
+			TokenEndpointAuthMethodsSupported:          dm.TokenEndpointAuthMethods(),
+			TokenEndpointAuthSigningAlgValuesSupported: dm.TokenEndpointAuthAlgs(),
+			ServiceDocumentation:                       dm.ServiceDocumentation(),
+			OpPolicyURI:                                dm.PolicyURI(),
+			OpTosURI:                                   dm.TosURI(),
+		}
+	}
+
+	sec.Normalize()
+	return sec
+}
+
 // NewFromDiscovery returns an Authenticator that verifies RFC 9068 JWT access
 // tokens discovered via OpenID Connect discovery (jwks_uri, issuer, etc.).
 //
@@ -113,55 +228,7 @@ func NewFromDiscovery(ctx context.Context, issuer string, audience string, opts 
 	if err != nil {
 		return nil, err
 	}
-	// Assemble full audience list: primary expected audience followed by
-	// any explicitly configured extras (deduplicated later by Normalize/usage
-	// layers if needed).
-	audiences := append([]string(nil), cfg.ExpectedAudiences...)
-	sec := SecurityConfig{
-		Issuer:      cfg.Issuer,
-		Audiences:   audiences,
-		AllowedAlgs: append([]string(nil), cfg.AllowedAlgs...),
-		Leeway:      cfg.Leeway,
-		EnforceExp:  true,
-		EnforceNbf:  true,
-		Advertise:   true,
-		HintScopes:  append([]string(nil), cfg.HintScopes...),
-	}
-	// Populate advertisement-only OIDC metadata if discovery yielded endpoints.
-	// Attempt to extract extended discovery metadata via a private interface.
-	type fullDiscovery interface {
-		AuthorizationEndpoint() string
-		TokenEndpoint() string
-		ResponseTypes() []string
-		Scopes() []string
-		GrantTypes() []string
-		ResponseModes() []string
-		CodeChallengeMethods() []string
-		TokenEndpointAuthMethods() []string
-		TokenEndpointAuthAlgs() []string
-		ServiceDocumentation() string
-		PolicyURI() string
-		TosURI() string
-		RegistrationEndpoint() string
-	}
-	if dm, ok := any(internal).(fullDiscovery); ok {
-		sec.OIDC = &OIDCExtra{
-			AuthorizationEndpoint:                      dm.AuthorizationEndpoint(),
-			TokenEndpoint:                              dm.TokenEndpoint(),
-			RegistrationEndpoint:                       dm.RegistrationEndpoint(),
-			ResponseTypesSupported:                     dm.ResponseTypes(),
-			ScopesSupported:                            dm.Scopes(),
-			GrantTypesSupported:                        dm.GrantTypes(),
-			ResponseModesSupported:                     dm.ResponseModes(),
-			CodeChallengeMethodsSupported:              dm.CodeChallengeMethods(),
-			TokenEndpointAuthMethodsSupported:          dm.TokenEndpointAuthMethods(),
-			TokenEndpointAuthSigningAlgValuesSupported: dm.TokenEndpointAuthAlgs(),
-			ServiceDocumentation:                       dm.ServiceDocumentation(),
-			OpPolicyURI:                                dm.PolicyURI(),
-			OpTosURI:                                   dm.TosURI(),
-		}
-	}
-	sec.Normalize()
+	sec := buildSecurityConfig(cfg, internal)
 	return &adapter{a: internal, sec: sec}, nil
 }
 

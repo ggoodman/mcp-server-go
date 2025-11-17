@@ -33,6 +33,11 @@ type Config struct {
 	// in WWW-Authenticate "scope" parameters when constructing Bearer
 	// challenges. They are advisory only and do not affect token validation.
 	HintScopes []string
+	// AdvertisedScopesTransform is an optional function that receives the scopes
+	// discovered from the authorization server's OIDC metadata and returns the
+	// scopes that should be advertised in the protected resource metadata. If nil,
+	// the discovered scopes are used as-is.
+	AdvertisedScopesTransform func(discovered []string) []string
 }
 
 // DefaultConfig returns a Config with safe defaults for algorithm and leeway.
