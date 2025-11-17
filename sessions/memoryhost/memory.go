@@ -3,13 +3,12 @@ package memoryhost
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/ggoodman/mcp-server-go/sessions"
+	"github.com/google/uuid"
 )
 
 // Interface compliance
@@ -266,8 +265,11 @@ func (h *Host) CreateSession(ctx context.Context, meta *sessions.SessionMetadata
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-
-	sessID := fmt.Sprintf("pid-%d", os.Getpid())
+	// Respect provided SessionID; generate a new one if empty.
+	sessID := meta.SessionID
+	if sessID == "" {
+		sessID = uuid.NewString()
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
