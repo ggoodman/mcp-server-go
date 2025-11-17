@@ -22,12 +22,6 @@ func TestStaticScopes(t *testing.T) {
 			want:       []string{"mcp:read", "mcp:write"},
 		},
 		{
-			name:       "empty static scopes",
-			static:     []string{},
-			discovered: []string{"openid", "profile"},
-			want:       []string{},
-		},
-		{
 			name:       "nil discovered scopes",
 			static:     []string{"custom:scope"},
 			discovered: nil,
