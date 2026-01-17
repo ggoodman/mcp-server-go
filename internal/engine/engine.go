@@ -30,9 +30,10 @@ const (
 const internalSessionDeletedMethod = "internal/session/deleted"
 
 var (
-	ErrCancelled     = errors.New("operation cancelled")
-	ErrInvalidUserID = errors.New("invalid user id")
-	ErrInternal      = errors.New("internal error")
+	ErrCancelled              = errors.New("operation cancelled")
+	ErrInvalidUserID          = errors.New("invalid user id")
+	ErrInvalidProtocolVersion = errors.New("invalid protocol version")
+	ErrInternal               = errors.New("internal error")
 )
 
 // Engine is the core of an MCP server, coordinating sessions, message routing,
@@ -159,11 +160,32 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 		return nil, nil, fmt.Errorf("initialize request required")
 	}
 
-	negotiatedVersion := req.ProtocolVersion
-	if v, ok, err := e.srv.GetPreferredProtocolVersion(ctx); err != nil {
-		return nil, nil, fmt.Errorf("get preferred protocol version: %w", err)
-	} else if ok && v != "" {
-		negotiatedVersion = v
+	if req.ProtocolVersion == "" {
+		return nil, nil, fmt.Errorf("%w: missing client protocol version", ErrInvalidProtocolVersion)
+	}
+
+	clientProtocolVersion := req.ProtocolVersion
+	clientSupported := mcp.IsSupportedProtocolVersion(clientProtocolVersion)
+
+	// The protocol version returned in initialize MUST be a version this library
+	// supports (i.e. something the server can actually speak). Clients may be on
+	// newer versions we don't yet know about; those should still initialize and
+	// receive a supported server version.
+	serverProtocolVersion := mcp.LatestProtocolVersion
+	if clientSupported {
+		// Spec-aligned: if we support the client's advertised version, we must
+		// respond with that same version.
+		serverProtocolVersion = clientProtocolVersion
+	} else {
+		// Otherwise, allow the server to optionally pick among supported versions.
+		if v, ok, err := e.srv.GetPreferredProtocolVersion(ctx, clientProtocolVersion); err != nil {
+			return nil, nil, fmt.Errorf("get preferred protocol version: %w", err)
+		} else if ok && v != "" {
+			if !mcp.IsSupportedProtocolVersion(v) {
+				return nil, nil, fmt.Errorf("%w: unsupported server protocol version %q", ErrInvalidProtocolVersion, v)
+			}
+			serverProtocolVersion = v
+		}
 	}
 
 	capSet := sessions.CapabilitySet{}
@@ -183,7 +205,7 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 		Version: req.ClientInfo.Version,
 	}
 
-	sess, err := e.createSession(ctx, userID, negotiatedVersion, capSet, meta)
+	sess, err := e.createSession(ctx, userID, clientProtocolVersion, serverProtocolVersion, capSet, meta)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -200,7 +222,7 @@ func (e *Engine) InitializeSession(ctx context.Context, userID string, req *mcp.
 	}
 
 	initRes := &mcp.InitializeResult{
-		ProtocolVersion: negotiatedVersion,
+		ProtocolVersion: serverProtocolVersion,
 		Capabilities:    mcp.ServerCapabilities{},
 		ServerInfo:      serverInfo,
 	}
@@ -860,7 +882,7 @@ func (e *Engine) HandleNotification(ctx context.Context, sess *SessionHandle, no
 			ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
 				SessionID:       sess.SessionID(),
 				UserID:          sess.UserID(),
-				ProtocolVersion: sess.ProtocolVersion(),
+				ProtocolVersion: sess.ServerProtocolVersion(),
 				State:           m.State,
 			})
 
@@ -906,7 +928,7 @@ func (e *Engine) HandleNotification(ctx context.Context, sess *SessionHandle, no
 	return nil
 }
 
-func (e *Engine) createSession(ctx context.Context, userID string, protocolVersion string, caps sessions.CapabilitySet, meta sessions.MetadataClientInfo) (*SessionHandle, error) {
+func (e *Engine) createSession(ctx context.Context, userID string, clientProtocolVersion string, serverProtocolVersion string, caps sessions.CapabilitySet, meta sessions.MetadataClientInfo) (*SessionHandle, error) {
 	if userID == "" { // user scoping required for auth boundary
 		return nil, ErrInvalidUserID
 	}
@@ -914,19 +936,20 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 	sid := uuid.NewString()
 	now := time.Now().UTC()
 	metaRec := &sessions.SessionMetadata{
-		MetaVersion:     1,
-		SessionID:       sid,
-		UserID:          userID,
-		ProtocolVersion: protocolVersion,
-		Client:          meta,
-		Capabilities:    caps,
-		State:           sessions.SessionStatePending,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		LastAccess:      now,
-		TTL:             e.handshakeTTL,
-		MaxLifetime:     e.sessionMaxLifetime,
-		Revoked:         false,
+		MetaVersion:           1,
+		SessionID:             sid,
+		UserID:                userID,
+		ClientProtocolVersion: clientProtocolVersion,
+		ServerProtocolVersion: serverProtocolVersion,
+		Client:                meta,
+		Capabilities:          caps,
+		State:                 sessions.SessionStatePending,
+		CreatedAt:             now,
+		UpdatedAt:             now,
+		LastAccess:            now,
+		TTL:                   e.handshakeTTL,
+		MaxLifetime:           e.sessionMaxLifetime,
+		Revoked:               false,
 	}
 	if err := e.host.CreateSession(ctx, metaRec); err != nil {
 		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{SessionID: sid, UserID: userID})
@@ -939,7 +962,7 @@ func (e *Engine) createSession(ctx context.Context, userID string, protocolVersi
 	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
 		SessionID:       sess.SessionID(),
 		UserID:          sess.UserID(),
-		ProtocolVersion: sess.ProtocolVersion(),
+		ProtocolVersion: sess.ServerProtocolVersion(),
 		State:           sess.State(),
 	})
 
@@ -1145,7 +1168,7 @@ func (e *Engine) handleSessionEvent(ctx context.Context, msg []byte) error {
 	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
 		SessionID:       sess.SessionID(),
 		UserID:          sess.UserID(),
-		ProtocolVersion: sess.ProtocolVersion(),
+		ProtocolVersion: sess.ServerProtocolVersion(),
 		State:           sess.State(),
 	})
 

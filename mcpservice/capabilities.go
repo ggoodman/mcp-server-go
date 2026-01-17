@@ -40,9 +40,15 @@ type ServerCapabilities interface {
 	GetServerInfo(ctx context.Context, session sessions.Session) (mcp.ImplementationInfo, error)
 
 	// GetPreferredProtocolVersion returns the server's preferred MCP protocol version
-	// for this session. If ok is false, the handler should fall back to the client's
-	// requested version.
-	GetPreferredProtocolVersion(ctx context.Context) (version string, ok bool, err error)
+	// given the client's advertised protocol version from initialize.
+	//
+	// This hook is invoked during initialize, before the session is created.
+	// Implementations MUST return a protocol version supported by this library.
+	//
+	// If ok is false, the engine selects the server protocol version by:
+	//   - echoing clientProtocolVersion when it is supported
+	//   - otherwise falling back to the library's latest supported version.
+	GetPreferredProtocolVersion(ctx context.Context, clientProtocolVersion string) (version string, ok bool, err error)
 
 	// GetInstructions returns optional human-readable instructions that should be
 	// surfaced to the client during initialization. If ok is false, no instructions

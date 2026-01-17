@@ -10,11 +10,12 @@ import (
 var _ sessions.Session = (*SessionHandle)(nil)
 
 type SessionHandle struct {
-	host            sessions.SessionHost
-	sessionID       string
-	userID          string
-	protocolVersion string
-	state           sessions.SessionState
+	host                  sessions.SessionHost
+	sessionID             string
+	userID                string
+	clientProtocolVersion string
+	serverProtocolVersion string
+	state                 sessions.SessionState
 
 	logLevel mcp.LoggingLevel // verbosity level for this session
 
@@ -26,11 +27,12 @@ type SessionHandle struct {
 
 func NewSessionHandle(host sessions.SessionHost, meta *sessions.SessionMetadata, opts ...SessionHandleOption) *SessionHandle {
 	s := &SessionHandle{
-		host:            host,
-		sessionID:       meta.SessionID,
-		userID:          meta.UserID,
-		protocolVersion: meta.ProtocolVersion,
-		state:           meta.State,
+		host:                  host,
+		sessionID:             meta.SessionID,
+		userID:                meta.UserID,
+		clientProtocolVersion: meta.ClientProtocolVersion,
+		serverProtocolVersion: meta.ServerProtocolVersion,
+		state:                 meta.State,
 
 		logLevel: mcp.LoggingLevelInfo, // default
 	}
@@ -72,8 +74,12 @@ func (s *SessionHandle) UserID() string {
 	return s.userID
 }
 
-func (s *SessionHandle) ProtocolVersion() string {
-	return s.protocolVersion
+func (s *SessionHandle) ClientProtocolVersion() string {
+	return s.clientProtocolVersion
+}
+
+func (s *SessionHandle) ServerProtocolVersion() string {
+	return s.serverProtocolVersion
 }
 
 func (s *SessionHandle) GetSamplingCapability() (cap sessions.SamplingCapability, ok bool) {

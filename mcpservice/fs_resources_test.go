@@ -7,14 +7,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
 )
 
 type fakeSession string
 
-func (s fakeSession) SessionID() string       { return string(s) }
-func (s fakeSession) UserID() string          { return string(s) }
-func (s fakeSession) ProtocolVersion() string { return "" }
+func (s fakeSession) SessionID() string             { return string(s) }
+func (s fakeSession) UserID() string                { return string(s) }
+func (s fakeSession) ClientProtocolVersion() string { return mcp.LatestProtocolVersion }
+func (s fakeSession) ServerProtocolVersion() string { return mcp.LatestProtocolVersion }
 func (s fakeSession) GetSamplingCapability() (cap sessions.SamplingCapability, ok bool) {
 	return nil, false
 }

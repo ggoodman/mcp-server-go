@@ -491,15 +491,15 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
 		SessionID:       sess.SessionID(),
 		UserID:          userInfo.UserID(),
-		ProtocolVersion: sess.ProtocolVersion(),
+		ProtocolVersion: sess.ServerProtocolVersion(),
 		State:           sess.State(),
 	})
 
 	pvHeader := r.Header.Get(mcpProtocolVersionHeader)
 
-	if pvHeader != "" && sess.ProtocolVersion() != "" && pvHeader != sess.ProtocolVersion() {
+	if pvHeader != "" && sess.ServerProtocolVersion() != "" && pvHeader != sess.ServerProtocolVersion() {
 		h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("client_version", pvHeader))
-		w.WriteHeader(http.StatusPreconditionFailed)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
@@ -515,8 +515,8 @@ func (h *StreamingHTTPHandler) handleDeleteMCP(w http.ResponseWriter, r *http.Re
 	}
 
 	// If we captured a protocol version, advertise it
-	if sess.ProtocolVersion() != "" {
-		w.Header().Set(mcpProtocolVersionHeader, sess.ProtocolVersion())
+	if sess.ServerProtocolVersion() != "" {
+		w.Header().Set(mcpProtocolVersionHeader, sess.ServerProtocolVersion())
 	}
 
 	// Success: no content.
@@ -595,6 +595,11 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		}
 		sess, initRes, err := h.eng.InitializeSession(ctx, userInfo.UserID(), &initReq)
 		if err != nil {
+			if errors.Is(err, engine.ErrInvalidProtocolVersion) {
+				writeJSONError(w, http.StatusBadRequest, "invalid initialize params")
+				h.log.InfoContext(ctx, "session.initialize.params.invalid", slog.String("err", err.Error()))
+				return
+			}
 			writeJSONError(w, http.StatusInternalServerError, "failed to initialize session")
 			h.log.ErrorContext(ctx, "session.initialize.fail", slog.String("err", err.Error()))
 			return
@@ -603,7 +608,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
 			SessionID:       sess.SessionID(),
 			UserID:          userInfo.UserID(),
-			ProtocolVersion: sess.ProtocolVersion(),
+			ProtocolVersion: sess.ServerProtocolVersion(),
 			State:           sess.State(),
 		})
 
@@ -656,7 +661,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 	ctx = logctx.WithSessionData(ctx, &logctx.SessionData{
 		SessionID:       sess.SessionID(),
 		UserID:          sess.UserID(),
-		ProtocolVersion: sess.ProtocolVersion(),
+		ProtocolVersion: sess.ServerProtocolVersion(),
 		State:           sess.State(),
 	})
 
@@ -668,7 +673,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	clientPV := r.Header.Get(mcpProtocolVersionHeader)
-	if clientPV != "" && sess.ProtocolVersion() != "" && clientPV != sess.ProtocolVersion() {
+	if clientPV != "" && sess.ServerProtocolVersion() != "" && clientPV != sess.ServerProtocolVersion() {
 		writeJSONError(w, http.StatusBadRequest, "protocol version mismatch")
 		h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("client_version", clientPV))
 		return
@@ -681,7 +686,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 				h.log.ErrorContext(ctx, "notification.inbound.fail", slog.String("err", err.Error()))
 				return
 			}
-			if spv := sess.ProtocolVersion(); spv != "" {
+			if spv := sess.ServerProtocolVersion(); spv != "" {
 				w.Header().Set(mcpProtocolVersionHeader, spv)
 			}
 			w.WriteHeader(http.StatusAccepted)
@@ -697,7 +702,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 				return
 			}
 		}
-		if spv := sess.ProtocolVersion(); spv != "" {
+		if spv := sess.ServerProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.Header().Set("Content-Type", eventStreamMediaType.String())
@@ -741,7 +746,7 @@ func (h *StreamingHTTPHandler) handlePostMCP(w http.ResponseWriter, r *http.Requ
 			h.log.ErrorContext(ctx, "response.forward.fail", slog.String("err", err.Error()))
 			return
 		}
-		if spv := sess.ProtocolVersion(); spv != "" {
+		if spv := sess.ServerProtocolVersion(); spv != "" {
 			w.Header().Set(mcpProtocolVersionHeader, spv)
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -805,8 +810,8 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 	}
 
 	if pv := r.Header.Get(mcpProtocolVersionHeader); pv != "" {
-		if spv := sess.ProtocolVersion(); spv != "" && pv != spv {
-			w.WriteHeader(http.StatusPreconditionFailed)
+		if spv := sess.ServerProtocolVersion(); spv != "" && pv != spv {
+			w.WriteHeader(http.StatusBadRequest)
 			h.log.WarnContext(ctx, "protocol.version.mismatch", slog.String("client_version", pv))
 			return
 		}
@@ -814,7 +819,7 @@ func (h *StreamingHTTPHandler) handleGetMCP(w http.ResponseWriter, r *http.Reque
 
 	lastEventID := r.Header.Get(lastEventIDHeader)
 
-	if spv := sess.ProtocolVersion(); spv != "" {
+	if spv := sess.ServerProtocolVersion(); spv != "" {
 		w.Header().Set(mcpProtocolVersionHeader, spv)
 	}
 	w.Header().Set("Content-Type", "text/event-stream")

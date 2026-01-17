@@ -13,8 +13,10 @@ import (
 type Session interface {
 	SessionID() string
 	UserID() string
-	// ProtocolVersion is the negotiated MCP protocol version baked into the session.
-	ProtocolVersion() string
+	// ClientProtocolVersion is the protocol version the client advertised in initialize.
+	ClientProtocolVersion() string
+	// ServerProtocolVersion is the protocol version the server selected for this session.
+	ServerProtocolVersion() string
 
 	GetSamplingCapability() (cap SamplingCapability, ok bool)
 	GetRootsCapability() (cap RootsCapability, ok bool)

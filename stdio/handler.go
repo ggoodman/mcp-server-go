@@ -180,6 +180,10 @@ func (h *Handler) handleInitialize(ctx context.Context, req *jsonrpc.Request) {
 	sess, initRes, err := h.engine.InitializeSession(ctx, h.userID, &initReq)
 	if err != nil {
 		h.log.ErrorContext(ctx, "initialize.session.fail", slog.String("err", err.Error()))
+		if errors.Is(err, engine.ErrInvalidProtocolVersion) {
+			h.writeError(ctx, req.ID, jsonrpc.ErrorCodeInvalidParams, "invalid params", err.Error())
+			return
+		}
 		h.writeError(ctx, req.ID, jsonrpc.ErrorCodeInternalError, "internal error", nil)
 		return
 	}

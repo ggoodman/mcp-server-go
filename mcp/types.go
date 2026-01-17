@@ -279,3 +279,11 @@ type PrimitiveSchemaDefinition struct {
 
 // LatestProtocolVersion is the latest version of the protocol.
 const LatestProtocolVersion = "2025-06-18"
+
+// IsSupportedProtocolVersion reports whether the provided MCP protocol version
+// string is supported by this library.
+//
+// Note: At the moment, only LatestProtocolVersion is supported.
+func IsSupportedProtocolVersion(v string) bool {
+	return v == LatestProtocolVersion
+}

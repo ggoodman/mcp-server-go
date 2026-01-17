@@ -16,6 +16,7 @@ package mcpservice
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ggoodman/mcp-server-go/mcp"
 	"github.com/ggoodman/mcp-server-go/sessions"
@@ -36,17 +37,21 @@ func (f ServerInfoProviderFunc) ProvideServerInfo(ctx context.Context, s session
 	return f(ctx, s)
 }
 
-// ProtocolVersionProvider yields a preferred protocol version. Session is
-// currently unused but retained for symmetry / future evolution.
+// ProtocolVersionProvider yields a preferred protocol version given the
+// client's advertised protocol version.
+//
+// Note: protocol version selection occurs during initialize, before a session
+// is created. As a result, session may be nil and implementations MUST NOT
+// assume it is non-nil.
 type ProtocolVersionProvider interface {
-	ProvideProtocolVersion(ctx context.Context, session sessions.Session) (string, bool, error)
+	ProvideProtocolVersion(ctx context.Context, session sessions.Session, clientProtocolVersion string) (string, bool, error)
 }
 
-// Session currently unused but retained for symmetry / future needs.
-type ProtocolVersionProviderFunc func(ctx context.Context, session sessions.Session) (string, bool, error)
+// ProtocolVersionProviderFunc adapts a function to a ProtocolVersionProvider.
+type ProtocolVersionProviderFunc func(ctx context.Context, session sessions.Session, clientProtocolVersion string) (string, bool, error)
 
-func (f ProtocolVersionProviderFunc) ProvideProtocolVersion(ctx context.Context, s sessions.Session) (string, bool, error) {
-	return f(ctx, s)
+func (f ProtocolVersionProviderFunc) ProvideProtocolVersion(ctx context.Context, s sessions.Session, clientProtocolVersion string) (string, bool, error) {
+	return f(ctx, s, clientProtocolVersion)
 }
 
 // InstructionsProvider supplies optional human-readable instructions returned
@@ -133,7 +138,15 @@ func StaticServerInfo(name, version string, opts ...ServerInfoOption) ServerInfo
 	return ServerInfoProviderFunc(func(context.Context, sessions.Session) (mcp.ImplementationInfo, bool, error) { return info, true, nil })
 }
 func StaticProtocolVersion(v string) ProtocolVersionProvider {
-	return ProtocolVersionProviderFunc(func(context.Context, sessions.Session) (string, bool, error) { return v, v != "", nil })
+	if v == "" {
+		return ProtocolVersionProviderFunc(func(context.Context, sessions.Session, string) (string, bool, error) { return "", false, nil })
+	}
+	if !mcp.IsSupportedProtocolVersion(v) {
+		return ProtocolVersionProviderFunc(func(context.Context, sessions.Session, string) (string, bool, error) {
+			return "", false, fmt.Errorf("unsupported protocol version %q", v)
+		})
+	}
+	return ProtocolVersionProviderFunc(func(context.Context, sessions.Session, string) (string, bool, error) { return v, true, nil })
 }
 func StaticInstructions(s string) InstructionsProvider {
 	return InstructionsProviderFunc(func(context.Context, sessions.Session) (string, bool, error) { return s, s != "", nil })
