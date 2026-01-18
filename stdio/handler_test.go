@@ -30,7 +30,7 @@ type testHarness struct {
 	lines   []string
 }
 
-const defaultProtocolVersion = "2024-11-05"
+var defaultProtocolVersion = mcp.LatestProtocolVersion
 
 func defaultInitializeRequest() mcp.InitializeRequest {
 	return mcp.InitializeRequest{
@@ -248,7 +248,7 @@ func TestInitialize_HappyPath(t *testing.T) {
 
 	initRes := th.initialize(t, "init-1", defaultInitializeRequest())
 	if initRes.ProtocolVersion != defaultProtocolVersion {
-		t.Fatalf("negotiated protocol mismatch: %s", initRes.ProtocolVersion)
+		t.Fatalf("server protocol version mismatch: %s", initRes.ProtocolVersion)
 	}
 	if initRes.ServerInfo.Name != "test" {
 		t.Fatalf("server info missing")

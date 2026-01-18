@@ -14,9 +14,10 @@ import (
 
 type fakeSession struct{ id, user string }
 
-func (s fakeSession) SessionID() string       { return s.id }
-func (s fakeSession) UserID() string          { return s.user }
-func (s fakeSession) ProtocolVersion() string { return "" }
+func (s fakeSession) SessionID() string             { return s.id }
+func (s fakeSession) UserID() string                { return s.user }
+func (s fakeSession) ClientProtocolVersion() string { return mcp.LatestProtocolVersion }
+func (s fakeSession) ServerProtocolVersion() string { return mcp.LatestProtocolVersion }
 func (s fakeSession) ConsumeMessages(ctx context.Context, last string, f sessions.MessageHandlerFunction) error {
 	return nil
 }

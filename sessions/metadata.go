@@ -47,13 +47,19 @@ const (
 // MUST also expire the session once CreatedAt + MaxLifetime < now regardless
 // of activity.
 type SessionMetadata struct {
-	MetaVersion     int                `json:"meta_version"`               // For forward migration; starts at 1
-	SessionID       string             `json:"session_id"`                 // immutable
-	UserID          string             `json:"user_id"`                    // immutable
-	Issuer          string             `json:"issuer,omitempty"`           // immutable (empty if not enforced)
-	ProtocolVersion string             `json:"protocol_version,omitempty"` // immutable after creation handshake
-	Client          MetadataClientInfo `json:"client,omitempty"`           // immutable (can relax later if needed)
-	Capabilities    CapabilitySet      `json:"capabilities,omitempty"`     // immutable
+	MetaVersion int    `json:"meta_version"`     // For forward migration; starts at 1
+	SessionID   string `json:"session_id"`       // immutable
+	UserID      string `json:"user_id"`          // immutable
+	Issuer      string `json:"issuer,omitempty"` // immutable (empty if not enforced)
+
+	// ClientProtocolVersion is the protocol version the client advertised in
+	// initialize.
+	ClientProtocolVersion string `json:"client_protocol_version,omitempty"` // immutable after creation handshake
+	// ServerProtocolVersion is the protocol version the server selected for the
+	// session (and returned in initialize).
+	ServerProtocolVersion string             `json:"server_protocol_version,omitempty"` // immutable after creation handshake
+	Client                MetadataClientInfo `json:"client,omitempty"`                  // immutable (can relax later if needed)
+	Capabilities          CapabilitySet      `json:"capabilities,omitempty"`            // immutable
 	// State tracks whether the session is pending or open. Missing state should
 	// be interpreted as open for backward compatibility.
 	State SessionState `json:"state,omitempty"`

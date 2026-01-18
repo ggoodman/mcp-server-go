@@ -49,6 +49,16 @@
 // serialized as JSON-RPC error responses. Authentication failures surface a
 // WWW-Authenticate challenge per the authorization spec.
 //
+// # Protocol Version Header
+//
+// The MCP streaming HTTP transport specifies that clients include the
+// MCP-Protocol-Version header on requests after initialize. This handler is
+// intentionally lenient: it tolerates a missing header because it can rely on
+// the negotiated session metadata instead.
+//
+// When the header is present and does not match the negotiated session
+// protocol version, the handler rejects the request with HTTP 400.
+//
 // Example (mount in net/http):
 //
 //	mux := http.NewServeMux()

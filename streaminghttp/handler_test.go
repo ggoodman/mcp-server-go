@@ -1155,7 +1155,9 @@ func doPostMCP(t *testing.T, srv *httptest.Server, authHeader, sessionID string,
 	}
 	if sessionID != "" {
 		httpReq.Header.Set("mcp-session-id", sessionID)
-		// All non-initialize requests must include protocol version header now.
+		// Non-initialize requests SHOULD include the protocol version header.
+		// The handler is intentionally lenient when it is absent, but tests include
+		// it to exercise the mismatch enforcement path.
 		if req.Method != string(mcp.InitializeMethod) {
 			httpReq.Header.Set("MCP-Protocol-Version", "2025-06-18")
 		}

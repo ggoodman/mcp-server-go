@@ -89,12 +89,12 @@ func (s *server) GetServerInfo(ctx context.Context, session sessions.Session) (m
 }
 
 // GetPreferredProtocolVersion implements ServerCapabilities.
-func (s *server) GetPreferredProtocolVersion(ctx context.Context) (string, bool, error) {
+func (s *server) GetPreferredProtocolVersion(ctx context.Context, clientProtocolVersion string) (string, bool, error) {
 	if s.protocolProv == nil {
 		return "", false, nil
 	}
 	// Pass a nil session; protocol currently session-agnostic. Could supply a dummy.
-	return s.protocolProv.ProvideProtocolVersion(ctx, nil)
+	return s.protocolProv.ProvideProtocolVersion(ctx, nil, clientProtocolVersion)
 }
 
 // GetInstructions implements ServerCapabilities.
